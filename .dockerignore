@@ -1,0 +1,20 @@
+# Keep the build context tiny — never ship the bank audio or local state.
+.git/
+.venv/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+tests/
+scripts/
+output/
+dist/
+data/
+wordbank.db
+wordbank.db-*
+*.wav
+*.ogg
+*.md
+.env
+.env.*
+.claude/
+docker-compose.yml

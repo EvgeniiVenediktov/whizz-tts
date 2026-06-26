@@ -1,0 +1,5 @@
+# Bank-only server runtime (lightweight — no ML stack).
+# wordbank.lookup / wordbank.paths use only the Python stdlib.
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9

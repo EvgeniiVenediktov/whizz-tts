@@ -1,0 +1,55 @@
+# Workflow:
+#   1. local dev — generate audio (Gemini) + code changes
+#   2. build image (code only) + push OGG copies to storage
+#   3. deploy — container pulls OGG + manifest into the volume and serves; pulls
+#      model weights only when MODEL_ENABLED=1
+#
+#   docker compose --profile bank up --build   → lightweight, OGG-only (no model)
+#   docker compose --profile full up --build   → adds live OmniVoice synthesis
+#
+# The image contains NO audio. WAV masters are never served in production (OGG
+# only). Below the bank dirs are bind-mounted from the host for local testing;
+# in production use a named volume populated by BANK_SYNC_CMD (see commented).
+services:
+  tts-bank:
+    build:
+      context: .
+      args: { WITH_MODEL: "0" }
+    profiles: [bank]
+    ports: ["8000:8000"]
+    environment:
+      MODEL_ENABLED: "0"
+      SERVE_FRONTEND: "1"
+      BANK_DB: /data/wordbank.db
+      OGG_ROOT: /data/words_ogg
+      # WAV_ROOT: /data/words            # uncomment + mount below for dev WAV compare
+      # Production: pull the bank into the volume at startup instead of bind-mounting:
+      # BANK_SYNC_CMD: "aws s3 sync s3://BUCKET/words_ogg /data/words_ogg && aws s3 cp s3://BUCKET/wordbank.db /data/wordbank.db"
+    volumes:
+      - ./output/words_ogg:/data/words_ogg:ro     # OGG copies (served)
+      - ./wordbank.db:/data/wordbank.db           # manifest
+      # - ./output/words:/data/words:ro           # WAV masters — dev compare only
+      # Production alternative (BANK_SYNC_CMD populates it):
+      # - bank-data:/data
+
+  tts-full:
+    build:
+      context: .
+      args: { WITH_MODEL: "1" }
+    profiles: [full]
+    ports: ["8000:8000"]
+    environment:
+      MODEL_ENABLED: "1"
+      PRELOAD_MODEL: "1"                  # pull/load weights at startup, not first request
+      SERVE_FRONTEND: "1"
+      BANK_DB: /data/wordbank.db
+      OGG_ROOT: /data/words_ogg
+      HF_HOME: /hf-cache                  # weights cached across restarts
+    volumes:
+      - ./output/words_ogg:/data/words_ogg:ro
+      - ./wordbank.db:/data/wordbank.db
+      - hf-cache:/hf-cache
+
+volumes:
+  hf-cache:
+  bank-data:

@@ -1,0 +1,8 @@
+# Live-synthesis stack, installed only when WITH_MODEL=1 (on top of base).
+# torch/torchaudio are installed separately from the CPU wheel index in the
+# Dockerfile so omnivoice doesn't drag in the multi-GB CUDA build.
+omnivoice
+transformers>=4.40.0
+librosa>=0.10.0
+soundfile>=0.12.1
+numpy>=1.26.0

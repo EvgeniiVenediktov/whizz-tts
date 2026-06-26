@@ -1,0 +1,29 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Secrets / local env
+.env
+.env.*
+!.env.example
+
+# Generated bank — large + regenerable (scripts/fetch_wordlist.py, wordbank CLI)
+output/
+dist/
+data/
+wordbank.db
+wordbank.db-*
+
+# Audio artifacts (never committed)
+*.wav
+*.ogg
+
+# Scratch word lists at repo root
+/words*.txt
+/single_word.txt
+
+# OS / editor / local tooling
+.DS_Store
+.claude/

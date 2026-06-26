@@ -1,0 +1,16 @@
+omnivoice
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9
+soundfile>=0.12.1
+numpy>=1.26.0
+httpx>=0.27.0
+pytest>=8.0.0
+librosa>=0.10.0
+transformers>=4.40.0
+# Word bank — Gemini Batch backend (lazy-imported; needs GEMINI_API_KEY at runtime)
+google-genai>=1.0.0
+# Word bank — Chirp 3 HD backend (lazy-imported; only needed for real cloud runs)
+google-cloud-texttospeech>=2.16.0
+# Word bank — frequency word-list source (used by scripts/fetch_wordlist.py)
+wordfreq>=3.0.0

@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TTS</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: system-ui, sans-serif;
+      background: #0f0f11;
+      color: #e8e8e8;
+      min-height: 100vh;
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+      padding: 48px 16px;
+    }
+
+    .card {
+      background: #1a1a1f;
+      border: 1px solid #2e2e38;
+      border-radius: 12px;
+      padding: 32px;
+      width: 100%;
+      max-width: 620px;
+      display: flex;
+      flex-direction: column;
+      gap: 24px;
+    }
+
+    h1 { font-size: 1.2rem; font-weight: 600; color: #fff; }
+
+    .field-label {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      font-size: 0.78rem;
+      color: #888;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    textarea, input[type="text"] {
+      background: #111116;
+      border: 1px solid #2e2e38;
+      border-radius: 8px;
+      color: #e8e8e8;
+      font-size: 0.95rem;
+      padding: 10px 12px;
+      outline: none;
+      transition: border-color 0.15s;
+      width: 100%;
+    }
+    textarea { resize: vertical; min-height: 100px; font-family: inherit; }
+    textarea:focus, input[type="text"]:focus { border-color: #5b6af0; }
+
+    /* Mode tabs */
+    .mode-tabs {
+      display: flex;
+      gap: 6px;
+    }
+    .tab {
+      background: #111116;
+      border: 1px solid #2e2e38;
+      border-radius: 6px;
+      color: #888;
+      cursor: pointer;
+      font-size: 0.82rem;
+      padding: 6px 14px;
+      transition: all 0.15s;
+    }
+    .tab:hover { border-color: #5b6af0; color: #ccc; }
+    .tab.active { background: #1e2050; border-color: #5b6af0; color: #a0aaff; font-weight: 600; }
+
+    .mode-panel { display: none; flex-direction: column; gap: 16px; }
+    .mode-panel.visible { display: flex; }
+
+    .section-box {
+      border: 1px dashed #2e2e38;
+      border-radius: 8px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    /* File picker */
+    .file-row { display: flex; align-items: center; gap: 10px; }
+    .file-btn {
+      background: #22222a;
+      border: 1px solid #2e2e38;
+      border-radius: 6px;
+      color: #bbb;
+      cursor: pointer;
+      font-size: 0.85rem;
+      padding: 7px 14px;
+      white-space: nowrap;
+      transition: border-color 0.15s;
+      flex-shrink: 0;
+    }
+    .file-btn:hover { border-color: #5b6af0; color: #fff; }
+    #file-name { font-size: 0.85rem; color: #555; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #ref-audio-input { display: none; }
+    .clear-btn {
+      background: none; border: none; color: #444; cursor: pointer;
+      font-size: 0.85rem; margin-left: auto; padding: 4px 6px; flex-shrink: 0;
+    }
+    .clear-btn:hover { color: #e06c75; }
+
+    /* Voice design chips */
+    .chips-group { display: flex; flex-direction: column; gap: 6px; }
+    .chips-group-label { font-size: 0.72rem; color: #555; text-transform: uppercase; letter-spacing: 0.05em; }
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+    .chip {
+      background: #111116;
+      border: 1px solid #2e2e38;
+      border-radius: 20px;
+      color: #888;
+      cursor: pointer;
+      font-size: 0.8rem;
+      padding: 4px 12px;
+      transition: all 0.12s;
+      user-select: none;
+    }
+    .chip:hover { border-color: #5b6af0; color: #ccc; }
+    .chip.selected { background: #1e2050; border-color: #5b6af0; color: #a0aaff; }
+
+    .instruct-preview {
+      background: #111116;
+      border: 1px solid #2e2e38;
+      border-radius: 6px;
+      color: #666;
+      font-size: 0.82rem;
+      min-height: 32px;
+      padding: 7px 12px;
+    }
+    .instruct-preview.has-value { color: #a0aaff; }
+
+    /* Warning */
+    .warn {
+      background: #1f1a10;
+      border: 1px solid #5c4a10;
+      border-radius: 8px;
+      color: #c9973a;
+      font-size: 0.85rem;
+      padding: 10px 14px;
+    }
+
+    /* Submit row */
+    .submit-row { display: flex; align-items: center; gap: 16px; }
+
+    button[type="submit"] {
+      background: #5b6af0;
+      border: none;
+      border-radius: 8px;
+      color: #fff;
+      cursor: pointer;
+      font-size: 0.95rem;
+      font-weight: 600;
+      padding: 10px 28px;
+      transition: background 0.15s;
+    }
+    button[type="submit"]:hover { background: #4a59e0; }
+    button[type="submit"]:disabled { background: #333; color: #666; cursor: not-allowed; }
+
+    .timer {
+      font-size: 1.3rem;
+      font-variant-numeric: tabular-nums;
+      color: #5b6af0;
+      font-weight: 600;
+      min-width: 5ch;
+      display: none;
+    }
+    .timer.running { display: block; }
+    .timer.done { color: #98c379; display: block; }
+
+    /* Result */
+    .result { display: none; flex-direction: column; gap: 8px; }
+    .result.visible { display: flex; }
+    .result-label { font-size: 0.78rem; color: #555; text-transform: uppercase; letter-spacing: 0.05em; }
+    audio { width: 100%; border-radius: 6px; accent-color: #5b6af0; }
+
+    .error {
+      background: #2a1a1a;
+      border: 1px solid #5c2626;
+      border-radius: 8px;
+      color: #e06c75;
+      display: none;
+      font-size: 0.88rem;
+      padding: 10px 14px;
+    }
+    .error.visible { display: block; }
+  </style>
+</head>
+<body>
+<div class="card" style="margin-bottom:20px">
+  <h1>Word bank</h1>
+  <label class="field-label">
+    Word <span style="color:#444;text-transform:none;letter-spacing:0;font-size:0.75rem">— compare the WAV master vs the OGG copy</span>
+    <input type="text" id="bank-word" list="bank-suggest" placeholder="type a word…" autocomplete="off">
+    <datalist id="bank-suggest"></datalist>
+  </label>
+  <div class="submit-row">
+    <button type="submit" id="bank-play-btn">Look up</button>
+    <span id="bank-status" style="font-size:0.85rem;color:#888"></span>
+  </div>
+  <div id="bank-compare" style="display:none;flex-direction:column;gap:14px">
+    <div>
+      <div class="result-label">OGG (served) <span id="ogg-size" style="color:#888;text-transform:none;letter-spacing:0"></span></div>
+      <audio id="ogg-player" controls style="width:100%;accent-color:#5b6af0"></audio>
+      <div id="ogg-missing" style="display:none;color:#c9973a;font-size:0.85rem">no OGG copy available</div>
+    </div>
+    <div id="wav-row" style="display:none">
+      <div class="result-label">WAV master <span style="color:#555;text-transform:none;letter-spacing:0">— dev only</span> <span id="wav-size" style="color:#888;text-transform:none;letter-spacing:0"></span></div>
+      <audio id="wav-player" controls style="width:100%;accent-color:#5b6af0"></audio>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <h1>Text to Speech</h1>
+
+  <label class="field-label">
+    Text
+    <textarea id="text" placeholder="Enter text to synthesize…"></textarea>
+  </label>
+
+  <!-- Mode selector -->
+  <div class="field-label">
+    Voice mode
+    <div class="mode-tabs">
+      <button class="tab active" data-mode="clone">Voice cloning</button>
+      <button class="tab" data-mode="design">Voice design</button>
+    </div>
+  </div>
+
+  <!-- Voice cloning panel -->
+  <div class="mode-panel visible" id="panel-clone">
+    <div class="section-box">
+      <label class="field-label">
+        Reference audio
+        <div class="file-row">
+          <button type="button" class="file-btn" onclick="document.getElementById('ref-audio-input').click()">Choose file</button>
+          <span id="file-name">No file chosen</span>
+          <button type="button" class="clear-btn" id="clear-file" title="Remove">✕</button>
+          <input type="file" id="ref-audio-input" accept="audio/*">
+        </div>
+      </label>
+      <label class="field-label">
+        Reference transcript
+        <span style="color:#444;text-transform:none;letter-spacing:0;font-size:0.75rem">leave blank to auto-transcribe via Whisper (slow)</span>
+        <input type="text" id="ref-text" placeholder="Words spoken in the reference audio…">
+      </label>
+    </div>
+  </div>
+
+  <!-- Voice design panel -->
+  <div class="mode-panel" id="panel-design">
+    <div class="section-box">
+
+      <div class="chips-group">
+        <span class="chips-group-label">Gender <span style="color:#e06c75">*</span></span>
+        <div class="chips" data-group="gender" data-required="true">
+          <span class="chip" data-value="male">Male</span>
+          <span class="chip selected" data-value="female">Female</span>
+        </div>
+      </div>
+
+      <div class="chips-group">
+        <span class="chips-group-label">Age</span>
+        <div class="chips" data-group="age">
+          <span class="chip" data-value="child">Child</span>
+          <span class="chip" data-value="teenager">Teenager</span>
+          <span class="chip selected" data-value="young adult">Young adult</span>
+          <span class="chip" data-value="middle-aged">Middle-aged</span>
+          <span class="chip" data-value="elderly">Elderly</span>
+        </div>
+      </div>
+
+      <div class="chips-group">
+        <span class="chips-group-label">Pitch</span>
+        <div class="chips" data-group="pitch">
+          <span class="chip" data-value="very low pitch">Very low</span>
+          <span class="chip" data-value="low pitch">Low</span>
+          <span class="chip selected" data-value="moderate pitch">Moderate</span>
+          <span class="chip" data-value="high pitch">High</span>
+          <span class="chip" data-value="very high pitch">Very high</span>
+        </div>
+      </div>
+
+      <div class="chips-group">
+        <span class="chips-group-label">Accent</span>
+        <div class="chips" data-group="accent">
+          <span class="chip selected" data-value="american accent">American</span>
+          <span class="chip" data-value="british accent">British</span>
+          <span class="chip" data-value="australian accent">Australian</span>
+          <span class="chip" data-value="indian accent">Indian</span>
+          <span class="chip" data-value="chinese accent">Chinese</span>
+          <span class="chip" data-value="canadian accent">Canadian</span>
+          <span class="chip" data-value="korean accent">Korean</span>
+          <span class="chip" data-value="russian accent">Russian</span>
+        </div>
+      </div>
+
+      <div class="chips-group">
+        <span class="chips-group-label">Style</span>
+        <div class="chips" data-group="style">
+          <span class="chip" data-value="whisper">Whisper</span>
+        </div>
+      </div>
+
+      <div class="field-label">
+        Instruct string sent to model
+        <div class="instruct-preview" id="instruct-preview"></div>
+      </div>
+
+      <div class="warn">
+        Attribute control (gender/accent) is unreliable on very short text.
+        Use a full sentence for dependable results.
+      </div>
+
+    </div>
+  </div>
+
+  <!-- Advanced tuning (applies to all modes) -->
+  <div class="section-box">
+    <span class="chips-group-label">Advanced</span>
+    <label class="field-label" style="text-transform:none;letter-spacing:0;color:#888">
+      Guidance scale — how strongly the voice settings are followed
+      <div style="display:flex;align-items:center;gap:12px">
+        <input type="range" id="guidance" min="1" max="7" step="0.5" value="2" style="flex:1;accent-color:#5b6af0">
+        <span id="guidance-val" style="color:#a0aaff;font-variant-numeric:tabular-nums;min-width:3ch">2.0</span>
+      </div>
+    </label>
+    <label class="field-label" style="text-transform:none;letter-spacing:0;color:#888">
+      Seed — fixed integer for reproducible output; blank = random each time
+      <input type="text" id="seed" inputmode="numeric" placeholder="e.g. 42 (blank = random)">
+    </label>
+  </div>
+
+  <div class="submit-row">
+    <button type="submit" id="submit-btn">Generate</button>
+    <span class="timer" id="timer">0.0s</span>
+  </div>
+
+  <div class="error" id="error"></div>
+
+  <div class="result" id="result">
+    <span class="result-label">Output</span>
+    <audio id="player" controls></audio>
+  </div>
+</div>
+
+<script>
+  // Same-origin relative URLs: works when the frontend is served by the API
+  // server (SERVE_FRONTEND=1). Override window.API_BASE to point elsewhere.
+  const API_BASE = window.API_BASE || '';
+  const API = `${API_BASE}/v1/tts`;
+  const BANK = `${API_BASE}/v1/bank`;
+
+  // ---- Word bank lookup ----
+  const bankWord = document.getElementById('bank-word');
+  const bankList = document.getElementById('bank-suggest');
+  const bankBtn = document.getElementById('bank-play-btn');
+  const bankStatus = document.getElementById('bank-status');
+  const bankCompare = document.getElementById('bank-compare');
+  const wavRow = document.getElementById('wav-row');
+  const wavPlayer = document.getElementById('wav-player');
+  const oggPlayer = document.getElementById('ogg-player');
+  const wavSize = document.getElementById('wav-size');
+  const oggSize = document.getElementById('ogg-size');
+  const oggMissing = document.getElementById('ogg-missing');
+
+  const kb = b => b == null ? '' : `(${(b / 1024).toFixed(1)} KB)`;
+
+  let suggestTimer = null;
+  bankWord.addEventListener('input', () => {
+    const p = bankWord.value.trim();
+    clearTimeout(suggestTimer);
+    if (!p) { bankList.innerHTML = ''; return; }
+    suggestTimer = setTimeout(async () => {
+      try {
+        const res = await fetch(`${BANK}?prefix=${encodeURIComponent(p)}&limit=10`);
+        const { words } = await res.json();
+        bankList.innerHTML = words.map(w => `<option value="${w}">`).join('');
+      } catch { /* ignore autocomplete errors */ }
+    }, 120);
+  });
+
+  async function lookupBank() {
+    const word = bankWord.value.trim();
+    if (!word) { bankWord.focus(); return; }
+    bankStatus.textContent = 'looking up…';
+    bankCompare.style.display = 'none';
+    try {
+      const res = await fetch(`${BANK}/${encodeURIComponent(word)}/info`);
+      if (res.status === 404) { bankStatus.textContent = `“${word}” is not in the bank`; return; }
+      if (!res.ok) { bankStatus.textContent = `error ${res.status}`; return; }
+      const info = await res.json();
+      bankStatus.textContent = '';
+      bankCompare.style.display = 'flex';
+
+      // OGG is the served asset (primary).
+      if (info.ogg.exists) {
+        const ratio = info.wav.exists && info.wav.bytes
+          ? ` · ${(info.wav.bytes / info.ogg.bytes).toFixed(1)}× smaller than WAV` : '';
+        oggSize.textContent = kb(info.ogg.bytes) + ratio;
+        oggPlayer.style.display = 'block';
+        oggMissing.style.display = 'none';
+        oggPlayer.src = `${BANK}/${encodeURIComponent(word)}?format=ogg`;
+      } else {
+        oggSize.textContent = '';
+        oggPlayer.style.display = 'none';
+        oggMissing.style.display = 'block';
+      }
+
+      // WAV master is dev-only — shown only if a WAV root is mounted.
+      if (info.wav.exists) {
+        wavRow.style.display = 'block';
+        wavSize.textContent = kb(info.wav.bytes);
+        wavPlayer.src = `${BANK}/${encodeURIComponent(word)}?format=wav`;
+      } else {
+        wavRow.style.display = 'none';
+        wavPlayer.removeAttribute('src');
+      }
+    } catch (e) {
+      bankStatus.textContent = e.message;
+    }
+  }
+  bankBtn.addEventListener('click', lookupBank);
+  bankWord.addEventListener('keydown', e => { if (e.key === 'Enter') lookupBank(); });
+
+  // Mode tabs
+  let activeMode = 'clone';
+  document.querySelectorAll('.tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+      activeMode = tab.dataset.mode;
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.mode-panel').forEach(p => p.classList.remove('visible'));
+      tab.classList.add('active');
+      document.getElementById(`panel-${activeMode}`).classList.add('visible');
+    });
+  });
+
+  // File picker
+  const fileInput  = document.getElementById('ref-audio-input');
+  const fileNameEl = document.getElementById('file-name');
+  fileInput.addEventListener('change', () => {
+    fileNameEl.textContent = fileInput.files[0]?.name ?? 'No file chosen';
+  });
+  document.getElementById('clear-file').addEventListener('click', () => {
+    fileInput.value = '';
+    fileNameEl.textContent = 'No file chosen';
+  });
+
+  // Chips — mutually exclusive within each group
+  const selectedByGroup = {};
+  document.querySelectorAll('.chips').forEach(group => {
+    const g = group.dataset.group;
+    // Init from pre-selected chips
+    const pre = group.querySelector('.chip.selected');
+    selectedByGroup[g] = pre ? pre.dataset.value : null;
+
+    const required = group.dataset.required === 'true';
+    group.querySelectorAll('.chip').forEach(chip => {
+      chip.addEventListener('click', () => {
+        if (selectedByGroup[g] === chip.dataset.value) {
+          if (!required) {
+            chip.classList.remove('selected');
+            selectedByGroup[g] = null;
+          }
+          // required group: keep selection, do nothing
+        } else {
+          group.querySelectorAll('.chip').forEach(c => c.classList.remove('selected'));
+          chip.classList.add('selected');
+          selectedByGroup[g] = chip.dataset.value;
+        }
+        updateInstructPreview();
+      });
+    });
+  });
+
+  function buildInstruct() {
+    return Object.values(selectedByGroup).filter(Boolean).join(', ');
+  }
+
+  function updateInstructPreview() {
+    const el = document.getElementById('instruct-preview');
+    const v = buildInstruct();
+    el.textContent = v || '(nothing selected)';
+    el.className = 'instruct-preview' + (v ? ' has-value' : '');
+  }
+  updateInstructPreview();
+
+  // Guidance slider live value
+  const guidanceEl = document.getElementById('guidance');
+  const guidanceValEl = document.getElementById('guidance-val');
+  guidanceEl.addEventListener('input', () => {
+    guidanceValEl.textContent = parseFloat(guidanceEl.value).toFixed(1);
+  });
+
+  // Timer
+  function startTimer() {
+    const timerEl = document.getElementById('timer');
+    const start = performance.now();
+    timerEl.className = 'timer running';
+    timerEl.textContent = '0.0s';
+    const iv = setInterval(() => {
+      timerEl.textContent = `${((performance.now() - start) / 1000).toFixed(1)}s`;
+    }, 100);
+    return () => {
+      clearInterval(iv);
+      timerEl.className = 'timer done';
+      timerEl.textContent = `${((performance.now() - start) / 1000).toFixed(1)}s`;
+    };
+  }
+
+  // Submit
+  document.getElementById('submit-btn').addEventListener('click', async () => {
+    const text = document.getElementById('text').value.trim();
+    if (!text) { document.getElementById('text').focus(); return; }
+
+    document.getElementById('error').className = 'error';
+    document.getElementById('result').className = 'result';
+    document.getElementById('submit-btn').disabled = true;
+
+    const stop = startTimer();
+
+    try {
+      const form = new FormData();
+      form.append('text', text);
+
+      if (activeMode === 'clone') {
+        const file = fileInput.files[0];
+        if (file) {
+          form.append('ref_audio', file);
+          const rt = document.getElementById('ref-text').value.trim();
+          if (rt) form.append('ref_text', rt);
+        }
+      } else {
+        const instruct = buildInstruct();
+        if (instruct) form.append('instruct', instruct);
+      }
+
+      // Advanced tuning (all modes)
+      form.append('guidance_scale', guidanceEl.value);
+      const seed = document.getElementById('seed').value.trim();
+      if (seed !== '') form.append('seed', seed);
+
+      const res = await fetch(API, { method: 'POST', body: form });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({ detail: res.statusText }));
+        throw new Error(body.detail ?? res.statusText);
+      }
+
+      const blob = await res.blob();
+      const player = document.getElementById('player');
+      player.src = URL.createObjectURL(blob);
+      document.getElementById('result').className = 'result visible';
+      player.play();
+    } catch (e) {
+      const el = document.getElementById('error');
+      el.textContent = e.message;
+      el.className = 'error visible';
+    } finally {
+      stop();
+      document.getElementById('submit-btn').disabled = false;
+    }
+  });
+
+  document.getElementById('text').addEventListener('keydown', e => {
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) document.getElementById('submit-btn').click();
+  });
+</script>
+</body>
+</html>
