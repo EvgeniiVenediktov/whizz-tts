@@ -1,7 +1,9 @@
-"""Word-bank CLI:  python -m wordbank <build|status|export> ...
+"""Word-bank CLI:  python -m wordbank <command> ...
 
-Examples:
-  python -m wordbank build --words words.txt --voice en-US-Chirp3-HD-Charon
+Commands: build (Chirp sync) · batch / batch-submit / batch-collect / batch-run
+(Gemini async) · status · export.
+
+  python -m wordbank batch-run --words words.txt --voice Kore
   python -m wordbank status
   python -m wordbank export --output bank.csv
 """
@@ -26,6 +28,15 @@ def _load_words(path: str) -> List[str]:
     return words
 
 
+def _ingest(cfg: Config, words_path: str) -> Manifest:
+    """Load a word file into the manifest (deduped) and report what's new."""
+    words = _load_words(words_path)
+    m = Manifest(cfg.db)
+    added = m.add_words(words, cfg.lang)
+    print(f"{len(words)} words in file; {added} newly added to manifest")
+    return m
+
+
 def _build_backend(cfg: Config):
     if cfg.backend == "chirp":
         from .backends.chirp import ChirpTTSBackend
@@ -33,16 +44,27 @@ def _build_backend(cfg: Config):
     raise SystemExit(f"unknown backend: {cfg.backend}")
 
 
+def _add_gemini_args(p, *, words=True, instruction=True, chunk=True, poll=True):
+    """Common args for the Gemini batch subcommands (which differ only slightly)."""
+    if words:
+        p.add_argument("--words", required=True, help="text file, one word per line")
+    p.add_argument("--voice", default="Kore", help="Gemini prebuilt voice name")
+    p.add_argument("--model", default="gemini-3.1-flash-tts-preview")
+    if instruction:
+        p.add_argument("--instruction", default=None,
+                       help="style direction prepended to each word ('' = bare word)")
+    if chunk:
+        p.add_argument("--chunk", type=int, default=2000, help="words per batch job")
+    if poll:
+        p.add_argument("--poll-interval", type=int, default=60, dest="poll_interval")
+
+
 def cmd_build(args, cfg: Config) -> None:
     from .pipeline import WordBankPipeline
     from .ratelimit import RateLimiter
     from .verify import Verifier
 
-    words = _load_words(args.words)
-    m = Manifest(cfg.db)
-    added = m.add_words(words, cfg.lang)
-    print(f"{len(words)} words in file; {added} newly added to manifest")
-
+    m = _ingest(cfg, args.words)
     limiter = RateLimiter(args.rpm) if args.rpm else None
     pipe = WordBankPipeline(
         m, _build_backend(cfg), Verifier(), cfg.out_dir,
@@ -69,11 +91,7 @@ def cmd_batch_submit(args, cfg: Config) -> None:
     """Submit pending words as async job(s) and exit — safe to power off after."""
     from .gemini_batch import submit_pending
 
-    words = _load_words(args.words)
-    m = Manifest(cfg.db)
-    added = m.add_words(words, cfg.lang)
-    print(f"{len(words)} words in file; {added} newly added to manifest")
-
+    m = _ingest(cfg, args.words)
     jobs = submit_pending(m, _make_batch(args), lang=cfg.lang, chunk=args.chunk)
     print(f"\nsubmitted {len(jobs)} batch job(s): {jobs}")
     print("job ids saved in the manifest. Collect later (jobs expire after 48h) with:")
@@ -99,11 +117,7 @@ def cmd_batch(args, cfg: Config) -> None:
     """Blocking convenience: submit then poll+collect in one process."""
     from .gemini_batch import run_batch
 
-    words = _load_words(args.words)
-    m = Manifest(cfg.db)
-    added = m.add_words(words, cfg.lang)
-    print(f"{len(words)} words in file; {added} newly added to manifest")
-
+    m = _ingest(cfg, args.words)
     counts = run_batch(
         m, _make_batch(args), cfg.out_dir, lang=cfg.lang, voice=args.voice,
         chunk=args.chunk, poll_interval=args.poll_interval,
@@ -116,11 +130,7 @@ def cmd_batch_run(args, cfg: Config) -> None:
     """Quota-aware waves: submit→collect→repeat until done (keep the laptop on)."""
     from .gemini_batch import run_in_waves
 
-    words = _load_words(args.words)
-    m = Manifest(cfg.db)
-    added = m.add_words(words, cfg.lang)
-    print(f"{len(words)} words in file; {added} newly added to manifest")
-
+    m = _ingest(cfg, args.words)
     counts = run_in_waves(
         m, _make_batch(args), cfg.out_dir, lang=cfg.lang, voice=args.voice,
         chunk=args.chunk, poll_interval=args.poll_interval,
@@ -172,43 +182,22 @@ def main(argv=None) -> None:
     b.set_defaults(func=cmd_build)
 
     g = sub.add_parser("batch", help="generate via Gemini Batch API (async, ~half cost)")
-    g.add_argument("--words", required=True, help="text file, one word per line")
-    g.add_argument("--voice", default="Kore", help="Gemini prebuilt voice name")
-    g.add_argument("--model", default="gemini-3.1-flash-tts-preview")
-    g.add_argument("--instruction", default=None,
-                   help="style direction prepended to each word "
-                        "(default: standard instruction; '' = bare word)")
-    g.add_argument("--chunk", type=int, default=2000, help="words per batch job")
-    g.add_argument("--poll-interval", type=int, default=60, dest="poll_interval")
+    _add_gemini_args(g)
     g.set_defaults(func=cmd_batch)
 
     bs = sub.add_parser("batch-submit",
                         help="submit async job(s) and exit — safe to power off after")
-    bs.add_argument("--words", required=True, help="text file, one word per line")
-    bs.add_argument("--voice", default="Kore", help="Gemini prebuilt voice name")
-    bs.add_argument("--model", default="gemini-3.1-flash-tts-preview")
-    bs.add_argument("--instruction", default=None,
-                    help="style direction prepended to each word ('' = bare word)")
-    bs.add_argument("--chunk", type=int, default=2000, help="words per batch job")
+    _add_gemini_args(bs, poll=False)
     bs.set_defaults(func=cmd_batch_submit)
 
     bc = sub.add_parser("batch-collect",
                         help="poll in-flight job(s) and write clips (run in the morning)")
-    bc.add_argument("--voice", default="Kore",
-                    help="must match the --voice used at submit (output folder naming)")
-    bc.add_argument("--model", default="gemini-3.1-flash-tts-preview")
-    bc.add_argument("--poll-interval", type=int, default=60, dest="poll_interval")
+    _add_gemini_args(bc, words=False, instruction=False, chunk=False)
     bc.set_defaults(func=cmd_batch_collect)
 
     br = sub.add_parser("batch-run",
                         help="quota-aware waves: submit+collect+repeat until done (laptop stays on)")
-    br.add_argument("--words", required=True, help="text file, one word per line")
-    br.add_argument("--voice", default="Kore", help="Gemini prebuilt voice name")
-    br.add_argument("--model", default="gemini-3.1-flash-tts-preview")
-    br.add_argument("--instruction", default=None,
-                    help="style direction prepended to each word ('' = bare word)")
-    br.add_argument("--chunk", type=int, default=2000, help="words per batch job")
-    br.add_argument("--poll-interval", type=int, default=60, dest="poll_interval")
+    _add_gemini_args(br)
     br.set_defaults(func=cmd_batch_run)
 
     s = sub.add_parser("status", help="show counts by status")

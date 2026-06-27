@@ -1,21 +1,16 @@
 """Orchestration: pull pending words → synthesize → post-process → verify → write."""
 import pathlib
-import re
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 from . import postproc
 from .backends.base import TTSBackend
 from .manifest import FAILED, QUARANTINED, VERIFIED, Manifest
+from .paths import safe_filename
 from .ratelimit import RateLimiter
 from .verify import Verifier
 
 _LANG_TO_CODE = {"en": "en-US"}
-
-
-def _safe(word: str) -> str:
-    s = re.sub(r"[^a-z0-9]+", "-", word.lower()).strip("-")
-    return s or "word"
 
 
 class VerificationError(Exception):
@@ -39,7 +34,7 @@ class WordBankPipeline:
     def _word_path(self, word_id: int, word: str) -> pathlib.Path:
         shard = word_id // 1000
         d = self.out_dir / self.lang / f"{self.backend.name}-{self.voice}" / str(shard)
-        return d / f"{word_id}_{_safe(word)}.ogg"
+        return d / f"{word_id}_{safe_filename(word)}.ogg"
 
     def process_row(self, row) -> str:
         word_id, word = row["id"], row["word"]

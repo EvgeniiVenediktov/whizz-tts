@@ -6,7 +6,8 @@ import soundfile as sf
 
 from wordbank.backends.chirp import ChirpTTSBackend
 from wordbank.manifest import Manifest, PENDING, VERIFIED, QUARANTINED
-from wordbank.pipeline import WordBankPipeline, _safe
+from wordbank.pipeline import WordBankPipeline
+from wordbank.paths import safe_filename
 from wordbank.verify import Verifier, normalize
 from wordbank import postproc
 
@@ -89,9 +90,9 @@ def test_to_ogg_magic_bytes():
 
 
 def test_safe_filename():
-    assert _safe("Cat") == "cat"
-    assert _safe("don't") == "don-t"
-    assert _safe("!!!") == "word"
+    assert safe_filename("Cat") == "cat"
+    assert safe_filename("don't") == "don-t"
+    assert safe_filename("!!!") == "word"
 
 
 # ---- pipeline end-to-end (all mocked) ----

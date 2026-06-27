@@ -5,7 +5,15 @@ Used to keep WAV masters and their OGG copies in parallel trees:
   output/words_ogg/en/gemini-Kore/0/1_the.ogg
 """
 import os
+import re
 from typing import Optional
+
+_SLUG = re.compile(r"[^a-z0-9]+")
+
+
+def safe_filename(word: str) -> str:
+    """Filesystem-safe slug for a word: lowercase, non-alphanumerics → '-'."""
+    return _SLUG.sub("-", word.lower()).strip("-") or "word"
 
 
 def mirror_path(src_path: str, src_root: str, dest_root: str,

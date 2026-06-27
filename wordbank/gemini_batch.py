@@ -27,7 +27,7 @@ import wave
 from typing import Callable, Iterable, List, Optional
 
 from .manifest import DONE, FAILED, SUBMITTED, Manifest
-from .pipeline import _safe
+from .paths import safe_filename
 
 # NOTE: not every TTS model supports batchGenerateContent. As of this writing
 # gemini-3.1-flash-tts-preview and gemini-2.5-pro-preview-tts do; the older
@@ -177,7 +177,7 @@ def _write_and_mark(manifest: Manifest, out_dir: pathlib.Path, lang: str,
     # location-independent: the server resolves it under WAV_ROOT/OGG_ROOT,
     # which differ between dev (output/words) and the container (/data/words).
     rel = os.path.join(lang, f"gemini-{voice}", str(row["id"] // 1000),
-                       f"{row['id']}_{_safe(row['word'])}.wav")
+                       f"{row['id']}_{safe_filename(row['word'])}.wav")
     path = out_dir / rel
     path.parent.mkdir(parents=True, exist_ok=True)
     write_wav(path, pcm)

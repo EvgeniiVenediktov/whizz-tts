@@ -10,6 +10,7 @@ import threading
 from typing import List, Optional
 
 _READY = ("done", "verified")
+_READY_SQL = "status IN ({})".format(", ".join(f"'{s}'" for s in _READY))
 
 
 def _prefix_upper(prefix: str) -> str:
@@ -22,6 +23,7 @@ class BankLookup:
         self._db_path = db_path
         self._lock = threading.Lock()
         self._conn = None
+        self._ready_count = None   # memoized; the served bank is static per process
         self._open()
 
     def _open(self) -> None:
@@ -50,14 +52,18 @@ class BankLookup:
         return os.path.abspath(self._db_path) if self._db_path else None
 
     def count(self) -> int:
-        """Number of words ready to serve (done/verified). Diagnostic."""
+        """Number of words ready to serve (done/verified). Memoized — the served
+        bank is read-only and static per process, so /health stays cheap."""
         with self._lock:
+            if self._ready_count is not None:
+                return self._ready_count
             self._open()
             if self._conn is None:
                 return 0
-            return self._conn.execute(
-                "SELECT COUNT(*) FROM words WHERE status IN ('done', 'verified')"
+            self._ready_count = self._conn.execute(
+                f"SELECT COUNT(*) FROM words WHERE {_READY_SQL}"
             ).fetchone()[0]
+            return self._ready_count
 
     def languages(self) -> List[dict]:
         """Languages the bank can serve: distinct `lang` codes with ready counts."""
@@ -66,7 +72,7 @@ class BankLookup:
             if self._conn is None:
                 return []
             rows = self._conn.execute(
-                "SELECT lang, COUNT(*) FROM words WHERE status IN ('done', 'verified') "
+                f"SELECT lang, COUNT(*) FROM words WHERE {_READY_SQL} "
                 "GROUP BY lang ORDER BY lang"
             ).fetchall()
         return [{"code": r[0], "words": r[1]} for r in rows]
@@ -79,8 +85,8 @@ class BankLookup:
             if self._conn is None:
                 return None
             return self._conn.execute(
-                "SELECT word, lang, file_path, status FROM words "
-                "WHERE word = ? AND lang = ? AND status IN ('done', 'verified')",
+                f"SELECT word, lang, file_path, status FROM words "
+                f"WHERE word = ? AND lang = ? AND {_READY_SQL}",
                 (w, lang),
             ).fetchone()
 
@@ -94,8 +100,8 @@ class BankLookup:
             if self._conn is None:
                 return []
             rows = self._conn.execute(
-                "SELECT word FROM words WHERE lang = ? AND word >= ? AND word < ? "
-                "AND status IN ('done', 'verified') ORDER BY word LIMIT ?",
+                f"SELECT word FROM words WHERE lang = ? AND word >= ? AND word < ? "
+                f"AND {_READY_SQL} ORDER BY word LIMIT ?",
                 (lang, p, _prefix_upper(p), limit),
             ).fetchall()
         return [r[0] for r in rows]
@@ -105,3 +111,4 @@ class BankLookup:
             if self._conn is not None:
                 self._conn.close()
                 self._conn = None
+            self._ready_count = None
