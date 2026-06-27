@@ -111,6 +111,6 @@ pytest --integration tests/test_integration.py      # loads OmniVoice (slow)
 ## TODO
 
 - [ ] **Verify voice cloning** — exercise the OmniVoice `ref_audio` path end-to-end (it's wired but never fully validated against a real reference clip).
-- [ ] **Generate British-accent audios** — a parallel bank with an `en-GB` voice/accent (new `lang`/voice → shows up automatically in `/v1/languages`).
-- [ ] **Add multi-language support** — generate per-language banks (Gemini covers 100+); serving + `/v1/languages` are already data-driven, so it's mostly a generation + word-list task per language.
+- [ ] **en-US + en-GB accent banks via Chirp** *(in progress)* — Chirp 3 HD has per-locale voices; generate `en-us` and `en-gb` banks. See AGENTS.md → *Runbook: generate an accent bank with Chirp*.
+- [ ] **Add multi-language support** — same Chirp/Gemini pattern per locale; serving + `/v1/languages` are already data-driven (language-scoped lookup + `(lang, word)` index), so it's mostly a generation + word-list task per language.
 - [ ] **Add JWT auth** — the API is currently open; protect it behind bearer tokens (verify signature/expiry, optional scopes for `/v1/tts` vs read-only bank access).

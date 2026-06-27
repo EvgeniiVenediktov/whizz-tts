@@ -6,7 +6,7 @@ import soundfile as sf
 
 from wordbank.backends.chirp import ChirpTTSBackend
 from wordbank.manifest import Manifest, PENDING, VERIFIED, QUARANTINED
-from wordbank.pipeline import WordBankPipeline
+from wordbank.pipeline import WordBankPipeline, _bcp47
 from wordbank.paths import safe_filename
 from wordbank.verify import Verifier, normalize
 from wordbank import postproc
@@ -93,6 +93,26 @@ def test_safe_filename():
     assert safe_filename("Cat") == "cat"
     assert safe_filename("don't") == "don-t"
     assert safe_filename("!!!") == "word"
+
+
+def test_bcp47_language_codes():
+    assert _bcp47("en-us") == "en-US"      # Chirp wants region uppercased
+    assert _bcp47("en-gb") == "en-GB"
+    assert _bcp47("pt-br") == "pt-BR"
+    assert _bcp47("fr") == "fr"
+
+
+def test_pipeline_without_verifier_writes(tmp_path):
+    """verifier=None → clip is written with no STT (used for bulk Chirp runs)."""
+    m = Manifest(str(tmp_path / "wb.db"))
+    m.add_words(["cat"], "en-gb")
+    pipe = WordBankPipeline(
+        m, ChirpTTSBackend(synth_fn=fake_synth), None, str(tmp_path / "out"),
+        lang="en-gb", voice="en-GB-Chirp3-HD-Charon",
+    )
+    assert pipe.language_code == "en-GB"
+    assert pipe.run()[VERIFIED] == 1
+    assert list((tmp_path / "out").rglob("*.ogg"))
 
 
 # ---- pipeline end-to-end (all mocked) ----

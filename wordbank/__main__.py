@@ -62,12 +62,15 @@ def _add_gemini_args(p, *, words=True, instruction=True, chunk=True, poll=True):
 def cmd_build(args, cfg: Config) -> None:
     from .pipeline import WordBankPipeline
     from .ratelimit import RateLimiter
-    from .verify import Verifier
 
     m = _ingest(cfg, args.words)
     limiter = RateLimiter(args.rpm) if args.rpm else None
+    verifier = None
+    if not args.no_verify:
+        from .verify import Verifier
+        verifier = Verifier()
     pipe = WordBankPipeline(
-        m, _build_backend(cfg), Verifier(), cfg.out_dir,
+        m, _build_backend(cfg), verifier, cfg.out_dir,
         lang=cfg.lang, voice=cfg.voice, max_attempts=cfg.max_attempts,
         rate_limiter=limiter,
     )
@@ -179,6 +182,8 @@ def main(argv=None) -> None:
                    help="parallel worker threads (1 = sequential)")
     b.add_argument("--rpm", type=float, default=200,
                    help="max requests/min (Chirp 3 HD quota = 200; 0 = unlimited)")
+    b.add_argument("--no-verify", action="store_true", dest="no_verify",
+                   help="skip local Whisper verification (impractical at scale)")
     b.set_defaults(func=cmd_build)
 
     g = sub.add_parser("batch", help="generate via Gemini Batch API (async, ~half cost)")

@@ -10,7 +10,12 @@ from .paths import safe_filename
 from .ratelimit import RateLimiter
 from .verify import Verifier
 
-_LANG_TO_CODE = {"en": "en-US"}
+def _bcp47(lang: str) -> str:
+    """Cloud TTS language code from a bank lang code: 'en-us'→'en-US', 'fr'→'fr'."""
+    parts = lang.split("-")
+    if len(parts) == 2:
+        return f"{parts[0].lower()}-{parts[1].upper()}"
+    return lang.lower()
 
 
 class VerificationError(Exception):
@@ -18,15 +23,16 @@ class VerificationError(Exception):
 
 
 class WordBankPipeline:
-    def __init__(self, manifest: Manifest, backend: TTSBackend, verifier: Verifier,
-                 out_dir: str, lang: str = "en", voice: Optional[str] = None,
-                 max_attempts: int = 3, rate_limiter: Optional[RateLimiter] = None):
+    def __init__(self, manifest: Manifest, backend: TTSBackend,
+                 verifier: Optional[Verifier], out_dir: str, lang: str = "en",
+                 voice: Optional[str] = None, max_attempts: int = 3,
+                 rate_limiter: Optional[RateLimiter] = None):
         self.manifest = manifest
         self.backend = backend
-        self.verifier = verifier
+        self.verifier = verifier          # None → skip STT verification
         self.out_dir = pathlib.Path(out_dir)
         self.lang = lang
-        self.language_code = _LANG_TO_CODE.get(lang, lang)
+        self.language_code = _bcp47(lang)
         self.voice = voice or getattr(backend, "_voice", "default")
         self.max_attempts = max_attempts
         self.rate_limiter = rate_limiter
@@ -49,9 +55,10 @@ class WordBankPipeline:
             pcm = postproc.peak_normalize(
                 postproc.trim_silence(res.pcm, res.sample_rate)
             )
-            ok, transcript = self.verifier.verify(pcm, res.sample_rate, word)
-            if not ok:
-                raise VerificationError(f"STT mismatch: heard {transcript!r}")
+            if self.verifier is not None:
+                ok, transcript = self.verifier.verify(pcm, res.sample_rate, word)
+                if not ok:
+                    raise VerificationError(f"STT mismatch: heard {transcript!r}")
 
             path = self._word_path(word_id, word)
             path.parent.mkdir(parents=True, exist_ok=True)
