@@ -41,34 +41,37 @@ and `WORDBANK_PLAN.md`.
 - `wordbank/`: `manifest.py` (SQLite) · `gemini_batch.py` (batch pipeline) · `lookup.py` (read-only search) · `pipeline.py` (sync Chirp path) · `languages.py` · `config.py` · `__main__.py` (CLI: `batch` / `batch-run` / `batch-submit` / `batch-collect` / `status` / `export`)
 - `scripts/`: `fetch_wordlist` · `encode_wavs` · `package_bank` · `gemini_batch_cleanup` · `gemini_batch_smoke` · `list_models` · `migrate_manifest_paths`
 - `frontend/index.html` · `Dockerfile` (`--build-arg WITH_MODEL`) · `docker-compose.yml` (profiles `bank` / `full`)
-- Open work is the **TODO** at the bottom of `README.md` (accent phrases via Chirp voice cloning, multi-language, JWT auth).
+- Open work is the **TODO** at the bottom of `README.md` (verify voice cloning, en-GB bank, multi-language, JWT auth).
 
 ---
 
-## Runbook: accent phrases via Chirp voice cloning (Gemini reference)
+## Runbook: generate an accent bank with Chirp (en-US / en-GB / …)
 
-**Not for the word bank** — that stays the Gemini batch path. Chirp here is for
-full **phrases** in a target accent, by cloning a reference voice. No pipeline
-code exists for this yet; it's a new capability, separate from the bank.
+Chirp 3 HD (Cloud TTS) has distinct per-locale voices, so it's the backend for
+accents. Needs **`GOOGLE_APPLICATION_CREDENTIALS`** (a GCP service account with
+the Text-to-Speech API) — NOT the Gemini key. Quota: **200 rpm** (`--rpm`/`--workers`).
 
-Workflow:
-1. **Gemini** — generate a short reference phrase (≤10 s) in the target accent →
-   a WAV + its exact transcript. (Gemini does accents via the voice / instruction.)
-2. **Chirp 3 Instant Custom Voice** — create a *voice cloning key* (a string) from
-   that reference audio + transcript (+ the required consent recording). Cloud TTS
-   API; needs `GOOGLE_APPLICATION_CREDENTIALS` (NOT the Gemini key).
-3. **Synthesize** phrases with the cloning key + text + language code (streaming /
-   long-form supported; multilingual transfer works).
+1. **Pick a voice** for the locale (names are `<locale>-Chirp3-HD-<Name>`):
+   ```bash
+   python scripts/list_chirp_voices.py en-GB
+   ```
+2. **Generate** — `--lang` is the bank/serving code; the pipeline maps it to
+   BCP-47 for Chirp (`en-gb`→`en-GB`). Use `--no-verify` for bulk (Whisper-
+   verifying every word is impractical at 10⁵+ scale):
+   ```bash
+   python -m wordbank build --backend chirp --lang en-gb \
+     --voice en-GB-Chirp3-HD-<Name> --words data/words_en.txt \
+     --workers 16 --rpm 200 --no-verify
+   ```
+   (en-US: `--lang en-us --voice en-US-Chirp3-HD-<Name>`.) Output goes to
+   `output/words/<lang>/chirp-<voice>/…`; manifest `lang=<lang>`. Resumable + deduped.
+3. **Encode + package** as usual (`scripts/encode_wavs.py`, `scripts/package_bank.py`).
+4. **Listen** to samples, then add the locale to `wordbank/languages.py`
+   `SUPPORTED_LANGUAGES` (presence = verified). It then appears in `/v1/languages`.
 
-⚠️ Verify before relying on this:
-- Instant Custom Voice is **access-gated** and requires a **consent statement**
-  recording — confirm the project is allowlisted.
-- It's built for *consented human* voices; cloning a *Gemini-generated* clip is
-  unusual — confirm Cloud TTS accepts a synthetic reference and how to satisfy
-  the consent step (likely: generate the consent phrase with Gemini too).
-- Reference ≤10 s, single-channel, supported encoding.
-
-Docs: https://docs.cloud.google.com/text-to-speech/docs/chirp3-instant-custom-voice
+Serving is already language-scoped (`/v1/bank?lang=en-gb`, backed by the
+`(lang, word)` index) — no serving code change needed. This is the **Chirp sync**
+path (separate from the Gemini batch path used for the en-us bank so far).
 
 ## Runbook: package the bank for upload
 
