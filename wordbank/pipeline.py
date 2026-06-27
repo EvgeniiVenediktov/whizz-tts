@@ -1,4 +1,6 @@
-"""Orchestration: pull pending words → synthesize → post-process → verify → write."""
+"""Sync generation pipeline: pull pending → synthesize → post-process →
+(optionally verify) → write a WAV master. Backend-agnostic (see backends/)."""
+import os
 import pathlib
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
@@ -9,13 +11,6 @@ from .manifest import FAILED, QUARANTINED, VERIFIED, Manifest
 from .paths import safe_filename
 from .ratelimit import RateLimiter
 from .verify import Verifier
-
-def _bcp47(lang: str) -> str:
-    """Cloud TTS language code from a bank lang code: 'en-us'→'en-US', 'fr'→'fr'."""
-    parts = lang.split("-")
-    if len(parts) == 2:
-        return f"{parts[0].lower()}-{parts[1].upper()}"
-    return lang.lower()
 
 
 class VerificationError(Exception):
@@ -32,15 +27,17 @@ class WordBankPipeline:
         self.verifier = verifier          # None → skip STT verification
         self.out_dir = pathlib.Path(out_dir)
         self.lang = lang
-        self.language_code = _bcp47(lang)
+        self.language_code = lang     # backends that don't need it ignore it
         self.voice = voice or getattr(backend, "_voice", "default")
         self.max_attempts = max_attempts
         self.rate_limiter = rate_limiter
 
-    def _word_path(self, word_id: int, word: str) -> pathlib.Path:
+    def _rel_path(self, word_id: int, word: str) -> str:
+        """WAV path relative to the bank root (out_dir) — stored in the manifest,
+        resolved at serve time under WAV_ROOT/OGG_ROOT (so it's portable)."""
         shard = word_id // 1000
-        d = self.out_dir / self.lang / f"{self.backend.name}-{self.voice}" / str(shard)
-        return d / f"{word_id}_{safe_filename(word)}.ogg"
+        return os.path.join(self.lang, f"{self.backend.name}-{self.voice}",
+                            str(shard), f"{word_id}_{safe_filename(word)}.wav")
 
     def process_row(self, row) -> str:
         word_id, word = row["id"], row["word"]
@@ -60,11 +57,12 @@ class WordBankPipeline:
                 if not ok:
                     raise VerificationError(f"STT mismatch: heard {transcript!r}")
 
-            path = self._word_path(word_id, word)
+            rel = self._rel_path(word_id, word)
+            path = self.out_dir / rel
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(postproc.to_ogg(pcm, res.sample_rate))
+            postproc.write_wav(path, pcm, res.sample_rate)
             self.manifest.set_status(
-                word_id, VERIFIED, file_path=str(path),
+                word_id, VERIFIED, file_path=rel,
                 transcript=transcript, billed_chars=res.billed_chars,
             )
             return VERIFIED

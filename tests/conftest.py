@@ -33,6 +33,18 @@ def make_wav_bytes(duration_s: float = 1.0, sample_rate: int = 24_000) -> bytes:
     return buf.getvalue()
 
 
+class FakeBackend:
+    """Generic TTSBackend test double — returns a short sine clip as PCM."""
+    name = "fake"
+
+    def synthesize(self, text, *, voice=None, language=None, ssml=None):
+        from wordbank.backends.base import SynthResult
+        sr = 24_000
+        t = np.linspace(0, 0.3, int(sr * 0.3), endpoint=False)
+        pcm = (0.3 * np.sin(2 * np.pi * 180 * t)).astype(np.float32)
+        return SynthResult(pcm=pcm, sample_rate=sr, billed_chars=len(text))
+
+
 @pytest.fixture
 def silent_wav() -> bytes:
     return make_wav_bytes()

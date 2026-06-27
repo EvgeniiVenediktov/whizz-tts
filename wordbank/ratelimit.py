@@ -1,7 +1,8 @@
 """Thread-safe token-bucket rate limiter.
 
-Sized to the backend's requests-per-minute quota (Chirp 3 HD = 200 rpm) so
-parallel workers stay under the limit instead of triggering 429s.
+Size it to a backend's requests-per-minute quota so parallel workers stay under
+the limit instead of triggering 429s. (Local generation is sequential and needs
+no limiter; this is for any future rate-limited cloud backend.)
 """
 import threading
 import time

@@ -1,14 +1,16 @@
 """Word-bank CLI:  python -m wordbank <command> ...
 
-Commands: build (Chirp sync) · batch / batch-submit / batch-collect / batch-run
-(Gemini async) · status · export.
+Commands: generate (local OmniVoice) · batch / batch-submit / batch-collect /
+batch-run (Gemini async) · status · export.
 
+  python -m wordbank --lang en-gb generate --words phrases.txt \
+      --ref-audio refs/en-gb.wav --ref-text "…" --voice en-gb
   python -m wordbank batch-run --words words.txt --voice Kore
   python -m wordbank status
-  python -m wordbank export --output bank.csv
 """
 import argparse
 import csv
+import pathlib
 import sys
 from typing import List
 
@@ -37,13 +39,6 @@ def _ingest(cfg: Config, words_path: str) -> Manifest:
     return m
 
 
-def _build_backend(cfg: Config):
-    if cfg.backend == "chirp":
-        from .backends.chirp import ChirpTTSBackend
-        return ChirpTTSBackend(voice=cfg.voice)
-    raise SystemExit(f"unknown backend: {cfg.backend}")
-
-
 def _add_gemini_args(p, *, words=True, instruction=True, chunk=True, poll=True):
     """Common args for the Gemini batch subcommands (which differ only slightly)."""
     if words:
@@ -59,25 +54,25 @@ def _add_gemini_args(p, *, words=True, instruction=True, chunk=True, poll=True):
         p.add_argument("--poll-interval", type=int, default=60, dest="poll_interval")
 
 
-def cmd_build(args, cfg: Config) -> None:
+def cmd_generate(args, cfg: Config) -> None:
+    """Generate phrases locally with OmniVoice; accent via a clone reference."""
+    from .backends.local import LocalOmniVoiceBackend
     from .pipeline import WordBankPipeline
-    from .ratelimit import RateLimiter
 
-    m = _ingest(cfg, args.words)
-    limiter = RateLimiter(args.rpm) if args.rpm else None
+    ref_text = args.ref_text
+    if ref_text is None and args.ref_text_file:
+        ref_text = pathlib.Path(args.ref_text_file).read_text(encoding="utf-8").strip()
+    backend = LocalOmniVoiceBackend(ref_audio=args.ref_audio, ref_text=ref_text,
+                                    voice=args.voice)
     verifier = None
-    if not args.no_verify:
+    if args.verify:
         from .verify import Verifier
         verifier = Verifier()
-    pipe = WordBankPipeline(
-        m, _build_backend(cfg), verifier, cfg.out_dir,
-        lang=cfg.lang, voice=cfg.voice, max_attempts=cfg.max_attempts,
-        rate_limiter=limiter,
-    )
-    if args.workers > 1:
-        result = pipe.run_parallel(workers=args.workers, limit=args.limit)
-    else:
-        result = pipe.run(limit=args.limit)
+
+    m = _ingest(cfg, args.words)
+    pipe = WordBankPipeline(m, backend, verifier, cfg.out_dir,
+                            lang=cfg.lang, voice=args.voice)
+    result = pipe.run(limit=args.limit)   # sequential — the model isn't thread-safe
     print(f"this run: {result}")
     print(f"totals:   {m.counts()}")
     m.close()
@@ -170,21 +165,22 @@ def main(argv=None) -> None:
     p.add_argument("--db", default=cfg.db)
     p.add_argument("--out", default=cfg.out_dir, dest="out_dir")
     p.add_argument("--lang", default=cfg.lang)
-    p.add_argument("--backend", default=cfg.backend)
-    p.add_argument("--voice", default=cfg.voice)
-    p.add_argument("--max-attempts", type=int, default=cfg.max_attempts, dest="max_attempts")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    b = sub.add_parser("build", help="add words and generate audio")
-    b.add_argument("--words", required=True, help="text file, one word per line")
-    b.add_argument("--limit", type=int, default=None, help="cap words processed this run")
-    b.add_argument("--workers", type=int, default=10,
-                   help="parallel worker threads (1 = sequential)")
-    b.add_argument("--rpm", type=float, default=200,
-                   help="max requests/min (Chirp 3 HD quota = 200; 0 = unlimited)")
-    b.add_argument("--no-verify", action="store_true", dest="no_verify",
-                   help="skip local Whisper verification (impractical at scale)")
-    b.set_defaults(func=cmd_build)
+    gen = sub.add_parser("generate",
+                         help="generate phrases locally with OmniVoice (accent via clone reference)")
+    gen.add_argument("--words", required=True, help="text file, one phrase/word per line")
+    gen.add_argument("--voice", default="local", help="label for the output dir, e.g. en-gb")
+    gen.add_argument("--ref-audio", default=None, dest="ref_audio",
+                     help="voice-clone reference clip (the accent), e.g. a Gemini phrase")
+    gen.add_argument("--ref-text", default=None, dest="ref_text",
+                     help="transcript of --ref-audio")
+    gen.add_argument("--ref-text-file", default=None, dest="ref_text_file",
+                     help="file holding the transcript of --ref-audio")
+    gen.add_argument("--limit", type=int, default=None, help="cap phrases this run")
+    gen.add_argument("--verify", action="store_true",
+                     help="STT-verify each clip with local Whisper (slow)")
+    gen.set_defaults(func=cmd_generate)
 
     g = sub.add_parser("batch", help="generate via Gemini Batch API (async, ~half cost)")
     _add_gemini_args(g)
@@ -213,8 +209,7 @@ def main(argv=None) -> None:
     e.set_defaults(func=cmd_export)
 
     args = p.parse_args(argv)
-    cfg = Config(db=args.db, out_dir=args.out_dir, lang=args.lang,
-                 backend=args.backend, voice=args.voice, max_attempts=args.max_attempts)
+    cfg = Config(db=args.db, out_dir=args.out_dir, lang=args.lang)
     args.func(args, cfg)
 
 

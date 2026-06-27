@@ -1,4 +1,4 @@
 from .base import SynthResult, TTSBackend
-from .chirp import ChirpTTSBackend
+from .local import LocalOmniVoiceBackend
 
-__all__ = ["SynthResult", "TTSBackend", "ChirpTTSBackend"]
+__all__ = ["SynthResult", "TTSBackend", "LocalOmniVoiceBackend"]

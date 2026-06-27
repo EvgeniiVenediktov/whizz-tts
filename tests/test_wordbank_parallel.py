@@ -1,27 +1,11 @@
 """Tests for the word-list cleaner, rate limiter, and parallel pipeline run."""
-import io
 import time
 
-import numpy as np
-import soundfile as sf
-
-from wordbank.backends.chirp import ChirpTTSBackend
-from wordbank.manifest import Manifest, VERIFIED, QUARANTINED
+from tests.conftest import FakeBackend
+from wordbank.manifest import Manifest, QUARANTINED, VERIFIED
 from wordbank.pipeline import WordBankPipeline
 from wordbank.ratelimit import RateLimiter
 from wordbank.wordlist import clean_words
-
-
-def make_wav(sr=24_000, dur=0.3) -> bytes:
-    t = np.linspace(0, dur, int(sr * dur), endpoint=False)
-    pcm = (0.3 * np.sin(2 * np.pi * 180 * t)).astype(np.float32)
-    buf = io.BytesIO()
-    sf.write(buf, pcm, sr, format="WAV", subtype="PCM_16")
-    return buf.getvalue()
-
-
-def fake_synth(text, voice, language, ssml):
-    return make_wav()
 
 
 class PassVerifier:
@@ -64,17 +48,15 @@ def test_rate_limiter_allows_burst_then_throttles():
 
 def test_parallel_run_processes_all(tmp_path):
     m = Manifest(str(tmp_path / "wb.db"))
-    words = [f"word{i}" for i in range(50)]
-    m.add_words(words, "en")
+    m.add_words([f"word{i}" for i in range(50)], "en")
     pipe = WordBankPipeline(
-        m, ChirpTTSBackend(synth_fn=fake_synth), PassVerifier(),
-        str(tmp_path / "out"), lang="en", voice="testvoice",
-        rate_limiter=RateLimiter(100_000),   # effectively unthrottled
+        m, FakeBackend(), PassVerifier(), str(tmp_path / "out"),
+        lang="en", voice="testvoice", rate_limiter=RateLimiter(100_000),
     )
     result = pipe.run_parallel(workers=8)
     assert result[VERIFIED] == 50
     assert m.counts().get(VERIFIED) == 50
-    assert len(list((tmp_path / "out").rglob("*.ogg"))) == 50
+    assert len(list((tmp_path / "out").rglob("*.wav"))) == 50
     # resume: nothing left
     assert pipe.run_parallel(workers=8) == {VERIFIED: 0, "failed": 0, QUARANTINED: 0}
     m.close()

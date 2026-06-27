@@ -17,7 +17,9 @@ def peak_normalize(pcm: np.ndarray, peak: float = 0.97) -> np.ndarray:
     return pcm * (peak / m)
 
 
-def to_ogg(pcm: np.ndarray, sr: int) -> bytes:
-    from src.audio import pcm_to_ogg
+def write_wav(path, pcm: np.ndarray, sr: int) -> None:
+    """Write a float32 PCM array as a 16-bit WAV master (the served OGG is a
+    later pass — see scripts/encode_wavs.py)."""
+    import soundfile as sf
 
-    return pcm_to_ogg(pcm, sample_rate=sr)
+    sf.write(str(path), pcm, sr, subtype="PCM_16")

@@ -1,5 +1,6 @@
-"""Cloud word-bank generation pipeline.
+"""Word/phrase-bank generation pipeline.
 
-Generates a bank of single-word audio clips via a pluggable cloud TTS backend
-(Chirp 3 HD by default), verified locally with Whisper. See WORDBANK_PLAN.md.
+Builds a bank of audio clips two ways: the **Gemini Batch** path (`gemini_batch.py`,
+the en-us word bank) and the **local OmniVoice** path (`pipeline.py` + `backends/`,
+accent phrase banks, optionally Whisper-verified). See WORDBANK_PLAN.md.
 """
