@@ -12,12 +12,22 @@
       background: #0f0f11;
       color: #e8e8e8;
       min-height: 100vh;
-      display: flex;
-      flex-wrap: wrap;
-      gap: 20px;
-      align-items: flex-start;
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 600px));
       justify-content: center;
-      padding: 48px 16px;
+      align-items: start;
+      gap: 20px;
+      padding: 28px 16px;
+    }
+    /* Wide screens: the tall TTS card gets its own column; the two shorter
+       cards stack in the other so the columns stay balanced (no skew). */
+    #card-bank   { grid-column: 1; grid-row: 1; }
+    #card-studio { grid-column: 1; grid-row: 2; }
+    #card-tts    { grid-column: 2; grid-row: 1 / span 2; }
+    /* Narrow screens: one centered column, natural source order. */
+    @media (max-width: 980px) {
+      body { grid-template-columns: minmax(0, 620px); }
+      #card-bank, #card-studio, #card-tts { grid-column: 1; grid-row: auto; }
     }
 
     .card {
@@ -200,7 +210,7 @@
   </style>
 </head>
 <body>
-<div class="card" style="margin-bottom:20px">
+<div class="card" id="card-bank">
   <h1>Word bank</h1>
   <label class="field-label">
     Word <span style="color:#444;text-transform:none;letter-spacing:0;font-size:0.75rem">— compare the WAV master vs the OGG copy</span>
@@ -224,7 +234,7 @@
   </div>
 </div>
 
-<div class="card">
+<div class="card" id="card-tts">
   <h1>Text to Speech</h1>
 
   <label class="field-label">
@@ -363,7 +373,7 @@
   </div>
 </div>
 
-<div class="card" style="margin-top:20px">
+<div class="card" id="card-studio">
   <h1>Gemini voice studio</h1>
   <p class="hint">Generate a phrase with Gemini, listen, and save good ones as OmniVoice clone references. Saved references appear in the cloning picker above. <span style="color:#c9973a">Server needs <code>GEMINI_API_KEY</code>.</span></p>
 
