@@ -1,10 +1,11 @@
 """Word-bank CLI:  python -m wordbank <command> ...
 
-Commands: generate (local OmniVoice) · batch / batch-submit / batch-collect /
-batch-run (Gemini async) · status · export.
+Commands: generate (local OmniVoice) · add-voice / voices (clone references) ·
+batch / batch-submit / batch-collect / batch-run (Gemini async) · status · export.
 
-  python -m wordbank --lang en-gb generate --words phrases.txt \
-      --ref-audio refs/en-gb.wav --ref-text "…" --voice en-gb
+  python -m wordbank --lang en-gb add-voice --ref-audio refs/en-gb/ref.wav \
+      --ref-text-file refs/en-gb/ref.txt --source gemini
+  python -m wordbank --lang en-gb generate --words phrases.txt --voice en-gb
   python -m wordbank batch-run --words words.txt --voice Kore
   python -m wordbank status
 """
@@ -59,23 +60,75 @@ def cmd_generate(args, cfg: Config) -> None:
     from .backends.local import LocalOmniVoiceBackend
     from .pipeline import WordBankPipeline
 
-    ref_text = args.ref_text
+    m = _ingest(cfg, args.words)
+
+    ref_audio, ref_text = args.ref_audio, args.ref_text
     if ref_text is None and args.ref_text_file:
         ref_text = pathlib.Path(args.ref_text_file).read_text(encoding="utf-8").strip()
-    backend = LocalOmniVoiceBackend(ref_audio=args.ref_audio, ref_text=ref_text,
+    if ref_audio is None:                       # fall back to a registered voice
+        v = m.get_voice(args.voice, cfg.lang)
+        if v:
+            from .voices import resolve_voice_path
+            ref_audio = resolve_voice_path(cfg.voices_root, v["ref_audio"])
+            ref_text = ref_text or v["ref_text"]
+            print(f"using registered voice {args.voice!r} ({cfg.lang}): {ref_audio}")
+
+    backend = LocalOmniVoiceBackend(ref_audio=ref_audio, ref_text=ref_text,
                                     voice=args.voice)
     verifier = None
     if args.verify:
         from .verify import Verifier
         verifier = Verifier()
 
-    m = _ingest(cfg, args.words)
     pipe = WordBankPipeline(m, backend, verifier, cfg.out_dir,
                             lang=cfg.lang, voice=args.voice)
     result = pipe.run(limit=args.limit)   # sequential — the model isn't thread-safe
     print(f"this run: {result}")
     print(f"totals:   {m.counts()}")
     m.close()
+
+
+def cmd_add_voice(args, cfg: Config) -> None:
+    """Register a voice-clone reference so `generate --voice <name>` can reuse it."""
+    ref_text = args.ref_text
+    if ref_text is None and args.ref_text_file:
+        ref_text = pathlib.Path(args.ref_text_file).read_text(encoding="utf-8").strip()
+    name = args.name or cfg.lang
+    m = Manifest(cfg.db)
+    m.add_voice(name, cfg.lang, args.ref_audio, ref_text=ref_text,
+                instruct=args.instruct, source=args.source,
+                sample_rate=args.sample_rate)
+    print(f"registered voice {name!r} (lang={cfg.lang}) → {args.ref_audio}")
+    m.close()
+
+
+def cmd_voices(args, cfg: Config) -> None:
+    """List registered voice-clone references."""
+    m = Manifest(cfg.db)
+    rows = m.voices()
+    if not rows:
+        print("no voices registered")
+    for r in rows:
+        print(f"{r['name']}\t{r['lang']}\t{r['ref_audio']}\t{r['ref_text'] or ''}")
+    m.close()
+
+
+def cmd_gemini_voice(args, cfg: Config) -> None:
+    """Synthesize a phrase with Gemini and save it as a clone reference (file + DB)."""
+    from .gemini_tts import pcm_to_wav_bytes, synthesize_pcm
+    from .voices import save_voice_clip
+
+    kwargs = {"model": args.model} if args.model else {}
+    pcm = synthesize_pcm(args.text, voice=args.voice, instruct=args.instruct or "",
+                         **kwargs)
+    name = args.name or cfg.lang
+    m = Manifest(cfg.db)
+    rel = save_voice_clip(m, cfg.voices_root, name, cfg.lang, pcm_to_wav_bytes(pcm),
+                          args.text, instruct=args.instruct, source="gemini")
+    m.close()
+    print(f"saved reference {name!r} (lang={cfg.lang}) → {cfg.voices_root}/{rel}")
+    print(f"generate with it:  python -m wordbank --lang {cfg.lang} generate "
+          f"--words PHRASES.txt --voice {name}")
 
 
 def _make_batch(args):
@@ -165,6 +218,7 @@ def main(argv=None) -> None:
     p.add_argument("--db", default=cfg.db)
     p.add_argument("--out", default=cfg.out_dir, dest="out_dir")
     p.add_argument("--lang", default=cfg.lang)
+    p.add_argument("--voices-root", default=cfg.voices_root, dest="voices_root")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     gen = sub.add_parser("generate",
@@ -201,6 +255,35 @@ def main(argv=None) -> None:
     _add_gemini_args(br)
     br.set_defaults(func=cmd_batch_run)
 
+    av = sub.add_parser("add-voice",
+                        help="register a voice-clone reference (reused by `generate --voice`)")
+    av.add_argument("--name", default=None,
+                    help="voice label (default: --lang), e.g. en-gb")
+    av.add_argument("--ref-audio", required=True, dest="ref_audio",
+                    help="reference clip path, e.g. refs/en-gb/ref.wav")
+    av.add_argument("--ref-text", default=None, dest="ref_text",
+                    help="transcript of --ref-audio")
+    av.add_argument("--ref-text-file", default=None, dest="ref_text_file",
+                    help="file holding the transcript of --ref-audio")
+    av.add_argument("--instruct", default=None,
+                    help="accent/style direction used to make the reference")
+    av.add_argument("--source", default=None, help="provenance, e.g. gemini")
+    av.add_argument("--sample-rate", type=int, default=None, dest="sample_rate",
+                    help="reference sample rate (informational)")
+    av.set_defaults(func=cmd_add_voice)
+
+    vl = sub.add_parser("voices", help="list registered voice-clone references")
+    vl.set_defaults(func=cmd_voices)
+
+    gv = sub.add_parser("gemini-voice",
+                        help="synth a phrase with Gemini and save it as a clone reference")
+    gv.add_argument("--text", required=True, help="phrase to speak")
+    gv.add_argument("--name", default=None, help="reference name (default: --lang)")
+    gv.add_argument("--voice", default="Kore", help="Gemini prebuilt voice")
+    gv.add_argument("--instruct", default=None, help="accent/style direction (not spoken)")
+    gv.add_argument("--model", default=None, help="Gemini TTS model (default: 2.5-flash-preview-tts)")
+    gv.set_defaults(func=cmd_gemini_voice)
+
     s = sub.add_parser("status", help="show counts by status")
     s.set_defaults(func=cmd_status)
 
@@ -209,7 +292,8 @@ def main(argv=None) -> None:
     e.set_defaults(func=cmd_export)
 
     args = p.parse_args(argv)
-    cfg = Config(db=args.db, out_dir=args.out_dir, lang=args.lang)
+    cfg = Config(db=args.db, out_dir=args.out_dir, lang=args.lang,
+                 voices_root=args.voices_root)
     args.func(args, cfg)
 
 

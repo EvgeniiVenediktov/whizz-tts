@@ -2,7 +2,8 @@
 reference. OmniVoice then clones this accent/voice for the whole phrase bank.
 
 Writes <out>/ref.wav + <out>/ref.txt (the spoken phrase, for --ref-text-file).
-Needs GEMINI_API_KEY.
+Needs GEMINI_API_KEY. To synth AND register in one step instead, use the CLI:
+`python -m wordbank --lang <lang> gemini-voice --text "…"`.
 
   GEMINI_API_KEY=… python scripts/make_accent_reference.py \
     --text "The quick brown fox jumps over the lazy dog." \
@@ -28,30 +29,20 @@ def main() -> None:
     p.add_argument("--out", default="refs/ref", help="output dir for ref.wav + ref.txt")
     args = p.parse_args()
 
-    from google import genai
-    from google.genai import types
+    from wordbank.gemini_tts import synthesize_pcm
 
-    client = genai.Client()
-    prompt = f"{args.instruct}: {args.text}" if args.instruct else args.text
-    resp = client.models.generate_content(
-        model=args.model,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_modalities=["AUDIO"],
-            speech_config=types.SpeechConfig(voice_config=types.VoiceConfig(
-                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=args.voice))),
-        ),
-    )
-    pcm = resp.candidates[0].content.parts[0].inline_data.data  # raw 24kHz/16-bit PCM
+    pcm = synthesize_pcm(args.text, voice=args.voice, instruct=args.instruct,
+                         model=args.model)
 
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     write_wav(out / "ref.wav", pcm)
     (out / "ref.txt").write_text(args.text, encoding="utf-8")
     print(f"wrote {out}/ref.wav + ref.txt  ({len(pcm)} PCM bytes)")
-    print("then generate the bank in this accent:")
-    print(f"  python -m wordbank --lang <lang> generate --words PHRASES.txt \\")
-    print(f"    --ref-audio {out}/ref.wav --ref-text-file {out}/ref.txt --voice <lang>")
+    print("then register the voice and generate the bank in this accent:")
+    print(f"  python -m wordbank --lang <lang> add-voice --ref-audio {out}/ref.wav \\")
+    print(f"    --ref-text-file {out}/ref.txt --source gemini")
+    print(f"  python -m wordbank --lang <lang> generate --words PHRASES.txt --voice <lang>")
 
 
 if __name__ == "__main__":

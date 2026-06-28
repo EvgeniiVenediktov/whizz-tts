@@ -13,6 +13,8 @@
       color: #e8e8e8;
       min-height: 100vh;
       display: flex;
+      flex-wrap: wrap;
+      gap: 20px;
       align-items: flex-start;
       justify-content: center;
       padding: 48px 16px;
@@ -42,7 +44,7 @@
       letter-spacing: 0.05em;
     }
 
-    textarea, input[type="text"] {
+    textarea, input[type="text"], select {
       background: #111116;
       border: 1px solid #2e2e38;
       border-radius: 8px;
@@ -54,7 +56,10 @@
       width: 100%;
     }
     textarea { resize: vertical; min-height: 100px; font-family: inherit; }
-    textarea:focus, input[type="text"]:focus { border-color: #5b6af0; }
+    textarea:focus, input[type="text"]:focus, select:focus { border-color: #5b6af0; }
+    .hint { font-size: 0.82rem; color: #777; line-height: 1.4; }
+    .row { display: flex; gap: 12px; }
+    .row > * { flex: 1; }
 
     /* Mode tabs */
     .mode-tabs {
@@ -240,6 +245,11 @@
   <div class="mode-panel visible" id="panel-clone">
     <div class="section-box">
       <label class="field-label">
+        Saved reference
+        <span style="color:#444;text-transform:none;letter-spacing:0;font-size:0.75rem">pick one made in the Gemini voice studio below — or upload a file</span>
+        <select id="saved-voice"><option value="">— none —</option></select>
+      </label>
+      <label class="field-label">
         Reference audio
         <div class="file-row">
           <button type="button" class="file-btn" onclick="document.getElementById('ref-audio-input').click()">Choose file</button>
@@ -353,12 +363,78 @@
   </div>
 </div>
 
+<div class="card" style="margin-top:20px">
+  <h1>Gemini voice studio</h1>
+  <p class="hint">Generate a phrase with Gemini, listen, and save good ones as OmniVoice clone references. Saved references appear in the cloning picker above. <span style="color:#c9973a">Server needs <code>GEMINI_API_KEY</code>.</span></p>
+
+  <label class="field-label">
+    Phrase
+    <textarea id="g-text">this was such a unique experience</textarea>
+  </label>
+
+  <div class="row">
+    <label class="field-label">Voice
+      <select id="g-voice"><option value="Kore">Kore — Firm</option></select>
+    </label>
+    <label class="field-label">Language
+      <select id="g-lang">
+        <option value="en-us">🇺🇸 English (US)</option>
+        <option value="en-gb">🇬🇧 English (UK)</option>
+        <option value="en-au">🇦🇺 English (AU)</option>
+        <option value="en-in">🇮🇳 English (India)</option>
+        <option value="es-es">🇪🇸 Spanish (Spain)</option>
+        <option value="es-mx">🇲🇽 Spanish (Mexico)</option>
+        <option value="fr-fr">🇫🇷 French</option>
+        <option value="de-de">🇩🇪 German</option>
+        <option value="it-it">🇮🇹 Italian</option>
+        <option value="pt-br">🇧🇷 Portuguese (Brazil)</option>
+        <option value="nl-nl">🇳🇱 Dutch</option>
+        <option value="pl-pl">🇵🇱 Polish</option>
+        <option value="ru-ru">🇷🇺 Russian</option>
+        <option value="hi-in">🇮🇳 Hindi</option>
+        <option value="ja-jp">🇯🇵 Japanese</option>
+        <option value="ko-kr">🇰🇷 Korean</option>
+        <option value="zh-cn">🇨🇳 Chinese (Mandarin)</option>
+        <option value="ar-xa">🇸🇦 Arabic</option>
+        <option value="tr-tr">🇹🇷 Turkish</option>
+      </select>
+    </label>
+  </div>
+  <p class="hint" style="margin-top:-8px">A voice is a <em>style</em> preset and speaks any language — Gemini auto-detects language from your phrase. Language here is just how the reference is filed for OmniVoice, so write the phrase in that language.</p>
+
+  <label class="field-label">
+    Instruct <span style="color:#444;text-transform:none;letter-spacing:0;font-size:0.75rem">optional accent/style, e.g. “British accent” (not spoken)</span>
+    <input type="text" id="g-instruct" placeholder="leave blank for a neutral read">
+  </label>
+
+  <div class="submit-row">
+    <button type="submit" id="g-generate">Generate</button>
+    <span class="timer" id="g-timer">0.0s</span>
+  </div>
+
+  <div class="error" id="g-error"></div>
+
+  <div class="result" id="g-result">
+    <span class="result-label">Preview</span>
+    <audio id="g-player" controls></audio>
+    <div class="row" style="align-items:flex-end;margin-top:4px">
+      <label class="field-label" style="flex:2">Reference name
+        <input type="text" id="g-name" placeholder="e.g. kore-warm">
+      </label>
+      <button type="submit" id="g-save" style="flex:1">Save as reference</button>
+    </div>
+    <span id="g-save-status" class="hint"></span>
+  </div>
+</div>
+
 <script>
   // Same-origin relative URLs: works when the frontend is served by the API
   // server (SERVE_FRONTEND=1). Override window.API_BASE to point elsewhere.
   const API_BASE = window.API_BASE || '';
   const API = `${API_BASE}/v1/tts`;
   const BANK = `${API_BASE}/v1/bank`;
+  const VOICES = `${API_BASE}/v1/voices`;
+  const GEMINI = `${API_BASE}/v1/gemini/tts`;
 
   // ---- Word bank lookup ----
   const bankWord = document.getElementById('bank-word');
@@ -534,10 +610,14 @@
 
       if (activeMode === 'clone') {
         const file = fileInput.files[0];
-        if (file) {
+        const rt = document.getElementById('ref-text').value.trim();
+        if (file) {                                   // uploaded file wins
           form.append('ref_audio', file);
-          const rt = document.getElementById('ref-text').value.trim();
           if (rt) form.append('ref_text', rt);
+        } else if (savedVoice.value) {                // else a saved reference
+          form.append('voice', savedVoice.value);
+          form.append('lang', savedVoice.selectedOptions[0].dataset.lang || 'en-us');
+          if (rt) form.append('ref_text', rt);        // override stored transcript
         }
       } else {
         const instruct = buildInstruct();
@@ -572,6 +652,121 @@
 
   document.getElementById('text').addEventListener('keydown', e => {
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) document.getElementById('submit-btn').click();
+  });
+
+  // ---- Saved voice references + Gemini voice studio ----
+  const savedVoice = document.getElementById('saved-voice');
+
+  async function loadVoices(selectName) {
+    try {
+      const res = await fetch(VOICES);
+      const { voices } = await res.json();
+      savedVoice.innerHTML = '<option value="">— none —</option>' + voices.map(v =>
+        `<option value="${v.name}" data-lang="${v.lang}">${v.name} (${v.lang})</option>`).join('');
+      if (selectName) savedVoice.value = selectName;
+    } catch { /* leave the picker empty on error */ }
+  }
+  loadVoices();
+
+  // Populate the Gemini voice dropdown — 30 style presets, not language-bound.
+  // Grouped Female / Male (community-perceived gender).
+  async function loadGeminiVoices() {
+    try {
+      const res = await fetch(`${API_BASE}/v1/gemini/voices`);
+      const { voices } = await res.json();
+      const sel = document.getElementById('g-voice');
+      const group = (label, gender) => {
+        const items = voices.filter(v => v.gender === gender);
+        return items.length ? `<optgroup label="${label}">` + items.map(v =>
+          `<option value="${v.name}">${v.name} — ${v.style}</option>`).join('') + '</optgroup>' : '';
+      };
+      sel.innerHTML = group('Female', 'female') + group('Male', 'male');
+      sel.value = 'Kore';
+    } catch { /* keep the default Kore option */ }
+  }
+  loadGeminiVoices();
+
+  // Picking a saved reference clears any chosen file (they're mutually exclusive).
+  savedVoice.addEventListener('change', () => {
+    if (savedVoice.value) { fileInput.value = ''; fileNameEl.textContent = 'No file chosen'; }
+  });
+
+  // Timer bound to a given element id (mirrors startTimer for the studio).
+  function runTimer(id) {
+    const el = document.getElementById(id);
+    const start = performance.now();
+    el.className = 'timer running';
+    el.textContent = '0.0s';
+    const iv = setInterval(() => {
+      el.textContent = `${((performance.now() - start) / 1000).toFixed(1)}s`;
+    }, 100);
+    return () => {
+      clearInterval(iv);
+      el.className = 'timer done';
+      el.textContent = `${((performance.now() - start) / 1000).toFixed(1)}s`;
+    };
+  }
+
+  let lastGeminiWav = null;   // Blob from the most recent Gemini generate
+
+  document.getElementById('g-generate').addEventListener('click', async () => {
+    const text = document.getElementById('g-text').value.trim();
+    if (!text) { document.getElementById('g-text').focus(); return; }
+    const gErr = document.getElementById('g-error');
+    gErr.className = 'error';
+    document.getElementById('g-generate').disabled = true;
+    const stop = runTimer('g-timer');
+    try {
+      const form = new FormData();
+      form.append('text', text);
+      form.append('voice', document.getElementById('g-voice').value.trim() || 'Kore');
+      const ins = document.getElementById('g-instruct').value.trim();
+      if (ins) form.append('instruct', ins);
+      const res = await fetch(GEMINI, { method: 'POST', body: form });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({ detail: res.statusText }));
+        throw new Error(body.detail ?? res.statusText);
+      }
+      lastGeminiWav = await res.blob();
+      const player = document.getElementById('g-player');
+      player.src = URL.createObjectURL(lastGeminiWav);
+      document.getElementById('g-result').className = 'result visible';
+      document.getElementById('g-save-status').textContent = '';
+      player.play();
+    } catch (e) {
+      gErr.textContent = e.message; gErr.className = 'error visible';
+    } finally {
+      stop();
+      document.getElementById('g-generate').disabled = false;
+    }
+  });
+
+  document.getElementById('g-save').addEventListener('click', async () => {
+    const status = document.getElementById('g-save-status');
+    if (!lastGeminiWav) { status.textContent = 'generate a phrase first'; return; }
+    const name = document.getElementById('g-name').value.trim();
+    if (!name) { document.getElementById('g-name').focus(); return; }
+    const lang = document.getElementById('g-lang').value.trim() || 'en-us';
+    status.textContent = 'saving…';
+    try {
+      const form = new FormData();
+      form.append('name', name);
+      form.append('lang', lang);
+      form.append('ref_text', document.getElementById('g-text').value.trim());
+      const ins = document.getElementById('g-instruct').value.trim();
+      if (ins) form.append('instruct', ins);
+      form.append('source', 'gemini');
+      form.append('audio', lastGeminiWav, `${name}.wav`);
+      const res = await fetch(VOICES, { method: 'POST', body: form });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({ detail: res.statusText }));
+        throw new Error(body.detail ?? res.statusText);
+      }
+      status.textContent = `saved “${name}” (${lang}) — now in the cloning picker above`;
+      await loadVoices(name);
+    } catch (e) {
+      status.textContent = `error: ${e.message}`;
+    }
   });
 </script>
 </body>

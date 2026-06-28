@@ -6,18 +6,18 @@ and `WORDBANK_PLAN.md`.
 ## Project at a glance
 - **Generate** → WAV masters in `output/words/` + manifest `wordbank.db`, via either the **Gemini Batch** path (`gemini_batch.py`; the existing en-us word bank) or the **local OmniVoice** path (`wordbank generate`; accent phrase banks, cloning a Gemini reference).
 - **Encode** (`scripts/encode_wavs.py`) → OGG copies in `output/words_ogg/` (16k VoIP, ~3 KB/word).
-- **Serve** (`src/server.py`, FastAPI) → indexed bank lookup over the manifest + static OGG; live OmniVoice synth optional behind `MODEL_ENABLED`.
+- **Serve** (`src/server.py`, FastAPI) → indexed bank lookup over the manifest + static OGG; live OmniVoice synth optional behind `MODEL_ENABLED`. Also hosts the **voice studio**: `GET /v1/gemini/voices` (the 30 prebuilt Gemini voices), `POST /v1/gemini/tts` (preview a Gemini phrase), `POST/GET /v1/voices` (save + list clone references), and `/v1/tts` accepts `voice=<saved name>` to clone from a stored clip. Gemini voices are **style presets, not language-bound** — language is auto-detected from the text — so the studio's flag dropdown is the (filing-only) bank language, not the voice.
 - Two halves are decoupled: serving needs **no ML stack** unless live synth is on.
 
 ## Dev setup & commands
 - Python venv at **`.venv`** (Python 3.14). Always invoke via `.venv/bin/python`, `.venv/bin/pytest`, `.venv/bin/uvicorn`.
 - **Tests:** `.venv/bin/pytest` (unit — fast, no model/cloud). `.venv/bin/pytest --integration tests/test_integration.py` loads OmniVoice (slow, needs the model).
 - **Run server + UI (bank only):** `SERVE_FRONTEND=1 .venv/bin/uvicorn src.server:app --port 8000` → http://localhost:8000
-- **Creds:** `GEMINI_API_KEY` for generation/cleanup; serving needs none. Secrets live in `.env` (gitignored).
+- **Creds:** `GEMINI_API_KEY` for word-bank generation/cleanup **and the voice-studio endpoints** (`/v1/gemini/tts`, `gemini-voice`); bank serving needs none. Secrets live in `.env` (gitignored).
 - **After editing `src/server.py` or `wordbank/lookup.py`, run `.venv/bin/pytest`** — it includes `tests/test_serves_real_bank.py`, which serves a real word from the local bank. Synthetic unit tests alone have repeatedly missed "server returns no audio" regressions (path resolution, WAL read visibility, env defaults). That test skips if no local bank, so also sanity-check by hand against the real data when you have it.
 
 ## Data & state (important)
-`wordbank.db`, `output/`, `data/`, `dist/` are **gitignored** → a fresh clone has **no bank**. Either regenerate (`fetch_wordlist` → `batch-run` → `encode_wavs`) or pull the bank from storage. The server serves whatever `BANK_DB` / `OGG_ROOT` (and dev-only `WAV_ROOT`) point at.
+`wordbank.db`, `output/`, `data/`, `dist/` are **gitignored** → a fresh clone has **no bank**. Either regenerate (`fetch_wordlist` → `batch-run` → `encode_wavs`) or pull the bank from storage. The server serves whatever `BANK_DB` / `OGG_ROOT` (and dev-only `WAV_ROOT`) point at. `wordbank.db` holds two tables: `words` (the served bank) and `voices` (clone references — generation-side only, never served). Reference clips live under `VOICES_ROOT` (default `output/voices`, gitignored); `voices.ref_audio` is stored relative to it.
 
 ## Invariants — don't regress these (each cost real debugging)
 - **Bank lookup uses a normal SQLite connection + `PRAGMA query_only`, NEVER `mode=ro`.** A read-only URI connection on a WAL DB uses a private in-memory `-shm` and won't see another process's commits → stale/empty results. (`wordbank/lookup.py`)
@@ -38,8 +38,9 @@ and `WORDBANK_PLAN.md`.
 
 ## Key files
 - `src/server.py` API · `src/model.py` OmniVoice (lazy) · `src/audio.py` PCM→OGG
-- `wordbank/`: `manifest.py` (SQLite) · `gemini_batch.py` (Gemini batch) · `pipeline.py` + `backends/local.py` (local OmniVoice sync gen) · `lookup.py` (read-only search) · `languages.py` · `config.py` · `__main__.py` (CLI: `generate` / `batch*` / `status` / `export`)
+- `wordbank/`: `manifest.py` (SQLite — `words` + `voices` clone-reference registry) · `gemini_batch.py` (Gemini batch) · `gemini_tts.py` (sync Gemini TTS for studio/refs) · `voices.py` (clip storage + path resolution) · `pipeline.py` + `backends/local.py` (local OmniVoice sync gen) · `lookup.py` (read-only search + voice reads) · `languages.py` · `config.py` · `__main__.py` (CLI: `generate` / `gemini-voice` / `add-voice` / `voices` / `batch*` / `status` / `export`)
 - `scripts/`: `fetch_wordlist` · `make_accent_reference` · `encode_wavs` · `package_bank` · `gemini_batch_cleanup` · `gemini_batch_smoke` · `list_models` · `migrate_manifest_paths`
+- `frontend/index.html` also has the **Gemini voice studio** (author refs) + a saved-reference picker in the cloning panel.
 - `frontend/index.html` · `Dockerfile` (`--build-arg WITH_MODEL`) · `docker-compose.yml` (profiles `bank` / `full`)
 - Open work is the **TODO** at the bottom of `README.md` (verify voice cloning, en-GB bank, multi-language, JWT auth).
 
@@ -51,22 +52,40 @@ The local OmniVoice model generates the **phrases**. Accent comes from a one-off
 **voice-clone reference** — a phrase generated by Gemini in the target accent,
 which OmniVoice clones for the whole bank. No Chirp.
 
+**Reference clip format:** any file `soundfile`/`librosa` can decode — WAV/FLAC/OGG
+natively (no ffmpeg), MP3/M4A via ffmpeg. OmniVoice auto-downmixes to mono,
+resamples to **24 kHz**, loudness-normalizes (boosts quiet clips), and trims
+silence — so you don't pre-process. Keep it **3–10 s**; >20 s warns and degrades
+cloning quality (and is auto-trimmed only when `ref_text` is omitted, so a long
+clip *with* a transcript stays long — avoid it). `make_accent_reference.py`
+already emits the ideal 24 kHz mono WAV.
+
+**Easiest path** (synth + register in one step): the UI **Gemini voice studio**, or
+`python -m wordbank --lang <lang> gemini-voice --text "…" --name <name> [--instruct "…"]`.
+Then skip to step 3 with `--voice <name>`. Steps 1–2 below are the manual,
+file-based equivalent (useful when you already have a clip).
+
 1. **Make the accent reference** (Gemini, one phrase → `ref.wav` + `ref.txt`):
    ```bash
    GEMINI_API_KEY=… python scripts/make_accent_reference.py \
      --text "The quick brown fox jumps over the lazy dog." \
      --instruct "Speak in a British (RP) accent" --voice Kore --out refs/en-gb
    ```
-2. **Generate locally** (`--lang` = serving code; `--voice` = output-dir label).
-   Verification is off by default (Whisper per phrase is slow); add `--verify` to spot-check:
+2. **Register the voice** in the `voices` table (so generation can reuse it):
    ```bash
-   python -m wordbank --lang en-gb generate --words PHRASES.txt \
-     --ref-audio refs/en-gb/ref.wav --ref-text-file refs/en-gb/ref.txt --voice en-gb
+   python -m wordbank --lang en-gb add-voice --ref-audio refs/en-gb/ref.wav \
+     --ref-text-file refs/en-gb/ref.txt --source gemini
+   ```
+3. **Generate locally** — `generate --voice en-gb` pulls the registered reference
+   (pass `--ref-audio`/`--ref-text` to override). Verification is off by default
+   (Whisper per phrase is slow); add `--verify` to spot-check:
+   ```bash
+   python -m wordbank --lang en-gb generate --words PHRASES.txt --voice en-gb
    ```
    Sequential (the model isn't thread-safe). Writes WAV masters to
    `output/words/<lang>/local-<voice>/…`; manifest `lang=<lang>`, relative paths.
-3. **Encode + package** (`scripts/encode_wavs.py`, `scripts/package_bank.py`).
-4. **Listen**, then add the locale to `wordbank/languages.py` `SUPPORTED_LANGUAGES`
+4. **Encode + package** (`scripts/encode_wavs.py`, `scripts/package_bank.py`).
+5. **Listen**, then add the locale to `wordbank/languages.py` `SUPPORTED_LANGUAGES`
    (presence = verified) → it appears in `/v1/languages`.
 
 Serving is already language-scoped (`/v1/bank?lang=en-gb`, `(lang, word)` index) —

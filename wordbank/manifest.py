@@ -35,6 +35,25 @@ CREATE TABLE IF NOT EXISTS words (
 -- (lang, word) leading index → per-language exact lookup AND prefix range scan
 -- seek straight into one language; also serves `GROUP BY lang` for /v1/languages.
 CREATE INDEX IF NOT EXISTS idx_words_lang_word ON words(lang, word);
+
+-- Voice-clone references: one row per reusable reference clip. The local
+-- OmniVoice path clones `ref_audio` (+ `ref_text`) to speak a whole bank in
+-- that voice/accent. ref_audio is a file path (e.g. refs/en-gb/ref.wav); the
+-- bank's served audio lives in `words` — this table is generation-side only.
+CREATE TABLE IF NOT EXISTS voices (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    name         TEXT NOT NULL,
+    lang         TEXT NOT NULL,
+    ref_audio    TEXT NOT NULL,
+    ref_text     TEXT,
+    instruct     TEXT,
+    source       TEXT,
+    sample_rate  INTEGER,
+    created_at   REAL,
+    updated_at   REAL,
+    UNIQUE(name, lang)
+);
+CREATE INDEX IF NOT EXISTS idx_voices_lang ON voices(lang);
 """
 
 
@@ -146,3 +165,43 @@ class Manifest:
     def iter_rows(self):
         with self._lock:
             return self._conn.execute("SELECT * FROM words ORDER BY id").fetchall()
+
+    # ---- voices (clone references) ----
+
+    def add_voice(self, name: str, lang: str, ref_audio: str, *,
+                  ref_text: Optional[str] = None, instruct: Optional[str] = None,
+                  source: Optional[str] = None,
+                  sample_rate: Optional[int] = None) -> None:
+        """Register (or update) a voice-clone reference. Upsert on (name, lang)."""
+        now = time.time()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO voices (name, lang, ref_audio, ref_text, instruct, "
+                "source, sample_rate, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(name, lang) DO UPDATE SET "
+                "ref_audio=excluded.ref_audio, ref_text=excluded.ref_text, "
+                "instruct=excluded.instruct, source=excluded.source, "
+                "sample_rate=excluded.sample_rate, updated_at=excluded.updated_at",
+                (name, lang, ref_audio, ref_text, instruct, source, sample_rate,
+                 now, now),
+            )
+            self._conn.commit()
+
+    def get_voice(self, name: str, lang: Optional[str] = None):
+        """Fetch one registered voice by name (optionally scoped to lang). None if absent."""
+        with self._lock:
+            if lang is not None:
+                return self._conn.execute(
+                    "SELECT * FROM voices WHERE name = ? AND lang = ?", (name, lang)
+                ).fetchone()
+            return self._conn.execute(
+                "SELECT * FROM voices WHERE name = ? ORDER BY id LIMIT 1", (name,)
+            ).fetchone()
+
+    def voices(self):
+        """All registered voices, ordered by (lang, name)."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM voices ORDER BY lang, name"
+            ).fetchall()

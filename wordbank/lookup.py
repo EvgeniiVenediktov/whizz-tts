@@ -106,6 +106,40 @@ class BankLookup:
             ).fetchall()
         return [r[0] for r in rows]
 
+    def voices(self, lang: Optional[str] = None) -> List[dict]:
+        """Registered voice-clone references (optionally one language). Empty if
+        the `voices` table doesn't exist yet (older bank)."""
+        with self._lock:
+            self._open()
+            if self._conn is None:
+                return []
+            sql = ("SELECT name, lang, ref_audio, ref_text, instruct, source "
+                   "FROM voices")
+            params: tuple = ()
+            if lang is not None:
+                sql += " WHERE lang = ?"
+                params = (lang,)
+            sql += " ORDER BY lang, name"
+            try:
+                rows = self._conn.execute(sql, params).fetchall()
+            except sqlite3.OperationalError:
+                return []
+        return [dict(r) for r in rows]
+
+    def get_voice(self, name: str, lang: str) -> Optional[sqlite3.Row]:
+        """One reference by (name, lang). None if absent or no `voices` table."""
+        with self._lock:
+            self._open()
+            if self._conn is None:
+                return None
+            try:
+                return self._conn.execute(
+                    "SELECT name, lang, ref_audio, ref_text, instruct FROM voices "
+                    "WHERE name = ? AND lang = ?", (name, lang),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                return None
+
     def close(self) -> None:
         with self._lock:
             if self._conn is not None:

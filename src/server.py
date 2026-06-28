@@ -19,6 +19,8 @@ MAX_TEXT_LEN = int(os.getenv("MAX_TEXT_LEN", "2000"))
 MAX_REF_BYTES = int(os.getenv("MAX_REF_BYTES", str(10 * 1024 * 1024)))  # 10 MB
 FRONTEND_DIR = os.getenv("FRONTEND_DIR", "frontend")
 DEFAULT_LANG = os.getenv("DEFAULT_LANG", "en-us")
+GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts")
+GEMINI_TTS_VOICE = os.getenv("GEMINI_TTS_VOICE", "Kore")
 
 
 def _truthy(val: Optional[str]) -> bool:
@@ -30,6 +32,7 @@ async def lifespan(app: FastAPI):
     app.state.bank = BankLookup(os.getenv("BANK_DB", "wordbank.db"))
     app.state.wav_root = os.getenv("WAV_ROOT", "output/words")
     app.state.ogg_root = os.getenv("OGG_ROOT", "output/words_ogg")
+    app.state.voices_root = os.getenv("VOICES_ROOT", "output/voices")
     app.state.model_enabled = _truthy(os.getenv("MODEL_ENABLED"))
     if app.state.model_enabled and _truthy(os.getenv("PRELOAD_MODEL")):
         from .model import load_model
@@ -139,13 +142,16 @@ async def tts(
     text: str = Form(...),
     ref_text: Annotated[Optional[str], Form()] = None,
     ref_audio: Annotated[Optional[UploadFile], File()] = None,
+    voice: Annotated[Optional[str], Form()] = None,
+    lang: Annotated[str, Form()] = DEFAULT_LANG,
     instruct: Annotated[Optional[str], Form()] = None,
     guidance_scale: Annotated[Optional[float], Form()] = None,
     seed: Annotated[Optional[int], Form()] = None,
 ):
     """Live synthesis (requires MODEL_ENABLED + the model build).
 
-    Modes: ref_audio[+ref_text] → cloning; instruct → voice design; none → auto.
+    Modes: ref_audio upload[+ref_text] → cloning; `voice` (a saved reference
+    name) → clone from the stored clip; instruct → voice design; none → auto.
     """
     if not app.state.model_enabled:
         raise HTTPException(
@@ -160,13 +166,25 @@ async def tts(
         raise HTTPException(400, f"text exceeds {MAX_TEXT_LEN} characters")
 
     ref_path: Optional[str] = None
-    if ref_audio is not None:
+    cleanup_ref = False
+    if ref_audio is not None:                       # uploaded clip (one-off)
         raw = await ref_audio.read(MAX_REF_BYTES + 1)
         if len(raw) > MAX_REF_BYTES:
             raise HTTPException(413, "ref_audio exceeds size limit")
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as ref_file:
             ref_path = ref_file.name
             ref_file.write(raw)
+        cleanup_ref = True
+    elif voice:                                     # saved reference by name
+        from wordbank.voices import resolve_voice_path
+        row = app.state.bank.get_voice(voice, lang)
+        if row is None:
+            raise HTTPException(404, f"no saved voice {voice!r} for lang {lang!r}")
+        ref_path = resolve_voice_path(app.state.voices_root, row["ref_audio"])
+        if not os.path.exists(ref_path):
+            raise HTTPException(404, f"reference clip missing on disk: {row['ref_audio']}")
+        if ref_text is None:
+            ref_text = row["ref_text"]
 
     def _synthesize():
         from .model import ensure_loaded, generate  # lazy: needs torch/omnivoice
@@ -181,11 +199,97 @@ async def tts(
     except Exception as exc:
         raise HTTPException(500, str(exc)) from exc
     finally:
-        if ref_path is not None:
+        if cleanup_ref and ref_path is not None:
             os.unlink(ref_path)
 
     from .audio import pcm_to_ogg  # lazy: needs numpy/soundfile/ffmpeg
     return Response(content=pcm_to_ogg(audio), media_type="audio/ogg")
+
+
+# --- Voice studio: author Gemini references, save + reuse them for cloning ---
+
+@app.post("/v1/gemini/tts")
+async def gemini_tts(
+    text: str = Form(...),
+    voice: Annotated[str, Form()] = GEMINI_TTS_VOICE,
+    instruct: Annotated[Optional[str], Form()] = None,
+    model: Annotated[str, Form()] = GEMINI_TTS_MODEL,
+):
+    """Generate a phrase with Gemini (a prebuilt voice) → WAV, for previewing
+    before saving as a clone reference. Needs GEMINI_API_KEY on the server."""
+    if len(text) > MAX_TEXT_LEN:
+        raise HTTPException(400, f"text exceeds {MAX_TEXT_LEN} characters")
+
+    def _gen():
+        from wordbank.gemini_tts import pcm_to_wav_bytes, synthesize_pcm  # lazy: genai
+        pcm = synthesize_pcm(text, voice=voice, instruct=instruct or "", model=model)
+        return pcm_to_wav_bytes(pcm)
+
+    try:
+        loop = asyncio.get_event_loop()
+        wav = await loop.run_in_executor(None, _gen)
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise HTTPException(503, f"google-genai not installed: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(502, f"Gemini TTS failed: {exc}") from exc
+    return Response(content=wav, media_type="audio/wav")
+
+
+@app.get("/v1/gemini/voices")
+def gemini_voices():
+    """The prebuilt Gemini TTS voices (static list, name + style) for the studio
+    dropdown. Voices aren't language-bound — Gemini auto-detects language."""
+    from wordbank.gemini_tts import VOICES
+    return {"voices": [{"name": n, "style": s, "gender": g} for n, s, g in VOICES]}
+
+
+@app.get("/v1/voices")
+def list_voices(lang: Optional[str] = None):
+    """Saved clone references (optionally one language) — for the picker UI."""
+    return {"voices": app.state.bank.voices(lang)}
+
+
+@app.get("/v1/voices/{lang}/{name}/audio")
+def voice_audio(lang: str, name: str):
+    """Serve a saved reference clip so the UI can replay it."""
+    row = app.state.bank.get_voice(name, lang)
+    if row is None:
+        raise HTTPException(404, "no such voice")
+    from wordbank.voices import resolve_voice_path
+    path = resolve_voice_path(app.state.voices_root, row["ref_audio"])
+    if not os.path.exists(path):
+        raise HTTPException(404, "reference clip missing on disk")
+    return FileResponse(path, media_type=_media_type(path))
+
+
+@app.post("/v1/voices")
+async def save_voice(
+    name: str = Form(...),
+    ref_text: str = Form(...),
+    audio: UploadFile = File(...),
+    lang: Annotated[str, Form()] = DEFAULT_LANG,
+    instruct: Annotated[Optional[str], Form()] = None,
+    source: Annotated[str, Form()] = "gemini",
+):
+    """Save an audio clip as a reusable OmniVoice clone reference (writes the WAV
+    under VOICES_ROOT and registers it in the manifest's `voices` table)."""
+    raw = await audio.read(MAX_REF_BYTES + 1)
+    if len(raw) > MAX_REF_BYTES:
+        raise HTTPException(413, "audio exceeds size limit")
+    if raw[:4] != b"RIFF":
+        raise HTTPException(400, "audio must be a WAV file")
+
+    from wordbank.manifest import Manifest
+    from wordbank.voices import save_voice_clip
+    m = Manifest(os.getenv("BANK_DB", "wordbank.db"))
+    try:
+        rel = save_voice_clip(m, app.state.voices_root, name, lang, raw,
+                              ref_text, instruct=(instruct or None), source=source)
+    finally:
+        m.close()
+    app.state.bank.close()   # drop the memoized read conn so the new row is visible
+    return {"name": name, "lang": lang, "ref_audio": rel, "ref_text": ref_text,
+            "instruct": instruct or None, "source": source}
 
 
 # Optionally serve the static frontend from this server (same origin → relative
