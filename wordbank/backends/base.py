@@ -9,6 +9,7 @@ class SynthResult:
     pcm: np.ndarray       # float32 mono in [-1, 1]
     sample_rate: int
     billed_chars: int     # characters (or SSML length) billed for this call
+    seed: Optional[int] = None  # RNG seed used (local model) — for reproducibility
 
 
 class TTSBackend(Protocol):

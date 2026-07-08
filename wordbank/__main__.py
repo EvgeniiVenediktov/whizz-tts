@@ -56,11 +56,12 @@ def _add_gemini_args(p, *, words=True, instruction=True, chunk=True, poll=True):
 
 
 def cmd_generate(args, cfg: Config) -> None:
-    """Generate phrases locally with OmniVoice; accent via a clone reference."""
+    """Generate phrases locally with OmniVoice → the phrase bank (stored separately
+    from words); accent via a clone reference."""
     from .backends.local import LocalOmniVoiceBackend
     from .pipeline import WordBankPipeline
 
-    m = _ingest(cfg, args.words)
+    m = Manifest(cfg.db, table="phrases", text_col="text")
 
     ref_audio, ref_text = args.ref_audio, args.ref_text
     if ref_text is None and args.ref_text_file:
@@ -73,8 +74,13 @@ def cmd_generate(args, cfg: Config) -> None:
             ref_text = ref_text or v["ref_text"]
             print(f"using registered voice {args.voice!r} ({cfg.lang}): {ref_audio}")
 
+    phrases = _load_words(args.words)
+    added = m.add_words(phrases, cfg.lang, voice=args.voice)
+    print(f"{len(phrases)} phrases in file; {added} newly added to the phrase bank "
+          f"(lang={cfg.lang}, voice={args.voice})")
+
     backend = LocalOmniVoiceBackend(ref_audio=ref_audio, ref_text=ref_text,
-                                    voice=args.voice)
+                                    voice=args.voice, seed=args.seed)
     verifier = None
     if args.verify:
         from .verify import Verifier
@@ -84,7 +90,7 @@ def cmd_generate(args, cfg: Config) -> None:
                             lang=cfg.lang, voice=args.voice)
     result = pipe.run(limit=args.limit)   # sequential — the model isn't thread-safe
     print(f"this run: {result}")
-    print(f"totals:   {m.counts()}")
+    print(f"phrase totals: {m.counts()}")
     m.close()
 
 
@@ -191,9 +197,12 @@ def cmd_batch_run(args, cfg: Config) -> None:
 
 
 def cmd_status(args, cfg: Config) -> None:
-    m = Manifest(cfg.db)
-    print(m.counts())
-    m.close()
+    words = Manifest(cfg.db)
+    phrases = Manifest(cfg.db, table="phrases", text_col="text")
+    print(f"words:   {words.counts()}")
+    print(f"phrases: {phrases.counts()}")
+    words.close()
+    phrases.close()
 
 
 def cmd_export(args, cfg: Config) -> None:
@@ -232,6 +241,8 @@ def main(argv=None) -> None:
     gen.add_argument("--ref-text-file", default=None, dest="ref_text_file",
                      help="file holding the transcript of --ref-audio")
     gen.add_argument("--limit", type=int, default=None, help="cap phrases this run")
+    gen.add_argument("--seed", type=int, default=None,
+                     help="fixed RNG seed (default: a fresh random seed per phrase, recorded)")
     gen.add_argument("--verify", action="store_true",
                      help="STT-verify each clip with local Whisper (slow)")
     gen.set_defaults(func=cmd_generate)

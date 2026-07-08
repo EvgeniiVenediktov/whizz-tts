@@ -24,6 +24,8 @@ class BankLookup:
         self._lock = threading.Lock()
         self._conn = None
         self._ready_count = None   # memoized; the served bank is static per process
+        self._words_has_voice = False  # set on open (older banks may lack it)
+        self._has_phrases = False
         self._open()
 
     def _open(self) -> None:
@@ -40,6 +42,13 @@ class BankLookup:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA query_only = ON")
             self._conn = conn
+            # Capabilities (a bank from older code may lack these).
+            self._words_has_voice = any(
+                r[1] == "voice" for r in conn.execute("PRAGMA table_info(words)")
+            )
+            self._has_phrases = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='phrases'"
+            ).fetchone() is not None
 
     @property
     def available(self) -> bool:
@@ -78,17 +87,76 @@ class BankLookup:
         return [{"code": r[0], "words": r[1]} for r in rows]
 
     def get(self, word: str, lang: str = "en") -> Optional[sqlite3.Row]:
-        """Exact match (case-insensitive). Returns the row or None."""
+        """Exact word match (case-insensitive). Returns the row or None."""
         w = word.strip().lower()
         with self._lock:
             self._open()
             if self._conn is None:
                 return None
+            voice = "voice" if self._words_has_voice else "NULL AS voice"
             return self._conn.execute(
-                f"SELECT word, lang, file_path, status FROM words "
+                f"SELECT word, lang, file_path, status, {voice} FROM words "
                 f"WHERE word = ? AND lang = ? AND {_READY_SQL}",
                 (w, lang),
             ).fetchone()
+
+    def get_phrase(self, text: str, lang: str = "en",
+                   voice: Optional[str] = None) -> Optional[sqlite3.Row]:
+        """Exact phrase match (case-insensitive). If voice is omitted, returns any
+        voice for that phrase. Returns the row or None (also None if no phrases)."""
+        with self._lock:
+            self._open()
+            if self._conn is None or not self._has_phrases:
+                return None
+            sql = ("SELECT text, lang, file_path, status, voice, seed, "
+                   "ref_audio, ref_text FROM phrases "
+                   f"WHERE LOWER(text) = LOWER(?) AND lang = ? AND {_READY_SQL}")
+            params = [text.strip(), lang]
+            if voice is not None:
+                sql += " AND voice = ?"
+                params.append(voice)
+            return self._conn.execute(sql + " LIMIT 1", params).fetchone()
+
+    def search(self, prefix: str, lang: str = "en", limit: int = 10,
+               kind: Optional[str] = None) -> List[dict]:
+        """Merged prefix search over words + phrases. Each result is tagged with
+        its `type` ('word'|'phrase') and `voice`. `kind` optionally restricts to one."""
+        p = prefix.strip().lower()
+        if not p:
+            return []
+        with self._lock:
+            self._open()
+            if self._conn is None:
+                return []
+            parts, params = [], []
+            if kind in (None, "word"):
+                vw = "voice" if self._words_has_voice else "NULL"
+                parts.append(
+                    f"SELECT word AS text, 'word' AS type, {vw} AS voice FROM words "
+                    f"WHERE lang = ? AND word >= ? AND word < ? AND {_READY_SQL}")
+                params += [lang, p, _prefix_upper(p)]
+            if kind in (None, "phrase") and self._has_phrases:
+                parts.append(
+                    "SELECT text, 'phrase' AS type, voice FROM phrases "
+                    f"WHERE lang = ? AND LOWER(text) LIKE ? AND {_READY_SQL}")
+                params += [lang, p + "%"]
+            if not parts:
+                return []
+            sql = " UNION ALL ".join(parts) + " ORDER BY text LIMIT ?"
+            params.append(limit)
+            return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
+
+    def phrase_languages(self) -> List[dict]:
+        """Languages the phrase bank can serve: distinct lang codes with ready counts."""
+        with self._lock:
+            self._open()
+            if self._conn is None or not self._has_phrases:
+                return []
+            rows = self._conn.execute(
+                f"SELECT lang, COUNT(*) FROM phrases WHERE {_READY_SQL} "
+                "GROUP BY lang ORDER BY lang"
+            ).fetchall()
+        return [{"code": r[0], "words": r[1]} for r in rows]
 
     def suggest(self, prefix: str, lang: str = "en", limit: int = 10) -> List[str]:
         """Index-backed prefix autocomplete; returns up to `limit` words."""

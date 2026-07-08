@@ -211,10 +211,10 @@
 </head>
 <body>
 <div class="card" id="card-bank">
-  <h1>Word bank</h1>
+  <h1>Bank lookup</h1>
   <label class="field-label">
-    Word <span style="color:#444;text-transform:none;letter-spacing:0;font-size:0.75rem">— compare the WAV master vs the OGG copy</span>
-    <input type="text" id="bank-word" list="bank-suggest" placeholder="type a word…" autocomplete="off">
+    Word or phrase <span style="color:#444;text-transform:none;letter-spacing:0;font-size:0.75rem">— searches both banks; shows type + voice, compares WAV vs OGG</span>
+    <input type="text" id="bank-word" list="bank-suggest" placeholder="type a word or phrase…" autocomplete="off">
     <datalist id="bank-suggest"></datalist>
   </label>
   <div class="submit-row">
@@ -445,6 +445,8 @@
   const BANK = `${API_BASE}/v1/bank`;
   const VOICES = `${API_BASE}/v1/voices`;
   const GEMINI = `${API_BASE}/v1/gemini/tts`;
+  const SEARCH = `${API_BASE}/v1/search`;
+  const PHRASE = `${API_BASE}/v1/phrase`;
 
   // ---- Word bank lookup ----
   const bankWord = document.getElementById('bank-word');
@@ -461,31 +463,42 @@
 
   const kb = b => b == null ? '' : `(${(b / 1024).toFixed(1)} KB)`;
 
+  const esc = s => s.replace(/"/g, '&quot;');
+
   let suggestTimer = null;
   bankWord.addEventListener('input', () => {
     const p = bankWord.value.trim();
     clearTimeout(suggestTimer);
     if (!p) { bankList.innerHTML = ''; return; }
     suggestTimer = setTimeout(async () => {
-      try {
-        const res = await fetch(`${BANK}?prefix=${encodeURIComponent(p)}&limit=10`);
-        const { words } = await res.json();
-        bankList.innerHTML = words.map(w => `<option value="${w}">`).join('');
+      try {                                    // merged: words + phrases, tagged
+        const res = await fetch(`${SEARCH}?prefix=${encodeURIComponent(p)}&limit=10`);
+        const { results } = await res.json();
+        bankList.innerHTML = results.map(r =>
+          `<option value="${esc(r.text)}" label="${r.type}${r.voice ? ' · ' + r.voice : ''}">`).join('');
       } catch { /* ignore autocomplete errors */ }
     }, 120);
   });
 
+  // Resolve a text to its bank entry: try the word bank, then the phrase bank.
+  async function entryInfo(text) {
+    let r = await fetch(`${BANK}/${encodeURIComponent(text)}/info`);
+    if (r.ok) return { info: await r.json(), url: f => `${BANK}/${encodeURIComponent(text)}?format=${f}` };
+    r = await fetch(`${PHRASE}/info?text=${encodeURIComponent(text)}`);
+    if (r.ok) return { info: await r.json(), url: f => `${PHRASE}?text=${encodeURIComponent(text)}&format=${f}` };
+    return null;
+  }
+
   async function lookupBank() {
-    const word = bankWord.value.trim();
-    if (!word) { bankWord.focus(); return; }
+    const text = bankWord.value.trim();
+    if (!text) { bankWord.focus(); return; }
     bankStatus.textContent = 'looking up…';
     bankCompare.style.display = 'none';
     try {
-      const res = await fetch(`${BANK}/${encodeURIComponent(word)}/info`);
-      if (res.status === 404) { bankStatus.textContent = `“${word}” is not in the bank`; return; }
-      if (!res.ok) { bankStatus.textContent = `error ${res.status}`; return; }
-      const info = await res.json();
-      bankStatus.textContent = '';
+      const hit = await entryInfo(text);
+      if (!hit) { bankStatus.textContent = `“${text}” is not in the bank`; return; }
+      const { info, url } = hit;
+      bankStatus.textContent = `${info.type}${info.voice ? ' · voice: ' + info.voice : ''}`;
       bankCompare.style.display = 'flex';
 
       // OGG is the served asset (primary).
@@ -495,7 +508,7 @@
         oggSize.textContent = kb(info.ogg.bytes) + ratio;
         oggPlayer.style.display = 'block';
         oggMissing.style.display = 'none';
-        oggPlayer.src = `${BANK}/${encodeURIComponent(word)}?format=ogg`;
+        oggPlayer.src = url('ogg');
       } else {
         oggSize.textContent = '';
         oggPlayer.style.display = 'none';
@@ -506,7 +519,7 @@
       if (info.wav.exists) {
         wavRow.style.display = 'block';
         wavSize.textContent = kb(info.wav.bytes);
-        wavPlayer.src = `${BANK}/${encodeURIComponent(word)}?format=wav`;
+        wavPlayer.src = url('wav');
       } else {
         wavRow.style.display = 'none';
         wavPlayer.removeAttribute('src');

@@ -20,6 +20,9 @@ wordbank.db-*
 *.wav
 *.ogg
 
+# Bundled bank archives (scripts/pack.sh) — large + regenerable
+*.tar.gz
+
 # Scratch word lists at repo root
 /words*.txt
 /single_word.txt

@@ -182,7 +182,7 @@ def _write_and_mark(manifest: Manifest, out_dir: pathlib.Path, lang: str,
     path.parent.mkdir(parents=True, exist_ok=True)
     write_wav(path, pcm)
     manifest.set_status(row["id"], DONE, file_path=rel,
-                        billed_chars=len(row["word"]))
+                        billed_chars=len(row["word"]), voice=voice)
 
 
 def _collect(manifest: Manifest, batch: GeminiBatch, job_name: str,

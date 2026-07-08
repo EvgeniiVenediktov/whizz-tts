@@ -32,44 +32,48 @@ class WordBankPipeline:
         self.max_attempts = max_attempts
         self.rate_limiter = rate_limiter
 
-    def _rel_path(self, word_id: int, word: str) -> str:
+    def _rel_path(self, row_id: int, text: str) -> str:
         """WAV path relative to the bank root (out_dir) — stored in the manifest,
         resolved at serve time under WAV_ROOT/OGG_ROOT (so it's portable)."""
-        shard = word_id // 1000
+        shard = row_id // 1000
         return os.path.join(self.lang, f"{self.backend.name}-{self.voice}",
-                            str(shard), f"{word_id}_{safe_filename(word)}.wav")
+                            str(shard), f"{row_id}_{safe_filename(text)}.wav")
 
     def process_row(self, row) -> str:
-        word_id, word = row["id"], row["word"]
-        attempts = self.manifest.start_attempt(word_id)
+        row_id, text = row["id"], row[self.manifest.text_col]
+        attempts = self.manifest.start_attempt(row_id)
         transcript = None
         try:
             if self.rate_limiter is not None:
                 self.rate_limiter.acquire()
             res = self.backend.synthesize(
-                word, voice=self.voice, language=self.language_code
+                text, voice=self.voice, language=self.language_code
             )
             pcm = postproc.peak_normalize(
                 postproc.trim_silence(res.pcm, res.sample_rate)
             )
             if self.verifier is not None:
-                ok, transcript = self.verifier.verify(pcm, res.sample_rate, word)
+                ok, transcript = self.verifier.verify(pcm, res.sample_rate, text)
                 if not ok:
                     raise VerificationError(f"STT mismatch: heard {transcript!r}")
 
-            rel = self._rel_path(word_id, word)
+            rel = self._rel_path(row_id, text)
             path = self.out_dir / rel
             path.parent.mkdir(parents=True, exist_ok=True)
             postproc.write_wav(path, pcm, res.sample_rate)
+            # Record provenance: the seed and the clone reference used, so every
+            # generated clip is reproducible.
             self.manifest.set_status(
-                word_id, VERIFIED, file_path=rel,
-                transcript=transcript, billed_chars=res.billed_chars,
+                row_id, VERIFIED, file_path=rel, transcript=transcript,
+                billed_chars=res.billed_chars, voice=self.voice, seed=res.seed,
+                ref_audio=getattr(self.backend, "ref_audio", None),
+                ref_text=getattr(self.backend, "ref_text", None),
             )
             return VERIFIED
         except Exception as exc:
             status = QUARANTINED if attempts >= self.max_attempts else FAILED
             self.manifest.set_status(
-                word_id, status, error=str(exc)[:500], transcript=transcript
+                row_id, status, error=str(exc)[:500], transcript=transcript
             )
             return status
 

@@ -91,41 +91,36 @@ def _file_info(path: Optional[str]) -> dict:
 
 @app.get("/v1/languages")
 def languages():
-    """Two language lists:
+    """Language lists:
 
-    - wordbank: data-driven — languages currently in the bank (lang + ready count).
+    - wordbank / phrasebank: data-driven — languages currently in each bank.
     - generate: manually-curated, verified list the model can generate
       (wordbank/languages.py).
     """
     from wordbank.languages import SUPPORTED_LANGUAGES
-    return {"wordbank": app.state.bank.languages(), "generate": SUPPORTED_LANGUAGES}
+    return {"wordbank": app.state.bank.languages(),
+            "phrasebank": app.state.bank.phrase_languages(),
+            "generate": SUPPORTED_LANGUAGES}
+
+
+@app.get("/v1/search")
+def search(prefix: str, lang: str = DEFAULT_LANG, limit: int = 10,
+           kind: Optional[str] = None):
+    """Merged prefix search over the word + phrase banks. Each result carries a
+    `type` flag ('word'|'phrase') and the `voice` it was generated with.
+    `kind=word|phrase` restricts to one bank."""
+    return {"results": app.state.bank.search(prefix, lang, min(limit, 50), kind)}
 
 
 @app.get("/v1/bank")
 def bank_suggest(prefix: str, lang: str = DEFAULT_LANG, limit: int = 10):
-    """Prefix autocomplete over the bank (index-backed range scan)."""
+    """Prefix autocomplete over the word bank only (index-backed range scan)."""
     return {"words": app.state.bank.suggest(prefix, lang, min(limit, 50))}
 
 
-@app.get("/v1/bank/{word}/info")
-def bank_info(word: str, lang: str = DEFAULT_LANG):
-    """Sizes/availability of the WAV master and OGG copy — for the compare UI."""
-    row = app.state.bank.get(word, lang)
-    if row is None:
-        raise HTTPException(404, "not in bank")
-    rel = row["file_path"]
-    return {"word": row["word"], "wav": _file_info(_wav_abs(rel)),
-            "ogg": _file_info(_ogg_abs(rel))}
-
-
-@app.get("/v1/bank/{word}")
-def bank_get(word: str, lang: str = DEFAULT_LANG, format: str = "ogg"):
+def _serve_audio(rel: str, format: str):
     """Serve the OGG copy (default — what production ships) or, for dev compare,
     the WAV master (?format=wav, only if WAV_ROOT is mounted)."""
-    row = app.state.bank.get(word, lang)
-    if row is None:
-        raise HTTPException(404, "not in bank")
-    rel = row["file_path"]
     if format == "wav":
         wav = _wav_abs(rel)
         if not os.path.exists(wav):
@@ -135,6 +130,49 @@ def bank_get(word: str, lang: str = DEFAULT_LANG, format: str = "ogg"):
     if not os.path.exists(ogg):
         raise HTTPException(404, "ogg copy not available")
     return FileResponse(ogg, media_type="audio/ogg")
+
+
+@app.get("/v1/bank/{word}/info")
+def bank_info(word: str, lang: str = DEFAULT_LANG):
+    """Sizes/availability of the WAV master and OGG copy — for the compare UI."""
+    row = app.state.bank.get(word, lang)
+    if row is None:
+        raise HTTPException(404, "not in bank")
+    rel = row["file_path"]
+    return {"word": row["word"], "type": "word", "voice": row["voice"],
+            "wav": _file_info(_wav_abs(rel)), "ogg": _file_info(_ogg_abs(rel))}
+
+
+@app.get("/v1/bank/{word}")
+def bank_get(word: str, lang: str = DEFAULT_LANG, format: str = "ogg"):
+    """Serve a word's audio (OGG by default, WAV master in dev)."""
+    row = app.state.bank.get(word, lang)
+    if row is None:
+        raise HTTPException(404, "not in bank")
+    return _serve_audio(row["file_path"], format)
+
+
+@app.get("/v1/phrase/info")
+def phrase_info(text: str, lang: str = DEFAULT_LANG, voice: Optional[str] = None):
+    """Sizes/availability for a phrase (optionally pin a voice)."""
+    row = app.state.bank.get_phrase(text, lang, voice)
+    if row is None:
+        raise HTTPException(404, "not in phrase bank")
+    rel = row["file_path"]
+    return {"text": row["text"], "type": "phrase", "voice": row["voice"],
+            "seed": row["seed"], "ref_audio": row["ref_audio"],
+            "ref_text": row["ref_text"],
+            "wav": _file_info(_wav_abs(rel)), "ogg": _file_info(_ogg_abs(rel))}
+
+
+@app.get("/v1/phrase")
+def phrase_get(text: str, lang: str = DEFAULT_LANG, voice: Optional[str] = None,
+               format: str = "ogg"):
+    """Serve a phrase's audio (OGG by default, WAV master in dev)."""
+    row = app.state.bank.get_phrase(text, lang, voice)
+    if row is None:
+        raise HTTPException(404, "not in phrase bank")
+    return _serve_audio(row["file_path"], format)
 
 
 @app.post("/v1/tts")
