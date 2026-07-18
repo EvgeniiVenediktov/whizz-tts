@@ -20,8 +20,9 @@ wordbank.db-*
 *.wav
 *.ogg
 
-# Bundled bank archives (scripts/pack.sh) — large + regenerable
+# Deployment package artifacts (scripts/pack.sh) — regenerable
 *.tar.gz
+/library.json
 
 # Scratch word lists at repo root
 /words*.txt
@@ -29,4 +30,5 @@ wordbank.db-*
 
 # OS / editor / local tooling
 .DS_Store
-.claude/
+.claude/*
+!.claude/workflows/

@@ -1,0 +1,432 @@
+{
+  "summary": "Multi-dimension automated code review of the TTS MVP codebase (with test quality pass)",
+  "agentCount": 7,
+  "logs": [
+    "Running 4 parallel triage auditors...",
+    "Architect judge reading codebase independently...",
+    "Adversarially verifying 26 raw findings...",
+    "21 of 26 findings confirmed.",
+    "Generating prioritized punch list...",
+    "Test quality pass: 157 tests across 15 files audited — 9 findings added as test_quality dimension."
+  ],
+  "test_inventory": {
+    "total_test_functions": 157,
+    "total_test_files": 15,
+    "summary": "~140 high-confidence tests covering the core invariants well. 9 tests should be removed/refactored (vacuous, implementation-detail, or redundant). 2 large tests should be split for debuggability. 1 integration test needs flakiness documentation.",
+    "files": [
+      { "file": "tests/conftest.py", "purpose": "Shared fixtures: FakeBackend (PCM sine wave), make_wav_bytes, silent_wav, FastAPI test client with model patched" },
+      { "file": "tests/test_wordbank.py", "purpose": "Manifest dedup/attempt tracking, text normalization, Verifier STT matching, pipeline success/quarantine/resume (8 tests)" },
+      { "file": "tests/test_wordbank_batch.py", "purpose": "Gemini Batch API: request body shape, JSONL key mapping, base64 decode, keyed 1:1 correspondence (reversed results), overnight batch flow, 429 quota handling (11 tests)" },
+      { "file": "tests/test_wordbank_parallel.py", "purpose": "Word-list cleaner, RateLimiter token-bucket, run_parallel pipeline (4 tests — 1 trivial)" },
+      { "file": "tests/test_bank.py", "purpose": "BankLookup exact/prefix/language-scoped lookup, WAL visibility regression, server /v1/bank endpoints (10 tests — 1 should be split)" },
+      { "file": "tests/test_phrases.py", "purpose": "Phrase bank storage separate from words, per-voice uniqueness, merged prefix search, backward compat, pipeline provenance, server phrase endpoints (7 tests — 1 should be split, 1 tests a script)" },
+      { "file": "tests/test_voices.py", "purpose": "Voices registry: add/get/upsert/multi-lang, forward compat (old DB), save_voice_clip writes + registers, BankLookup.voices() (9 tests)" },
+      { "file": "tests/test_library.py", "purpose": "describe() captures counts, verify() happy path and failure modes (missing desc, wrong count, missing folder, empty volume) (5 tests)" },
+      { "file": "tests/test_server_unit.py", "purpose": "/v1/tts: no-ref, with ref_audio/text, text-too-long, audio-too-large, 422 missing text, guidance+seed forwarding, MODEL_ENABLED=0 503; /health (9 tests — 1 tests impl details)" },
+      { "file": "tests/test_voice_studio.py", "purpose": "Gemini voices list (30 voices, gender distribution), /v1/gemini/tts WAV output, save/list/serve voice workflow, /v1/tts with saved voice, unknown-voice 404 (5 tests)" },
+      { "file": "tests/test_local_backend.py", "purpose": "LocalOmniVoice backend: fixed seed forwarded, random seed generated (2 tests — both test impl details, should be refactored)" },
+      { "file": "tests/test_audio.py", "purpose": "pcm_to_ogg: returns bytes (trivial), OggS magic, short audio (3 tests — 1 trivial)" },
+      { "file": "tests/test_device.py", "purpose": "select_device/select_dtype for CUDA/MPS/CPU (6 tests — ALL vacuous mocks, remove entire file)" },
+      { "file": "tests/test_serves_real_bank.py", "purpose": "Skips if no bank present; picks a random done word and asserts server returns OGG with correct MIME and OggS magic (1 test, high value smoke test)" },
+      { "file": "tests/test_integration.py", "purpose": "Real OmniVoice model (--integration flag): health, TTS no-ref, full sentence, voice cloning, ASR roundtrip (>=60% word recall), seed determinism, gender pitch direction (7 tests — 1 potentially flaky)" }
+    ]
+  },
+  "result": {
+    "findings_by_dimension": {
+      "dead_code": [
+        {
+          "dimension": "dead_code",
+          "file": "/Users/evgenii.venediktov/tts/scripts/gemini_sync.py",
+          "line_range": "19",
+          "description": "`from wordbank.pipeline import _safe` will raise ImportError at runtime. The symbol `_safe` does not exist in wordbank/pipeline.py — it was renamed to `safe_filename` and moved to wordbank/paths.py. The script also imports `write_wav` from gemini_batch and `_safe` from pipeline, then uses `_safe(word)` at line 57. This is a broken import that crashes on invocation.",
+          "severity": "high",
+          "fix": "Replace `from wordbank.pipeline import _safe` with `from wordbank.paths import safe_filename` and rename the call on line 57 from `_safe(word)` to `safe_filename(word)`.",
+          "verdict": "CONFIRMED"
+        },
+        {
+          "dimension": "dead_code",
+          "file": "/Users/evgenii.venediktov/tts/requirements.txt",
+          "line_range": "14",
+          "description": "google-cloud-texttospeech>=2.16.0 is listed with a comment 'Word bank — Chirp 3 HD backend'. No Python file in wordbank/, src/, scripts/, or tests/ imports from google.cloud.texttospeech. The Chirp backend was superseded by the Gemini Batch and local OmniVoice backends; backends/chirp.py no longer exists.",
+          "severity": "medium",
+          "fix": "Remove the google-cloud-texttospeech line and its comment from requirements.txt.",
+          "verdict": "CONFIRMED"
+        },
+        {
+          "dimension": "dead_code",
+          "file": "/Users/evgenii.venediktov/tts/scripts/validate_batch_words.py",
+          "line_range": "1-68",
+          "description": "This script validates a now-abandoned approach: generating a period-separated batch of words with OmniVoice, then using `model._asr_pipe` (Whisper) word-timestamps to cut per-clip audio. WORDBANK_PLAN.md explicitly records 'Verification: None (Whisper dropped). Correctness comes from keyed mapping.' The current architecture generates one word per Gemini request with keyed JSONL — batch cutting via ASR timestamps is entirely superseded. The script also directly accesses `model._asr_pipe`, a private attribute.",
+          "severity": "medium",
+          "fix": "Delete scripts/validate_batch_words.py. It tests an approach that was evaluated and abandoned before the current pipeline was built.",
+          "verdict": "CONFIRMED"
+        },
+        {
+          "dimension": "dead_code",
+          "file": "/Users/evgenii.venediktov/tts/wordbank/pipeline.py",
+          "line_range": "30",
+          "description": "`self.language_code = lang` is assigned in `__init__` alongside `self.lang = lang`. Both hold the same value. `self.language_code` is used only in `process_row` (line 50) to pass `language=self.language_code` to `backend.synthesize()`; neither `LocalOmniVoiceBackend` nor `GeminiBatch` uses the `language` keyword argument. `self.lang` is used for the output path. The duplicate attribute `self.language_code` adds confusion about which attribute represents the language.",
+          "severity": "low",
+          "fix": "Remove `self.language_code = lang` and replace the reference on line 50 with `language=self.lang`.",
+          "verdict": "CONFIRMED"
+        },
+        {
+          "dimension": "dead_code",
+          "file": "/Users/evgenii.venediktov/tts/scripts/diagnose_voice_design.py",
+          "line_range": "1-75",
+          "description": "This is a one-off diagnostic script that sweeps OmniVoice `guidance_scale` values measuring male vs female F0 to validate whether voice design (gender/accent instructions) produces measurable pitch differences. The current architecture uses Gemini prebuilt voices for the word bank and voice-clone references for accent phrases — the guidance_scale F0 sweep against OmniVoice is a completed validation artifact, not part of any ongoing pipeline. It is referenced nowhere (no import, no Makefile target, no CI).",
+          "severity": "low",
+          "fix": "Delete scripts/diagnose_voice_design.py, or move it to an archive/experiments folder if the voice design investigation may resume.",
+          "verdict": "CONFIRMED"
+        }
+      ],
+      "bloat": [
+        {
+          "dimension": "bloat",
+          "file": "wordbank/gemini_batch.py, wordbank/gemini_tts.py, wordbank/backends/local.py, src/audio.py",
+          "line_range": "gemini_batch.py:36, gemini_tts.py:10, backends/local.py:20, src/audio.py:8",
+          "description": "SAMPLE_RATE = 24_000 is defined independently in four files. Any future change (e.g. to 22050) requires four edits and risks divergence. The four definition sites are identical in value and semantics.",
+          "severity": "high",
+          "fix": "Create a single shared constants module (e.g. wordbank/constants.py or src/constants.py) with SAMPLE_RATE = 24_000, then import it in all four files. Replace local assignments with `from .constants import SAMPLE_RATE` (or `from wordbank.constants import SAMPLE_RATE` in src/).",
+          "verdict": "CONFIRMED"
+        },
+        {
+          "dimension": "bloat",
+          "file": "wordbank/gemini_batch.py, wordbank/postproc.py",
+          "line_range": "gemini_batch.py:86-93, postproc.py:20-25",
+          "description": "Two functions named write_wav with incompatible signatures and implementations: gemini_batch.py takes (path, pcm: bytes, sample_rate) and uses stdlib wave to wrap raw 16-bit PCM; postproc.py takes (path, pcm: np.ndarray, sr) and uses soundfile to write float32 as PCM_16. Same name, different contracts — a reader or future caller can easily apply the wrong one.",
+          "severity": "high",
+          "fix": "Rename to distinguish: e.g. write_wav_from_pcm_bytes (in gemini_batch.py) and write_wav_from_array (in postproc.py), or consolidate into one function that accepts either type. The batch path only ever has raw bytes; the pipeline path always has an ndarray from postproc.peak_normalize — the distinction is real, so renaming is safer than merging.",
+          "verdict": "CONFIRMED"
+        },
+        {
+          "dimension": "bloat",
+          "file": "wordbank/pipeline.py",
+          "line_range": "29-30",
+          "description": "WordBankPipeline.__init__ assigns both self.lang and self.language_code to the same lang argument value with no branching logic. self.lang is used for path building (_rel_path); self.language_code is passed to backend.synthesize. They are always equal and never diverge — two attributes for one concept.",
+          "severity": "medium",
+          "fix": "Drop self.language_code and pass self.lang directly to backend.synthesize in process_row (line 50). If the two ever need to differ (e.g. path uses 'en', backend needs 'en-US'), document the distinction explicitly; right now they are identical.",
+          "verdict": "CONFIRMED"
+        },
+        {
+          "dimension": "bloat",
+          "file": "wordbank/gemini_tts.py, wordbank/gemini_batch.py, src/server.py",
+          "line_range": "gemini_tts.py:11, gemini_batch.py:35, src/server.py:22",
+          "description": "Gemini model version strings are hardcoded in three places: gemini_tts.py defines DEFAULT_MODEL = 'gemini-2.5-flash-preview-tts'; gemini_batch.py defines DEFAULT_MODEL = 'gemini-3.1-flash-tts-preview' (a different model); src/server.py hardcodes the fallback 'gemini-2.5-flash-preview-tts' as the env default for GEMINI_TTS_MODEL without importing it from gemini_tts.py. The two DEFAULT_MODEL names shadow each other if both modules are in scope, and server.py's fallback will go stale independently of gemini_tts.py.",
+          "severity": "medium",
+          "fix": "In src/server.py, import GEMINI_TTS_MODEL default from gemini_tts.py: `from wordbank.gemini_tts import DEFAULT_MODEL as _GEMINI_TTS_DEFAULT` and use it as the env fallback. The batch model (gemini_batch.py) serves a different purpose and can keep its own constant, but should be renamed BATCH_DEFAULT_MODEL to avoid shadowing.",
+          "verdict": "CONFIRMED"
+        },
+        {
+          "dimension": "bloat",
+          "file": "wordbank/pipeline.py",
+          "line_range": "96-117",
+          "description": "WordBankPipeline.run_parallel uses a ThreadPoolExecutor but the only currently wired backend (LocalOmniVoiceBackend) is documented explicitly as not thread-safe and runs sequentially. The method exists for a future multi-threaded cloud backend that has not arrived, making it a dead-end on the current architecture.",
+          "severity": "medium",
+          "fix": "Either remove run_parallel until a thread-safe backend exists and add a guard at the top that raises if the backend is LocalOmniVoiceBackend, or add a clear docstring warning: 'Do not use with LocalOmniVoiceBackend — the underlying model is not thread-safe.' Currently it silently produces non-deterministic behavior if called on the local backend.",
+          "verdict": "CONFIRMED"
+        },
+        {
+          "dimension": "bloat",
+          "file": "wordbank/postproc.py",
+          "line_range": "13",
+          "description": "The comment '(Phase 2: switch to LUFS via pyloudnorm.)' refers to a phased development roadmap that no longer reflects project state. Recent commits show the project is well past any 'Phase 2' milestone, and no pyloudnorm dependency appears anywhere in the codebase.",
+          "severity": "low",
+          "fix": "Replace with a concrete TODO or remove: e.g. 'TODO: upgrade to LUFS normalization via pyloudnorm for broadcast-safe levels.' This avoids implying a sequential phase plan that no longer exists.",
+          "verdict": "CONFIRMED"
+        }
+      ],
+      "token_optimization": [
+        {
+          "dimension": "token_optimization",
+          "file": "/Users/evgenii.venediktov/tts/wordbank/gemini_batch.py",
+          "line_range": "41",
+          "description": "VOICE_INSTRUCTION is 71 characters and adds 72 chars of overhead (instruction + space) to every request. At the default 2000-word batch this is 144,000 characters of pure prompt overhead per batch job — roughly 10x the character volume of the actual word content (averaging 7 chars/word = 14,000 chars). At Gemini TTS pricing (~$0.50/1M chars) this costs ~$0.072 extra per batch and ~$1.80 extra for a 50k-word bank. The instruction is hardcoded at the module level and not overridable via environment variable.",
+          "severity": "high",
+          "fix": "Shorten VOICE_INSTRUCTION to a minimal equivalent such as 'Say clearly and naturally:' (saves ~47 chars/request = 94,000 chars per 2000-word batch). Also add an environment variable fallback: `VOICE_INSTRUCTION = os.getenv('WORDBANK_VOICE_INSTRUCTION', 'Say clearly and naturally:')`. The --instruction CLI flag already works but is not wired to the environment.",
+          "verdict": "CONFIRMED"
+        },
+        {
+          "dimension": "token_optimization",
+          "file": "/Users/evgenii.venediktov/tts/wordbank/gemini_tts.py",
+          "line_range": "49",
+          "description": "genai.Client() is instantiated inside synthesize_pcm on every call. The server's /v1/gemini/tts endpoint calls synthesize_pcm inside a thread executor on every HTTP request, meaning a new SDK client object (with its associated HTTP connection pool and auth state) is constructed per voice-studio preview request. Repeated client construction adds latency and risks exhausting connection pool resources under concurrent usage.",
+          "severity": "medium",
+          "fix": "Lift the client to module level or use a module-level cached singleton: `_client = None` with a `_get_client()` helper (same pattern as GeminiBatch._get_client in gemini_batch.py lines 105-109). The server imports gemini_tts lazily so module-level initialization is safe.",
+          "verdict": "CONFIRMED"
+        },
+        {
+          "dimension": "token_optimization",
+          "file": "/Users/evgenii.venediktov/tts/wordbank/gemini_batch.py",
+          "line_range": "41,60",
+          "description": "The batch path (gemini_batch.py) and the single-phrase path (gemini_tts.py) use incompatible instruction-prepending conventions. The batch uses a space separator (f'{instruction} {word}', line 49) with a hardcoded delivery-directive constant. The single path uses a colon+space separator (f'{instruct}: {text}', gemini_tts.py line 50) with a free-form accent/style string. There is no shared instruction module, so if a caller wants identical phrasing in both paths they must manually coordinate two different format strings.",
+          "severity": "low",
+          "fix": "Extract a shared helper in a new wordbank/instructions.py module that owns the canonical instruction string and a format_prompt(instruction, text) function with a single separator convention. Both gemini_batch.build_request_body and gemini_tts.synthesize_pcm import from it.",
+          "verdict": "CONFIRMED"
+        },
+        {
+          "dimension": "token_optimization",
+          "file": "/Users/evgenii.venediktov/tts/wordbank/gemini_batch.py",
+          "line_range": "46-57",
+          "description": "build_request_body constructs a fresh dict from scratch for every word including the static generationConfig subtree (responseModalities, speechConfig, voiceConfig, prebuiltVoiceConfig). In a 2000-word batch all 2000 generationConfig dicts are structurally identical — only the text field in contents[0].parts[0].text changes. This is a CPU/memory inefficiency: 2000 redundant object allocations for the static portion.",
+          "severity": "low",
+          "fix": "In build_jsonl, pre-build the static generationConfig JSON string once per call and string-template only the text portion. Serialize the config subtree once with json.dumps, then construct each line by merging only the changing contents key. This avoids 2000x dict allocation for the static config at effectively zero correctness risk.",
+          "verdict": "CONFIRMED"
+        }
+      ],
+      "test_quality": [
+        {
+          "dimension": "test_quality",
+          "file": "tests/test_device.py",
+          "line_range": "1-40 (all 6 tests)",
+          "description": "All 6 tests are vacuous: they patch torch.cuda.is_available / torch.backends.mps.is_available to return True/False, then assert the function returns the expected string. They test the mocking framework, not real device-selection logic. No real torch or hardware involved — passing these tests gives zero confidence that device selection works on actual hardware.",
+          "severity": "medium",
+          "fix": "Remove the entire file. If device selection needs testing, add a single integration-level check that imports the real module and verifies it returns a valid torch device string.",
+          "verdict": "CONFIRMED"
+        },
+        {
+          "dimension": "test_quality",
+          "file": "tests/test_audio.py",
+          "line_range": "test_pcm_to_ogg_returns_bytes",
+          "description": "Asserts that pcm_to_ogg() returns bytes and is non-empty. Every call either returns bytes or raises — this assertion can never add confidence. The other two audio tests (OggS magic bytes, short audio) already subsume this check.",
+          "severity": "low",
+          "fix": "Delete test_pcm_to_ogg_returns_bytes. The remaining two tests in test_audio.py are sufficient.",
+          "verdict": "CONFIRMED"
+        },
+        {
+          "dimension": "test_quality",
+          "file": "tests/test_wordbank_parallel.py",
+          "line_range": "test_clean_words_preserves_frequency_order",
+          "description": "Passes ['zebra', 'apple', 'mango'] (all valid words, no filtering occurs) and asserts the list is returned in the same order. This tests that Python list comprehensions preserve order — a language property, not application logic.",
+          "severity": "low",
+          "fix": "Delete this test. The existing test_clean_words_filters_and_dedupes already covers filtering and dedup; order preservation is only meaningful when some items are filtered out, which that test already exercises.",
+          "verdict": "CONFIRMED"
+        },
+        {
+          "dimension": "test_quality",
+          "file": "tests/test_server_unit.py",
+          "line_range": "test_tts_forwards_guidance_and_seed",
+          "description": "Patches model_mod.generate and inspects a captured dict of keyword arguments passed to it. This tests internal call conventions, not observable HTTP behavior. If the server is refactored to pass guidance/seed differently (e.g. via a dataclass), this test breaks even if the audio output is identical.",
+          "severity": "medium",
+          "fix": "Refactor to test observable behavior: same seed → same audio bytes (or at least same length), different seeds → different audio. Remove the internal call-signature assertion.",
+          "verdict": "CONFIRMED"
+        },
+        {
+          "dimension": "test_quality",
+          "file": "tests/test_local_backend.py",
+          "line_range": "test_local_backend_passes_reference_and_fixed_seed, test_local_backend_uses_random_seed_when_unset",
+          "description": "Both tests inject a generate_fn spy and assert exact argument values passed to it. test_local_backend_uses_random_seed_when_unset checks that the seed is an int in 0..2^31, which is an arbitrary constraint not documented in the code. Both test the internal wiring rather than the observable contract: given ref_audio+ref_text+fixed_seed, output is reproducible.",
+          "severity": "medium",
+          "fix": "Replace with behavioral tests: (1) same seed + same ref → identical PCM output; (2) no fixed seed → two consecutive calls produce different outputs. This tests the actual guarantee callers depend on.",
+          "verdict": "CONFIRMED"
+        },
+        {
+          "dimension": "test_quality",
+          "file": "tests/test_bank.py",
+          "line_range": "test_bank_endpoints",
+          "description": "Single test exercises GET /v1/bank/{word} (OGG default, WAV fallback, missing file, 404), GET /v1/bank?prefix=, and GET /v1/languages through multiple code paths in sequence. When it fails the assertion line number points into a 50-line test body with no intermediate labels, making the failure hard to diagnose.",
+          "severity": "low",
+          "fix": "Split into focused test functions: test_bank_serves_ogg_by_default, test_bank_falls_back_to_wav, test_bank_404_for_unknown_word, test_bank_prefix_search. Each verifies one behavior and fails with a clear name.",
+          "verdict": "CONFIRMED"
+        },
+        {
+          "dimension": "test_quality",
+          "file": "tests/test_phrases.py",
+          "line_range": "test_server_search_and_phrase_serving",
+          "description": "Single test exercises /v1/search, /v1/phrase/info, /v1/phrase (audio bytes), and /v1/languages in sequence. Four different endpoints in one test body; any failure obscures which endpoint broke.",
+          "severity": "low",
+          "fix": "Split into test_search_returns_words_and_phrases, test_phrase_info_endpoint, test_phrase_audio_endpoint, test_languages_includes_phrase_langs.",
+          "verdict": "CONFIRMED"
+        },
+        {
+          "dimension": "test_quality",
+          "file": "tests/test_phrases.py",
+          "line_range": "test_backfill_voice_from_path",
+          "description": "Dynamically imports scripts/backfill_voice.py via importlib at test time and calls a parse_path() helper from it. This couples the test suite to a standalone utility script's internal API. If the script is deleted or renamed, the test raises an ImportError with no useful message.",
+          "severity": "low",
+          "fix": "If parse_path is worth testing, move it into a proper module (e.g. wordbank/paths.py) and test it there. Otherwise delete the test alongside the script if backfill_voice.py is removed.",
+          "verdict": "CONFIRMED"
+        },
+        {
+          "dimension": "test_quality",
+          "file": "tests/test_integration.py",
+          "line_range": "test_gender_pitch_direction",
+          "description": "Relies on OmniVoice producing measurably different F0 for male vs female voice design across a fixed sentence and 5 seeds. Uses a hardcoded 10% threshold with no documented basis. If the model weights are updated or voice-design sensitivity changes, this test may flip without any real regression — or may mask a real regression if the model changes in the expected direction by coincidence.",
+          "severity": "low",
+          "fix": "Add a comment documenting the threshold basis and the model version it was calibrated against. Mark with @pytest.mark.flaky(max_runs=3) if the test is run in CI, or move to a dedicated model-quality benchmark suite that is not blocking.",
+          "verdict": "CONFIRMED"
+        }
+      ],
+      "deployment": [
+        {
+          "dimension": "deployment",
+          "file": "/Users/evgenii.venediktov/tts/src/server.py",
+          "line_range": "46-49",
+          "description": "CORS is wide-open: allow_origins=['*'], allow_methods=['*'], allow_headers=['*']. The comment says 'restrict in production' but there is no mechanism to enforce this — no env-var toggle, no production override. Any web page on the internet can POST to /v1/voices (which writes a WAV file to disk at VOICES_ROOT) or POST to /v1/tts (which synthesises audio), both with no authentication or authorization check whatsoever.",
+          "severity": "high",
+          "fix": "Read allowed origins from an env var (e.g. CORS_ORIGINS, defaulting to 'http://localhost:8000' rather than '*'). Add API-key or token authentication on state-mutating endpoints (/v1/voices POST, /v1/tts, /v1/gemini/tts) via a FastAPI dependency. At minimum, restrict allow_methods to the actual verbs used by each route rather than '*'.",
+          "verdict": "CONFIRMED"
+        },
+        {
+          "dimension": "deployment",
+          "file": "/Users/evgenii.venediktov/tts/src/server.py",
+          "line_range": "233-234",
+          "description": "asyncio.get_event_loop() is called inside the async def tts() handler (line 233). In Python 3.10+ this is deprecated inside a running event loop and emits a DeprecationWarning; in 3.12 (which the Dockerfile uses) the deprecation path warns that this behavior will eventually change. The correct call is asyncio.get_running_loop().",
+          "severity": "medium",
+          "fix": "Replace both occurrences: line 233: loop = asyncio.get_event_loop() → loop = asyncio.get_running_loop(); line 267: loop = asyncio.get_event_loop() → loop = asyncio.get_running_loop(). The same pattern appears identically in the gemini_tts handler.",
+          "verdict": "CONFIRMED"
+        },
+        {
+          "dimension": "deployment",
+          "file": "/Users/evgenii.venediktov/tts/src/server.py",
+          "line_range": "267-268",
+          "description": "Second occurrence of asyncio.get_event_loop() inside async def gemini_tts() (line 267), same issue as the tts() handler. Both will emit DeprecationWarning on every synthesis request under Python 3.12.",
+          "severity": "medium",
+          "fix": "Replace line 267: loop = asyncio.get_event_loop() → loop = asyncio.get_running_loop().",
+          "verdict": "CONFIRMED"
+        },
+        {
+          "dimension": "deployment",
+          "file": "/Users/evgenii.venediktov/tts/Dockerfile",
+          "line_range": "1-47",
+          "description": "No HEALTHCHECK instruction in the Dockerfile. The /health endpoint exists and returns meaningful status (bank availability, word count, model_loaded), but it is never wired to Docker's native health-check mechanism. Docker and docker-compose have no way to know whether the container is actually serving traffic or still in the entrypoint provisioning phase.",
+          "severity": "medium",
+          "fix": "Add to Dockerfile: HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 CMD curl -sf http://localhost:8000/health || exit 1. Also add a healthcheck block to each service in docker-compose.yml. The start-period should be at least as long as worst-case archive unpack time.",
+          "verdict": "CONFIRMED"
+        },
+        {
+          "dimension": "deployment",
+          "file": "/Users/evgenii.venediktov/tts/docker-entrypoint.sh",
+          "line_range": "37-39",
+          "description": "BANK_SYNC_CMD is executed via `sh -c \"$BANK_SYNC_CMD\"` with no sanitization. Because the value is user-controlled (set in docker-compose.yml environment block or at `docker run -e`), an operator who can set that variable can execute arbitrary shell commands as the container's process user. The compose file already shows an example with multi-command strings, confirming this is a shell-expansion-capable vector.",
+          "severity": "medium",
+          "fix": "If the intended use is always an aws/rclone/gsutil sync, accept structured parameters (SYNC_BUCKET, SYNC_PREFIX) and hard-code the safe command template, rather than eval-ing a free-form string. If freeform is required, document the injection risk explicitly and validate the value against an allowlist pattern (e.g. must start with 'aws s3' or 'rclone sync') before executing.",
+          "verdict": "CONFIRMED"
+        },
+        {
+          "dimension": "deployment",
+          "file": "/Users/evgenii.venediktov/tts/docker-entrypoint.sh",
+          "line_range": "22-42",
+          "description": "When verify fails AND no archive exists (line 34), the entrypoint prints a warning and falls through to `exec \"$@\"` — starting the uvicorn server with an empty or corrupt bank. The server will start, report status=ok on /health, and silently serve 404s for all word/phrase lookups. There is no restart policy or memory limit in docker-compose.yml.",
+          "severity": "medium",
+          "fix": "Add `exit 1` after the 'volume not provisioned and no archive' message so Docker sees the container exit with a non-zero code and the restart policy can trigger. Also add a restart policy (e.g. restart: unless-stopped or on-failure:3) and memory limits to both services in docker-compose.yml. Harden the /health endpoint to return HTTP 503 when bank.available is False.",
+          "verdict": "CONFIRMED"
+        }
+      ]
+    },
+    "architect_summary": [
+      "SPOF — SQLite is the sole state store with no replica or fallback. A corruption event (mid-write crash to the WAV, followed by a power loss before the manifest.set_status commit at gemini_batch.py:185) leaves a DONE row pointing at a truncated or absent WAV file. There is no integrity check on startup beyond the library-description verify; a corrupted DB is served silently, and bank_words in /health will report a non-zero count that misleads operators. The only recovery path is the archive re-unpack, which requires the correct tts-bank.tar.gz to already be on the volume.",
+      "SPOF — Volume provisioning is a TOCTOU race on cold start. docker-entrypoint.sh (line 22) runs the Python verify check, then unpacks (line 27–29), then re-verifies. If two containers start simultaneously against the same named volume (bank-data) — e.g. during a rolling restart or a compose up that races — both can observe 'not provisioned', both run tar xzf concurrently, and the overlapping writes can produce a partially-extracted OGG tree. Neither run detects the other's writes. A file lock or an atomic sentinel file written only after a complete unpack would eliminate this.",
+      "SPOF — BankLookup opens SQLite without a busy-timeout (lookup.py:41). In WAL mode, a read cursor and a write cursor from the batch writer can coexist, but if the writer holds a RESERVED or PENDING lock during a checkpoint, a concurrent read will immediately get SQLITE_BUSY and bubble up as an unhandled OperationalError to the FastAPI handler, producing a 500. Setting conn.execute('PRAGMA busy_timeout = 5000') at open time would let readers retry up to 5 s before failing.",
+      "SPOF — save_voice in server.py (lines 322–330) opens a second Manifest connection, writes a new voices row, closes it, then calls app.state.bank.close() to force the read connection to reconnect and see the new row. This close() drops the single shared BankLookup connection under live traffic: any concurrent read-path request between the close() and the next _open() call returns 404 (bank shows as unavailable). The correct fix is to invalidate only the memoized voice cache, or to hold a dedicated long-lived read connection per connection WAL semantics allow.",
+      "RELIABILITY — The Docker service has no HEALTHCHECK directive in the Dockerfile (Dockerfile:39–47) or in either compose service definition (docker-compose.yml:14–37). The /health endpoint exists (server.py:52) but is never wired to Docker's health machinery, so a container in a crash-loop-or-degraded state is invisible to the scheduler, to a load-balancer health gate, and to any restart: on_failure policy. Add HEALTHCHECK CMD curl -f http://localhost:8000/health || exit 1 with a --start-period long enough to allow model loading.",
+      "RELIABILITY — uvicorn's default shutdown (exec'd by docker-entrypoint.sh line 42) sends SIGTERM and drops all in-flight requests immediately. FastAPI/Starlette lifespan teardown (server.py:41, bank.close()) runs only after the ASGI app finishes, which it does not when uvicorn kills handlers on signal. A slow /v1/tts synthesis request or a large audio download will be aborted mid-stream. Adding --timeout-graceful-shutdown N to the uvicorn CMD (e.g. CMD [\"uvicorn\", ... \"--timeout-graceful-shutdown\", \"30\"]) enables draining.",
+      "RELIABILITY — The entrypoint (docker-entrypoint.sh line 32) prints a WARNING if the post-unpack verify still fails but continues to exec the server. The server will start with a broken or empty bank, /health will show bank: false or an incorrect word count, and every /v1/bank and /v1/phrase request will 404. The entrypoint should exit 1 on a failed verify so the container is reported as failed and a restart policy or orchestrator can intervene instead of silently serving nothing.",
+      "RELIABILITY — BankLookup.count() memoizes the ready word count on first call (lookup.py:66–75, _ready_count). This is correct for a static read-only bank but becomes incorrect as soon as the batch writer adds new DONE rows mid-session (or if save_voice causes a reconnect). After bank.close() + reconnect in save_voice, _ready_count is reset (lookup.py:215), but concurrent GETs to /health that race the reconnect window will see count() return 0 (the _open() path returns early when conn is None, and count() returns 0 on line 71). The memoize-reset and reconnect should be atomic.",
+      "SECURITY — CORS is open for all origins (server.py:47–49, allow_origins=['*']). The README notes this should be restricted in production (line 46 comment) but there is no mechanism to enforce it at deploy time. With no authentication, any browser tab on any origin can invoke /v1/tts (live synthesis) or /v1/voices (POST saves a new voice reference to disk) on behalf of an authenticated user's browser cookies/credentials. Set allow_origins to an explicit allowlist via an env var parsed at startup.",
+      "SECURITY — BANK_SYNC_CMD is passed directly to sh -c at docker-entrypoint.sh line 39. Any operator or CI system that can set this env variable can execute arbitrary commands inside the container as the process user. Because the compose file shows the example value inline (docker-compose.yml line 28), it is tempting to set it from an untrusted config source. This is a shell-injection vector; if the command must be configurable, accept only a whitelist of allowable sync verbs (e.g. aws s3 sync with argument validation) or replace the open sh -c with a structured argument list.",
+      "SECURITY — GEMINI_API_KEY is consumed by the google-genai client implicitly via the environment (gemini_batch.py:108, genai.Client() with no explicit key). The key is never logged, but it is present in the process environment of the running container and visible to any code that runs in the same process. The /health endpoint (server.py:52–70) does not redact environment contents, but because no env-dump endpoint exists today this is low severity. The higher risk is that docker-compose.yml example comments show GEMINI_API_KEY=… inline in the README (README.md line 142) — if that line is pasted into a .env file that is committed, the key leaks. Document that the key must come from a secrets manager, not a committed file.",
+      "SECURITY — The /v1/voices POST endpoint (server.py:303–330) writes arbitrary WAV bytes to disk under VOICES_ROOT with no authentication. The path is determined by save_voice_clip (called with the user-supplied name and lang fields). If save_voice_clip constructs the path directly from name without sanitisation (not visible from the reviewed files, but the name and lang values arrive from Form() with no validation), this is a path-traversal write vector. At minimum the endpoint should require authentication and sanitise the name/lang path components.",
+      "SECURITY — ref_audio upload in /v1/tts (server.py:208–215) writes the uploaded bytes to a tempfile.NamedTemporaryFile and passes the path to the synthesis model. The file is cleaned up in the finally block (line 240), but if the cleanup raises (e.g. file already deleted by another thread), the unlink exception is silently swallowed only because os.unlink is not inside a try/except. Actually os.unlink is not guarded — it will propagate and suppress the audio response. More importantly, there is no validation that the uploaded bytes are actually audio before passing them to the model; a malformed or crafted binary is passed directly to omnivoice.",
+      "SCALABILITY — BankLookup holds a single sqlite3 connection shared across all FastAPI worker threads via a threading.Lock (lookup.py:9, 21). Every request — suggest, get, search, phrase, voices — serialises through that lock. Under the default uvicorn single-worker, this is fine. If the operator scales to multiple workers (uvicorn --workers N or gunicorn), each worker process gets its own BankLookup, which is correct. But within a single worker, a slow query (e.g. the UNION ALL search across a large bank) holds the lock and blocks all other reads for its duration. Per-request short-lived connections or a connection pool (even size=2) would eliminate this serialisation without sacrificing WAL read concurrency.",
+      "SCALABILITY — Live synthesis in /v1/tts uses loop.run_in_executor(None, _synthesize) (server.py:234) with the default ThreadPoolExecutor, whose size is min(32, os.cpu_count()+4) in Python 3.12. Each OmniVoice synthesis call is CPU-bound and long-running (seconds). Under concurrent requests, all executor threads saturate CPUs simultaneously; the GIL does not protect CPU-bound C-extension code in torch. The result is degraded latency for bank-only requests that share the same event loop. A dedicated bounded executor (e.g. ThreadPoolExecutor(max_workers=2)) for synthesis, with a 503 when the queue is full, prevents a few slow synthesis requests from starving bank lookups.",
+      "SCALABILITY — Horizontal scaling of the bank-only tier is straightforward (stateless reads from a read-only SQLite on a shared volume, or per-replica copies). However, the /v1/voices POST write path and the entrypoint unpack both write to the shared /data volume. If two replicas run against the same volume and both receive a /v1/voices POST simultaneously, both open separate Manifest connections (server.py:322), both call save_voice_clip, and SQLite's WAL arbitrates the INSERT via ON CONFLICT — this part is safe. But save_voice_clip likely writes the WAV file to disk before the manifest insert; two writes for the same name/lang to the same path on a shared volume (e.g. NFS) with no flock can corrupt the file. The design implicitly assumes a single writer.",
+      "OPERATIONAL — /health (server.py:52–70) always returns HTTP 200 with status:'ok' regardless of whether the bank is empty, the DB is missing, or the model failed to load. bank_words:0 and bank:false appear in the body, but a load-balancer or Kubernetes readiness probe that only checks the status code will consider the instance healthy when it can serve nothing. The health endpoint should return 503 when bank.available is False (or when bank_words is 0 and the bank build is expected to be non-empty), and when model_enabled is True but model_loaded is False after the preload window.",
+      "OPERATIONAL — There is no structured logging or metrics surface anywhere in the codebase. The entrypoint prints plain-text lines; the FastAPI handlers rely on uvicorn's default access log. There is no request-latency histogram, no bank-miss counter, no synthesis-error rate, and no Gemini quota-exhaustion event. An operator learning that the bank is partial must manually call /health and inspect bank_words, or ssh into the container and run python -m wordbank status. A Prometheus /metrics endpoint (even a minimal one: request count, p99 latency, bank_words gauge, synthesis_errors counter) would make this observable without manual inspection.",
+      "OPERATIONAL — Gemini quota exhaustion surfaces only as a log line ('quota reached (429 enqueued tokens) — stopping submission', gemini_batch.py:250) printed to stdout during the batch run, which is a local developer workflow, not a server-side event. There is no persistent record in the manifest of 'quota was hit during this run', so when the batch job resumes the operator has no machine-readable way to know how many words were left unsubmitted due to quota vs due to API errors. Storing a quota_exhausted flag or a submission_stopped_at timestamp in a separate manifest metadata table would make resumability auditable.",
+      "OPERATIONAL — The entrypoint verify-then-unpack flow (docker-entrypoint.sh) has no timeout on the tar extraction step. A large tts-bank.tar.gz on a slow volume can block container start for minutes. During this time the server is not running, Docker reports the container as starting, and there is no progress indicator beyond the single log line 'unpacking'. A liveness probe will not fire (no HEALTHCHECK), so orchestrators will not restart or reschedule. Consider streaming the unpack progress (tar xzvf piped to wc -l) or setting a tar extraction deadline with timeout(1)."
+    ],
+    "top_10": [
+      {
+        "rank": 1,
+        "dimension": "dead_code",
+        "file": "/Users/evgenii.venediktov/tts/scripts/gemini_sync.py",
+        "line_range": "19",
+        "description": "Broken import: `from wordbank.pipeline import _safe` raises ImportError at runtime — `_safe` was renamed to `safe_filename` and moved to wordbank/paths.py. The script crashes on invocation.",
+        "severity": "high",
+        "fix": "Replace `from wordbank.pipeline import _safe` with `from wordbank.paths import safe_filename` and rename the call on line 57 from `_safe(word)` to `safe_filename(word)`."
+      },
+      {
+        "rank": 2,
+        "dimension": "deployment",
+        "file": "/Users/evgenii.venediktov/tts/src/server.py",
+        "line_range": "46-49",
+        "description": "Unauthenticated write endpoints with wildcard CORS (allow_origins=['*'], allow_methods=['*']). Any web page can POST to /v1/voices (writes WAV to disk) or /v1/tts (synthesises audio) with zero authentication.",
+        "severity": "high",
+        "fix": "Read allowed origins from CORS_ORIGINS env var, defaulting to 'http://localhost:8000'. Add API-key authentication on all state-mutating endpoints (/v1/voices POST, /v1/tts, /v1/gemini/tts) via a FastAPI dependency."
+      },
+      {
+        "rank": 3,
+        "dimension": "deployment",
+        "file": "/Users/evgenii.venediktov/tts/docker-entrypoint.sh",
+        "line_range": "37-39",
+        "description": "Command injection: BANK_SYNC_CMD is executed via `sh -c \"$BANK_SYNC_CMD\"` with no sanitization. Any operator who can set this env var can execute arbitrary shell commands as the container process user.",
+        "severity": "medium",
+        "fix": "Accept structured parameters (SYNC_BUCKET, SYNC_PREFIX) and hard-code the safe command template, or validate the value against an allowlist pattern (e.g. must start with 'aws s3' or 'rclone sync') before executing."
+      },
+      {
+        "rank": 4,
+        "dimension": "deployment",
+        "file": "/Users/evgenii.venediktov/tts/Dockerfile",
+        "line_range": "1-47",
+        "description": "No HEALTHCHECK instruction in the Dockerfile or docker-compose.yml. The /health endpoint exists but is never wired to Docker's health machinery. Docker cannot distinguish a provisioning container from a serving one.",
+        "severity": "medium",
+        "fix": "Add HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 CMD curl -sf http://localhost:8000/health || exit 1 to Dockerfile. Add corresponding healthcheck blocks in docker-compose.yml."
+      },
+      {
+        "rank": 5,
+        "dimension": "deployment",
+        "file": "/Users/evgenii.venediktov/tts/docker-entrypoint.sh",
+        "line_range": "22-42",
+        "description": "When verify fails and no archive exists, the entrypoint falls through to exec uvicorn, starting the server with an empty/corrupt bank. The server returns HTTP 200 on /health and silently serves 404s for all lookups. No restart policy exists in docker-compose.yml.",
+        "severity": "medium",
+        "fix": "Add `exit 1` after the 'volume not provisioned and no archive' message. Add restart: on-failure:3 and memory limits in docker-compose.yml. Harden /health to return HTTP 503 when bank.available is False."
+      },
+      {
+        "rank": 6,
+        "dimension": "deployment",
+        "file": "/Users/evgenii.venediktov/tts/src/server.py",
+        "line_range": "233-234",
+        "description": "asyncio.get_event_loop() called inside async handlers (lines 233 and 267). Deprecated in Python 3.10+ inside a running event loop; emits DeprecationWarning on every synthesis request under Python 3.12 (the Dockerfile base).",
+        "severity": "medium",
+        "fix": "Replace both occurrences — lines 233 and 267 — with asyncio.get_running_loop()."
+      },
+      {
+        "rank": 7,
+        "dimension": "dead_code",
+        "file": "/Users/evgenii.venediktov/tts/requirements.txt",
+        "line_range": "14",
+        "description": "google-cloud-texttospeech>=2.16.0 is a dead dependency: no file in the codebase imports from google.cloud.texttospeech. The Chirp backend it supported no longer exists. It bloats the install and production image.",
+        "severity": "medium",
+        "fix": "Remove the google-cloud-texttospeech line and its comment from requirements.txt."
+      },
+      {
+        "rank": 8,
+        "dimension": "token_optimization",
+        "file": "/Users/evgenii.venediktov/tts/wordbank/gemini_batch.py",
+        "line_range": "41",
+        "description": "VOICE_INSTRUCTION (71 chars) adds 144,000 characters of pure prompt overhead per 2000-word batch — ~10x the character volume of actual word content. At Gemini TTS pricing this costs ~$0.072 extra per batch and ~$1.80 extra for a 50k-word bank. Not overridable via environment variable.",
+        "severity": "high",
+        "fix": "Shorten to 'Say clearly and naturally:' (saves ~47 chars/request = 94,000 chars per batch). Add `VOICE_INSTRUCTION = os.getenv('WORDBANK_VOICE_INSTRUCTION', 'Say clearly and naturally:')` so it is tunable without code changes."
+      },
+      {
+        "rank": 9,
+        "dimension": "bloat",
+        "file": "wordbank/gemini_batch.py, wordbank/postproc.py",
+        "line_range": "gemini_batch.py:86-93, postproc.py:20-25",
+        "description": "Two functions both named write_wav with incompatible signatures: one takes (path, pcm: bytes, sample_rate) using stdlib wave; the other takes (path, pcm: np.ndarray, sr) using soundfile. Same name, different contracts — a caller can easily apply the wrong one.",
+        "severity": "high",
+        "fix": "Rename to write_wav_from_pcm_bytes (gemini_batch.py) and write_wav_from_array (postproc.py). The distinction in input types is real so renaming is safer than merging."
+      },
+      {
+        "rank": 10,
+        "dimension": "bloat",
+        "file": "wordbank/gemini_batch.py, wordbank/gemini_tts.py, wordbank/backends/local.py, src/audio.py",
+        "line_range": "gemini_batch.py:36, gemini_tts.py:10, backends/local.py:20, src/audio.py:8",
+        "description": "SAMPLE_RATE = 24_000 is defined independently in four files. Any future change requires four edits and risks silent divergence between files that produce and consume audio.",
+        "severity": "high",
+        "fix": "Create wordbank/constants.py with SAMPLE_RATE = 24_000 and import it in all four files, replacing local assignments."
+      }
+    ]
+  }
+}
