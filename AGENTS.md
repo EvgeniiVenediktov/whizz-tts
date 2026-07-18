@@ -11,6 +11,11 @@ and `WORDBANK_PLAN.md`.
 
 ## Dev setup & commands
 - Python venv at **`.venv`** (Python 3.14). Always invoke via `.venv/bin/python`, `.venv/bin/pytest`, `.venv/bin/uvicorn`.
+- **Building the venv from scratch** (a fresh clone has none, and these each cost time to rediscover):
+  - Use **`uv venv .venv --python 3.14`** — stock `python3 -m venv` fails on Debian/Ubuntu without `python3.14-venv` (no `ensurepip`).
+  - Install **`torch` and `torchaudio` from the same index**: `uv pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu`. Mixing the CPU index with default PyPI gives an ABI mismatch that surfaces as `OSError: Could not load .../_torchaudio.abi3.so`.
+  - `src/audio.py` shells out to **ffmpeg**; `apt install ffmpeg`, or for a venv-local fallback `pip install imageio-ffmpeg` and symlink its binary into `.venv/bin/ffmpeg`.
+  - Serving + the fast test suite need only: `fastapi uvicorn[standard] python-multipart pytest numpy soundfile httpx librosa`. `torch`/`omnivoice` are needed only for model tests and live synth.
 - **Tests:** `.venv/bin/pytest` (unit — fast, no model/cloud). `.venv/bin/pytest --integration tests/test_integration.py` loads OmniVoice (slow, needs the model).
 - **Run server + UI (bank only):** `SERVE_FRONTEND=1 .venv/bin/uvicorn src.server:app --port 8000` → http://localhost:8000
 - **Creds:** `GEMINI_API_KEY` for word-bank generation/cleanup **and the voice-studio endpoints** (`/v1/gemini/tts`, `gemini-voice`); bank serving needs none. Secrets live in `.env` (gitignored).
@@ -28,6 +33,8 @@ and `WORDBANK_PLAN.md`.
 - **`lang` is the serving code (`en-us`)**; lookups are language-scoped, backed by the `(lang, word)` index. (The on-disk dir is historically `en`; `file_path` is opaque to the server beyond root-joining — fine.)
 - **The server is read-only w.r.t. the bank.** Only `wordbank` generation tools write `wordbank.db`.
 - **Tests mock the model on `src.model`** (the handler imports it lazily, so patching `src.server` won't take). The `client` fixture forces `MODEL_ENABLED=1` and patches `src.model.generate`/`ensure_loaded`; bank tests set `BANK_DB`/`OGG_ROOT`/`WAV_ROOT` via env. Keep this pattern when editing the server.
+- **All access to the OmniVoice model goes through `_MODEL_LOCK` (`src/model.py`).** The model isn't thread-safe and `/v1/tts` offloads synthesis to a multi-threaded executor. The lock covers **seeding *and* generation as one unit** — `_seed_everything` sets torch's *global* RNG, so splitting them lets one request silently generate with another's seed, breaking the reproducibility guarantee the phrase bank records seeds for. It's an `RLock` because `ensure_loaded` → `load_model` nests. Guarded by `tests/test_model_concurrency.py`.
+- **`wordbank verify` resolves `db` / `ogg_root` / `voices_root` independently.** With `--root` it derives the flat deploy layout (`/data/wordbank.db` + `/data/words_ogg`); with no `--root` it falls back to the server's own env defaults, so a bare `python -m wordbank verify --desc library.json` checks exactly what the server would serve. Don't collapse these back to a single root — the dev layout (db at repo root, audio under `output/`) can't be expressed by one.
 
 ## Gemini batch notes (generation)
 - Enqueued-token quota counts **active (non-terminal)** jobs; it frees on completion. Use **`batch-run`** (quota-aware waves) for big runs; auto-delete of jobs is **off** (cleanup is on-request).
@@ -68,34 +75,37 @@ and `WORDBANK_PLAN.md`.
 
 ### Code-quality backlog (from `review-report.json`)
 
-These are confirmed issues from the automated review. Fix in isolation; each
-is small and independent. Do not bundle multiple items into one PR without asking.
+The review's dead-code, bloat, and test-quality items are **done** (see git log:
+dead code removal → naming/constants → verify fix → thread-safety → tests →
+deployment hardening). What remains:
 
-**Must fix before production:**
-- `scripts/gemini_sync.py:19` — broken `import _safe` crashes on invocation;
-  replace with `from wordbank.paths import safe_filename`.
-- `src/server.py:46-49` — wildcard CORS + no auth on write endpoints; add
-  `CORS_ORIGINS` env var and API-key dependency.
-- `docker-entrypoint.sh:37-39` — `sh -c "$BANK_SYNC_CMD"` is a shell-injection
-  vector; replace with structured params (`SYNC_BUCKET`, `SYNC_PREFIX`).
-- `Dockerfile` / `docker-compose.yml` — add `HEALTHCHECK` wired to `/health`.
-- `docker-entrypoint.sh:34` — server starts on empty bank; add `exit 1` and
-  harden `/health` to return 503 when `bank.available` is False.
-- `src/server.py:233,267` — replace `asyncio.get_event_loop()` with
-  `asyncio.get_running_loop()` (deprecated Python 3.10+).
+**Still open:**
+- **Auth** — the API is open; all write/synthesis routes (`/v1/tts`, `/v1/voices`,
+  `/v1/gemini/tts`) are unauthenticated. The review suggested an API-key
+  dependency, the TODO below calls for JWT — **they are the same layer, so pick
+  one before building it.** `CORS_ORIGINS` narrows browser access but is *not*
+  authentication and stops no non-browser client.
+- `src/device.py` has no fast-suite coverage. `tests/test_device.py` was deleted
+  (all 6 tests asserted only that `unittest.mock` returns what it was told). A
+  real check belongs in the `--integration` suite, against actual hardware.
+- Model-string duplication: `"gemini-2.5-flash-preview-tts"` is still hardcoded
+  in `scripts/gemini_sync.py` and `scripts/make_accent_reference.py`, so those
+  can drift from `gemini_tts.DEFAULT_MODEL` independently.
 
-**Clean up when convenient:**
-- `requirements.txt:14` — remove `google-cloud-texttospeech` (Chirp remnant).
-- `wordbank/gemini_batch.py:41` — shorten `VOICE_INSTRUCTION` and expose via
-  `WORDBANK_VOICE_INSTRUCTION` env var (~$1.80 savings per 50k-word bank).
-- `wordbank/gemini_tts.py:49` — cache `genai.Client()` at module level
-  (same pattern as `GeminiBatch._get_client`).
-- Rename `write_wav` functions (`gemini_batch.py` → `write_wav_from_pcm_bytes`,
-  `postproc.py` → `write_wav_from_array`).
-- Extract `SAMPLE_RATE = 24_000` into `wordbank/constants.py`; import everywhere.
-- Delete `tests/test_device.py` (all 6 tests are vacuous mocks of torch).
-- Refactor `test_local_backend.py` tests to assert reproducibility rather than
-  inspect internal call arguments.
+**Deliberately NOT done (decided against, don't "fix" these):**
+- **Shortening `VOICE_INSTRUCTION`** (`wordbank/gemini_batch.py`) to save ~$1.80
+  per 50k-word bank. That string shapes delivery style, and the existing 47,949-word
+  bank was generated with it — changing it makes new words subtly inconsistent
+  with words already banked, with nothing in the manifest recording which prompt
+  produced which clip. Not worth it. Exposing it via `WORDBANK_VOICE_INSTRUCTION`
+  as config is fine; changing the default is not.
+- **Pre-serializing the static `generationConfig`** in `build_request_body`. It
+  trades readability for ~2000 short-lived dict allocations in a job that spends
+  minutes blocked on a network API.
+- **Removing `BANK_SYNC_CMD`** as a "shell-injection vector". Whoever sets that
+  env var already controls the container's command line — it is not a privilege
+  boundary. `SYNC_BUCKET`/`SYNC_PREFIX` were added as a structured alternative;
+  the escape hatch stays for rclone/gsutil/multi-step pulls.
 
 ---
 
@@ -155,7 +165,7 @@ python scripts/package_bank.py            # → dist/bank/  (words_ogg/ + wordba
 - Verify the report: if it warns `N OGG < ready words`, the bank is incomplete — tell the user, don't treat it as ready.
 - `--bitrate` / `--application` change quality (default `16k voip`); `--force` re-encodes; `--out-dir` stages elsewhere.
 - The user uploads `dist/bank/` themselves (the script prints S3/GCS/rclone examples). **Do NOT upload unless asked**; never use destructive flags or make a bucket public.
-- Deploy: the container pulls `words_ogg/` + `wordbank.db` into its volume via `BANK_SYNC_CMD`.
+- Deploy: the container pulls `words_ogg/` + `wordbank.db` into its volume via `SYNC_BUCKET`/`SYNC_PREFIX` (structured, preferred) or `BANK_SYNC_CMD` (arbitrary shell — trusted config only).
 
 ## Runbook: build the deployment package (description + archive)
 
@@ -174,13 +184,22 @@ bash scripts/pack.sh          # → library.json + tts-bank.tar.gz (both gitigno
 
 **Docker deploy** — put `library.json` + `tts-bank.tar.gz` on the (persistent)
 `/data` volume; `docker-entrypoint.sh` on boot:
+0. If `SYNC_BUCKET`/`SYNC_PREFIX` (or `BANK_SYNC_CMD`) is set, pulls the bank
+   into the volume. **This runs first** — it is a way of *provisioning* the
+   volume, so it has to happen before the check below decides the volume is
+   unusable. Don't reorder it after the verify.
 1. `python -m wordbank verify --desc $LIBRARY_DESC --root $DATA_DIR` (defaults
    `/data/library.json`, `/data`) — checks the described folders exist and the
    DB word/phrase counts (+ ogg count) match.
 2. If invalid, unpacks `$LIBRARY_ARCHIVE` (`/data/tts-bank.tar.gz`) into `/data`
    (`output/words_ogg`→`/data/words_ogg`, `output/voices`→`/data/voices`,
    `wordbank.db`→`/data/wordbank.db`, `library.json`), then re-verifies.
-3. Starts the server. Later restarts find the volume provisioned → no unpack.
+3. **Refuses to start (`exit 1`) if there is still no usable bank** — rather than
+   coming up "healthy" and 404-ing every lookup. Exception: `MODEL_ENABLED=1` is
+   a valid bank-less (live-synthesis-only) deployment, so it degrades to a
+   warning instead. `/health` applies the identical rule (503 only when neither
+   bank nor model can serve), and the image `HEALTHCHECK` is wired to it.
+4. Starts the server. Later restarts find the volume provisioned → no unpack.
 
 **Bare-metal**: `mkdir tts-bank && tar xzf tts-bank.tar.gz -C tts-bank && cd tts-bank
 && bash scripts/unpack.sh` (`.venv` + `requirements-base.txt` only, verifies counts).

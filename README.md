@@ -111,7 +111,17 @@ docker compose --profile bank up --build   # mounts library.json + tts-bank.tar.
 ```
 
 Provisioning is `docker-entrypoint.sh` calling `python -m wordbank verify`; you can
-run the same check by hand: `python -m wordbank verify --desc library.json --root /data`.
+run the same check by hand:
+
+```bash
+python -m wordbank verify --desc library.json --root /data   # deployed (flat) layout
+python -m wordbank verify --desc library.json                # dev checkout
+```
+
+`--root` selects the flat deploy layout (`/data/wordbank.db` + `/data/words_ogg`).
+With no `--root`, `db`/`ogg_root`/`voices_root` fall back to the server's own env
+defaults (`BANK_DB`/`OGG_ROOT`/`VOICES_ROOT`) — so a bare `verify` checks exactly
+what the server would serve. Override any of them with `--db`/`--ogg-root`/`--voices-root`.
 
 **Bare-metal (no Docker)** — unpack the archive and run directly:
 
@@ -132,7 +142,16 @@ SERVE_FRONTEND=1 .venv/bin/uvicorn src.server:app --port 8000
 | `MODEL_ENABLED` | off | enable live `/v1/tts` synthesis |
 | `PRELOAD_MODEL` | off | load weights at startup vs first request |
 | `SERVE_FRONTEND` | off | serve the static UI from the API |
-| `BANK_SYNC_CMD` | — | command run at container start to pull the bank into the volume |
+| `CORS_ORIGINS` | `*` (any) | comma-separated allowed origins. **Browser-enforced only — not authentication**; it does nothing against `curl` or any non-browser client |
+| `SYNC_BUCKET` / `SYNC_PREFIX` | — | pull the bank from S3 at container start (structured + quoted; preferred over `BANK_SYNC_CMD`) |
+| `BANK_SYNC_CMD` | — | escape hatch: arbitrary shell command run at container start to pull the bank into the volume. Runs via `sh -c` — **set it only from trusted configuration** |
+
+**Health and startup.** `/health` returns **503** when the service can serve
+nothing — no bank *and* `MODEL_ENABLED` off — and 200 otherwise (a model-only
+deployment with no bank is legitimate and stays healthy). `docker-entrypoint.sh`
+applies the same rule: it refuses to start (`exit 1`) rather than come up and
+404 every lookup, and the image's `HEALTHCHECK` is wired to `/health` with a
+start period generous enough to cover first-boot archive unpacking.
 
 ## Generate / maintain the bank
 

@@ -1,5 +1,13 @@
 # Word Bank Generation Pipeline — Plan (Cloud TTS)
 
+> **Historical design document.** This records the original decisions and the
+> reasoning behind them — it is deliberately *not* kept in sync with the code.
+> Several things below were later superseded: the Chirp 3 HD backend was
+> removed entirely (replaced by local OmniVoice for accent phrases), Whisper
+> verification was dropped, and the CLI has changed. **For current state see
+> `AGENTS.md` and `README.md`**; read this for *why* the pipeline is shaped the
+> way it is.
+
 Generate a large bank (20k+) of single-word audio clips using a **cloud TTS
 backend** (Chirp 3 HD or Gemini TTS), verified locally with Whisper.
 
@@ -29,7 +37,7 @@ The manifest gives atomic per-word state, dedupe on ingest, and resumable batch
 tracking (`batch_id`). A human-readable snapshot is produced on demand via
 `export` (CSV), not kept as live state.
 
-## Implementation status (built + unit-tested with mocks)
+## Implementation status *(as of the original plan — since superseded)*
 
 `wordbank/` — `manifest.py` (SQLite, thread-safe, `submitted`+`batch_id`),
 `gemini_batch.py` (submit→poll→decode→OGG, resumable), `backends/chirp.py`
@@ -37,6 +45,10 @@ tracking (`batch_id`). A human-readable snapshot is produced on demand via
 `verify.py` (Whisper), `postproc.py`, `wordlist.py`, CLI (`build` / `batch` /
 `status` / `export`). `scripts/fetch_wordlist.py` (wordfreq) and
 `scripts/gemini_batch_smoke.py` (verify-before-bulk).
+
+Since removed: `backends/chirp.py` (Chirp dropped for local OmniVoice) and
+`pipeline.run_parallel` (dead — the only wired backend isn't thread-safe).
+See `AGENTS.md` → *Key files* for the current layout.
 
 ⚠️ Two things to confirm with `scripts/gemini_batch_smoke.py` on ~10 words +
 a real key before a 20k run: (1) batch mode accepts the per-request TTS config
