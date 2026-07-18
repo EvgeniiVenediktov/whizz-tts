@@ -15,9 +15,9 @@ src.model (torch/omnivoice) is imported lazily; tests inject `generate_fn`.
 import random
 from typing import Callable, Optional
 
+from ..constants import SAMPLE_RATE
 from .base import SynthResult
 
-SAMPLE_RATE = 24_000
 _SEED_MAX = 2 ** 31 - 1
 
 

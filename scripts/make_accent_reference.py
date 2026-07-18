@@ -16,7 +16,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 
-from wordbank.gemini_batch import write_wav  # raw PCM → WAV
+from wordbank.gemini_batch import write_wav_from_pcm_bytes  # raw PCM → WAV
 
 
 def main() -> None:
@@ -36,7 +36,7 @@ def main() -> None:
 
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    write_wav(out / "ref.wav", pcm)
+    write_wav_from_pcm_bytes(out / "ref.wav", pcm)
     (out / "ref.txt").write_text(args.text, encoding="utf-8")
     print(f"wrote {out}/ref.wav + ref.txt  ({len(pcm)} PCM bytes)")
     print("then register the voice and generate the bank in this accent:")

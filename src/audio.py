@@ -5,7 +5,7 @@ import tempfile
 import numpy as np
 import soundfile as sf
 
-SAMPLE_RATE = 24_000
+from wordbank.constants import SAMPLE_RATE
 
 
 def pcm_to_ogg(audio: np.ndarray, sample_rate: int = SAMPLE_RATE) -> bytes:

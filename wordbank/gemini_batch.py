@@ -26,14 +26,14 @@ import time
 import wave
 from typing import Callable, Iterable, List, Optional
 
+from .constants import SAMPLE_RATE
 from .manifest import DONE, FAILED, SUBMITTED, Manifest
 from .paths import safe_filename
 
 # NOTE: not every TTS model supports batchGenerateContent. As of this writing
 # gemini-3.1-flash-tts-preview and gemini-2.5-pro-preview-tts do; the older
 # gemini-2.5-flash-preview-tts does NOT. Run scripts/list_models.py to recheck.
-DEFAULT_MODEL = "gemini-3.1-flash-tts-preview"
-SAMPLE_RATE = 24_000
+BATCH_DEFAULT_MODEL = "gemini-3.1-flash-tts-preview"
 _TERMINAL = ("SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED")
 
 # Style direction prepended to each word. Gemini TTS treats a leading "Say …:"
@@ -83,7 +83,7 @@ def audio_from_line(line: dict) -> Optional[bytes]:
     return None
 
 
-def write_wav(path: pathlib.Path, pcm: bytes, sample_rate: int = SAMPLE_RATE) -> None:
+def write_wav_from_pcm_bytes(path: pathlib.Path, pcm: bytes, sample_rate: int = SAMPLE_RATE) -> None:
     """Wrap raw 16-bit mono PCM in a WAV container — no ffmpeg, lossless."""
     with wave.open(str(path), "wb") as wf:
         wf.setnchannels(1)
@@ -95,7 +95,7 @@ def write_wav(path: pathlib.Path, pcm: bytes, sample_rate: int = SAMPLE_RATE) ->
 # --- batch client wrapper (google-genai lazily imported) -------------------
 
 class GeminiBatch:
-    def __init__(self, model: str = DEFAULT_MODEL, voice: str = "Kore",
+    def __init__(self, model: str = BATCH_DEFAULT_MODEL, voice: str = "Kore",
                  instruction: str = VOICE_INSTRUCTION, client=None):
         self.model = model
         self.voice = voice
@@ -180,7 +180,7 @@ def _write_and_mark(manifest: Manifest, out_dir: pathlib.Path, lang: str,
                        f"{row['id']}_{safe_filename(row['word'])}.wav")
     path = out_dir / rel
     path.parent.mkdir(parents=True, exist_ok=True)
-    write_wav(path, pcm)
+    write_wav_from_pcm_bytes(path, pcm)
     manifest.set_status(row["id"], DONE, file_path=rel,
                         billed_chars=len(row["word"]), voice=voice)
 
@@ -302,7 +302,7 @@ def run_in_waves(manifest: Manifest, batch: GeminiBatch, out_dir: str, *,
     it with the laptop on. Fully resumable — picks up whatever the manifest holds.
     """
     voice = voice or batch.voice
-    for wave in range(1, max_waves + 1):
+    for wave_num in range(1, max_waves + 1):
         collect_active(manifest, batch, out_dir, lang=lang, voice=voice,
                        poll_interval=poll_interval, sleep=sleep, log=log)
         if not manifest.pending(limit=1):
@@ -313,5 +313,5 @@ def run_in_waves(manifest: Manifest, batch: GeminiBatch, out_dir: str, *,
             log("could not submit any job this wave — a single chunk likely exceeds "
                 "the enqueued-token quota; retry with a smaller --chunk")
             break
-        log(f"wave {wave}: {len(jobs)} job(s) in flight")
+        log(f"wave {wave_num}: {len(jobs)} job(s) in flight")
     return manifest.counts()

@@ -15,8 +15,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 from google import genai
 from google.genai import types
 
-from wordbank.gemini_batch import VOICE_INSTRUCTION, write_wav
-from wordbank.pipeline import _safe
+from wordbank.gemini_batch import VOICE_INSTRUCTION, write_wav_from_pcm_bytes
+from wordbank.paths import safe_filename
 
 # generateContent-capable TTS model (not all support batch; this one is fine for sync)
 DEFAULT_SYNC_MODEL = "gemini-2.5-flash-preview-tts"
@@ -54,8 +54,8 @@ def main() -> None:
         except Exception as e:
             print(f"  {word!r}: ERROR {type(e).__name__}: {str(e)[:160]}")
             continue
-        path = out / f"{i}_{_safe(word)}.wav"
-        write_wav(path, data)
+        path = out / f"{i}_{safe_filename(word)}.wav"
+        write_wav_from_pcm_bytes(path, data)
         ok += 1
         print(f"  {word!r}: {len(data)} PCM bytes -> {path}")
     print(f"\nwrote {ok}/{len(words)} clips to {out}")

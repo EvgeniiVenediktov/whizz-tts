@@ -7,7 +7,7 @@ Lazily imports google-genai; needs GEMINI_API_KEY in the environment.
 import io
 import wave
 
-SAMPLE_RATE = 24_000  # Gemini TTS emits 24 kHz / 16-bit mono PCM
+from .constants import SAMPLE_RATE  # Gemini TTS emits 24 kHz / 16-bit mono PCM
 DEFAULT_MODEL = "gemini-2.5-flash-preview-tts"
 
 # Prebuilt Gemini TTS voices: (name, style descriptor, gender). Voices are NOT
@@ -35,6 +35,19 @@ VOICES = [
     ("Sadaltager", "Knowledgeable", "male"), ("Sulafat", "Warm", "female"),
 ]
 
+_client = None
+
+
+def _get_client():
+    """Lazily construct and cache the google-genai client (one per process,
+    like GeminiBatch._get_client) — synthesize_pcm is called per voice-studio
+    HTTP request, so avoid reconnecting every time."""
+    global _client
+    if _client is None:
+        from google import genai
+        _client = genai.Client()
+    return _client
+
 
 def synthesize_pcm(text: str, voice: str = "Kore", instruct: str = "",
                    model: str = DEFAULT_MODEL) -> bytes:
@@ -43,10 +56,9 @@ def synthesize_pcm(text: str, voice: str = "Kore", instruct: str = "",
     `instruct` is style/accent direction (e.g. "British accent") — prepended,
     not spoken. Raises if Gemini returns no audio.
     """
-    from google import genai
     from google.genai import types
 
-    client = genai.Client()
+    client = _get_client()
     prompt = f"{instruct}: {text}" if instruct else text
     resp = client.models.generate_content(
         model=model,

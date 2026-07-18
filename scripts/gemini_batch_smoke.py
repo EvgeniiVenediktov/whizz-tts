@@ -18,8 +18,8 @@ import time
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 
 from wordbank.gemini_batch import (
-    DEFAULT_MODEL, VOICE_INSTRUCTION, GeminiBatch, audio_from_line, build_jsonl,
-    write_wav,
+    BATCH_DEFAULT_MODEL, VOICE_INSTRUCTION, GeminiBatch, audio_from_line, build_jsonl,
+    write_wav_from_pcm_bytes,
 )
 
 WORDS = ["cat", "elephant", "rhythm", "umbrella", "two"]
@@ -29,7 +29,7 @@ OUT = pathlib.Path(__file__).parent.parent / "output" / "gemini_batch_smoke"
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--voice", default="Kore")
-    p.add_argument("--model", default=DEFAULT_MODEL)
+    p.add_argument("--model", default=BATCH_DEFAULT_MODEL)
     p.add_argument("--poll-interval", type=int, default=15)
     args = p.parse_args()
 
@@ -61,7 +61,7 @@ def main() -> None:
         if not pcm:
             print(f"  {word!r}: NO AUDIO")
             continue
-        write_wav(OUT / f"{word}.wav", pcm)
+        write_wav_from_pcm_bytes(OUT / f"{word}.wav", pcm)
         n += 1
         print(f"  {word!r}: {len(pcm)} PCM bytes -> {word}.wav  OK")
     print(f"\nwrote {n}/{len(WORDS)} clips to {OUT}")
