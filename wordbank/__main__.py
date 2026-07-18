@@ -216,13 +216,15 @@ def cmd_verify(args, cfg: Config) -> None:
     """Verify a mounted volume against a library description; exit 1 if invalid."""
     from .library import verify
 
-    problems = verify(args.desc, args.root)
+    problems = verify(args.desc, args.root, db=args.db_override,
+                      ogg_root=args.ogg_root, voices_root=args.voices_root_override)
     if problems:
         print("library INVALID:")
         for p in problems:
             print(f"  - {p}")
         sys.exit(1)
-    print(f"library OK: {args.root} matches {args.desc}")
+    where = args.root if args.root is not None else "default layout"
+    print(f"library OK: {where} matches {args.desc}")
 
 
 def cmd_status(args, cfg: Config) -> None:
@@ -334,7 +336,16 @@ def main(argv=None) -> None:
     ve = sub.add_parser("verify",
                         help="verify a volume against a library description (exit 1 if invalid)")
     ve.add_argument("--desc", required=True, help="library description JSON")
-    ve.add_argument("--root", required=True, help="data dir to check (folders + db)")
+    ve.add_argument("--root", default=None,
+                    help="flat deploy layout data dir (db + words_ogg/ + voices/ all under "
+                         "here, as docker-entrypoint.sh lays it out). Omit to check the "
+                         "dev/server default layout ($BANK_DB, $OGG_ROOT, $VOICES_ROOT).")
+    ve.add_argument("--db", default=None, dest="db_override",
+                    help="override the db path (wins over --root and $BANK_DB)")
+    ve.add_argument("--ogg-root", default=None, dest="ogg_root",
+                    help="override the OGG tree (wins over --root and $OGG_ROOT)")
+    ve.add_argument("--voices-root", default=None, dest="voices_root_override",
+                    help="override the voices dir (wins over --root and $VOICES_ROOT)")
     ve.set_defaults(func=cmd_verify)
 
     s = sub.add_parser("status", help="show counts by status")
