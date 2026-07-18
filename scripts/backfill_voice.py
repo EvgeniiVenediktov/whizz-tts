@@ -13,13 +13,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 
-
-def voice_from_path(file_path: str):
-    """`en-us/gemini-Kore/0/1_cat.wav` → 'Kore'; `en-gb/local-en-gb/...` → 'en-gb'."""
-    parts = file_path.replace("\\", "/").split("/")
-    if len(parts) < 2 or "-" not in parts[1]:
-        return None
-    return parts[1].split("-", 1)[1]  # drop the backend prefix, keep the rest
+from wordbank.paths import voice_from_path  # noqa: E402
 
 
 def backfill(conn: sqlite3.Connection, table: str) -> tuple[int, int]:

@@ -24,3 +24,14 @@ def mirror_path(src_path: str, src_root: str, dest_root: str,
     if rel.startswith(".."):
         return None
     return os.path.join(dest_root, os.path.splitext(rel)[0] + new_ext)
+
+
+def voice_from_path(file_path: str) -> Optional[str]:
+    """Recover the `voice` a manifest row was generated with from its stored
+    `file_path`, whose directory segment encodes `<backend>-<voice>`:
+    `en-us/gemini-Kore/0/1_cat.wav` -> 'Kore'; `en-gb/local-en-gb/...` -> 'en-gb'.
+    Returns None if the path doesn't have the expected shape."""
+    parts = file_path.replace("\\", "/").split("/")
+    if len(parts) < 2 or "-" not in parts[1]:
+        return None
+    return parts[1].split("-", 1)[1]  # drop the backend prefix, keep the rest

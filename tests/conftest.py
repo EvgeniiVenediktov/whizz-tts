@@ -50,13 +50,22 @@ def silent_wav() -> bytes:
     return make_wav_bytes()
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def client():
     """FastAPI test client with the model enabled but mocked out.
 
     The synth handler imports src.model lazily, so we patch the names on
     src.model (the lazy `from .model import ...` binds to them at call time).
     MODEL_ENABLED is forced on so /v1/tts is reachable.
+
+    Function-scoped ON PURPOSE. `src.server.app` is a module-level singleton, so
+    a module-scoped client stays open across other tests — and any test that
+    opens its own TestClient on that same app (to check env-dependent behavior)
+    wipes `app.state` on exit, leaving this client's app half torn down. That
+    surfaced as `AttributeError: 'State' object has no attribute 'model_enabled'`
+    in whichever unrelated test happened to run next, so the suite only passed
+    in declaration order. Re-entering the lifespan per test is cheap (the model
+    is mocked) and removes the ordering hazard entirely.
     """
     import os
     import src.model as model_mod

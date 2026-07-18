@@ -1,9 +1,7 @@
 """Phrase bank: separate storage from words, voice on results, merged search,
 type flag, and phrase serving."""
-import importlib.util
-import pathlib
-
 from fastapi.testclient import TestClient
+import pytest
 
 from wordbank.lookup import BankLookup
 from wordbank.manifest import DONE, VERIFIED, Manifest
@@ -100,7 +98,11 @@ def test_lookup_handles_bank_without_phrases(tmp_path):
 
 # ---- server: /v1/search, phrase serving, voice/type on info ----
 
-def test_server_search_and_phrase_serving(tmp_path, monkeypatch):
+@pytest.fixture
+def search_client(tmp_path, monkeypatch):
+    """TestClient wired to a bank with one word (`cat`) and one phrase
+    (`hello world`), both with WAV+OGG on disk — shared setup for the
+    /v1/search, /v1/phrase*, /v1/bank/*/info, and /v1/languages tests below."""
     wav_root, ogg_root = tmp_path / "words", tmp_path / "words_ogg"
     for rel in ("en-us/gemini-Kore/0/1_cat.wav", "en-us/local-en-gb/0/1_hello.wav"):
         (wav_root / rel).parent.mkdir(parents=True, exist_ok=True)
@@ -126,24 +128,37 @@ def test_server_search_and_phrase_serving(tmp_path, monkeypatch):
     monkeypatch.setenv("OGG_ROOT", str(ogg_root))
     from src.server import app
     with TestClient(app) as c:
-        words = c.get("/v1/search", params={"prefix": "ca", "lang": "en-us"}).json()["results"]
-        assert {"text": "cat", "type": "word", "voice": "Kore"} in words
+        yield c
 
-        phrases = c.get("/v1/search", params={"prefix": "hel", "lang": "en-us"}).json()["results"]
-        assert any(p["text"] == "hello world" and p["type"] == "phrase"
-                   and p["voice"] == "en-gb" for p in phrases)
 
-        pinfo = c.get("/v1/phrase/info", params={"text": "hello world", "lang": "en-us"}).json()
-        assert pinfo["type"] == "phrase" and pinfo["voice"] == "en-gb" and pinfo["ogg"]["exists"]
-        assert pinfo["seed"] == 7 and pinfo["ref_audio"] == "refs/en-gb/ref.wav"
-        assert pinfo["ref_text"] == "fox"
-        assert c.get("/v1/phrase", params={"text": "hello world", "lang": "en-us"}).content[:4] == b"OggS"
-        assert c.get("/v1/phrase", params={"text": "nope", "lang": "en-us"}).status_code == 404
+def test_search_returns_words_and_phrases(search_client):
+    words = search_client.get("/v1/search", params={"prefix": "ca", "lang": "en-us"}).json()["results"]
+    assert {"text": "cat", "type": "word", "voice": "Kore"} in words
 
-        winfo = c.get("/v1/bank/cat/info").json()
-        assert winfo["type"] == "word" and winfo["voice"] == "Kore"
+    phrases = search_client.get("/v1/search", params={"prefix": "hel", "lang": "en-us"}).json()["results"]
+    assert any(p["text"] == "hello world" and p["type"] == "phrase"
+               and p["voice"] == "en-gb" for p in phrases)
 
-        assert {"code": "en-us", "words": 1} in c.get("/v1/languages").json()["phrasebank"]
+
+def test_phrase_info_endpoint(search_client):
+    pinfo = search_client.get("/v1/phrase/info", params={"text": "hello world", "lang": "en-us"}).json()
+    assert pinfo["type"] == "phrase" and pinfo["voice"] == "en-gb" and pinfo["ogg"]["exists"]
+    assert pinfo["seed"] == 7 and pinfo["ref_audio"] == "refs/en-gb/ref.wav"
+    assert pinfo["ref_text"] == "fox"
+
+
+def test_phrase_audio_endpoint(search_client):
+    assert search_client.get("/v1/phrase", params={"text": "hello world", "lang": "en-us"}).content[:4] == b"OggS"
+    assert search_client.get("/v1/phrase", params={"text": "nope", "lang": "en-us"}).status_code == 404
+
+
+def test_word_info_endpoint_includes_type_and_voice(search_client):
+    winfo = search_client.get("/v1/bank/cat/info").json()
+    assert winfo["type"] == "word" and winfo["voice"] == "Kore"
+
+
+def test_languages_includes_phrase_langs(search_client):
+    assert {"code": "en-us", "words": 1} in search_client.get("/v1/languages").json()["phrasebank"]
 
 
 # ---- pipeline records provenance (seed + reference) ----
@@ -173,16 +188,3 @@ def test_pipeline_records_seed_and_reference(tmp_path):
     assert row["ref_audio"] == "refs/en-gb/ref.wav"  # reference recorded
     assert row["ref_text"] == "the quick brown fox"
     m.close()
-
-
-# ---- backfill helper ----
-
-def test_backfill_voice_from_path():
-    spec = importlib.util.spec_from_file_location(
-        "backfill_voice",
-        pathlib.Path(__file__).parent.parent / "scripts" / "backfill_voice.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    assert mod.voice_from_path("en-us/gemini-Kore/0/1_cat.wav") == "Kore"
-    assert mod.voice_from_path("en-gb/local-en-gb/0/1_x.wav") == "en-gb"
-    assert mod.voice_from_path("nope.wav") is None

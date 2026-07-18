@@ -1,14 +1,6 @@
 import numpy as np
-import pytest
 
 from src.audio import pcm_to_ogg
-
-
-def test_pcm_to_ogg_returns_bytes():
-    audio = np.zeros(24_000, dtype=np.float32)  # 1 s silence
-    result = pcm_to_ogg(audio)
-    assert isinstance(result, bytes)
-    assert len(result) > 0
 
 
 def test_pcm_to_ogg_ogg_magic_bytes():

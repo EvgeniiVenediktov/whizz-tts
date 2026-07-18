@@ -3,7 +3,7 @@ import numpy as np
 
 from tests.conftest import FakeBackend
 from wordbank.manifest import Manifest, QUARANTINED, VERIFIED
-from wordbank.paths import safe_filename
+from wordbank.paths import safe_filename, voice_from_path
 from wordbank.pipeline import WordBankPipeline
 from wordbank.verify import Verifier, normalize
 
@@ -59,6 +59,12 @@ def test_safe_filename():
     assert safe_filename("Cat") == "cat"
     assert safe_filename("don't") == "don-t"
     assert safe_filename("!!!") == "word"
+
+
+def test_voice_from_path():
+    assert voice_from_path("en-us/gemini-Kore/0/1_cat.wav") == "Kore"
+    assert voice_from_path("en-gb/local-en-gb/0/1_x.wav") == "en-gb"
+    assert voice_from_path("nope.wav") is None
 
 
 # ---- pipeline → WAV masters (all mocked) ----

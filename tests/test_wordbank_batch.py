@@ -10,7 +10,7 @@ import wave
 from wordbank.gemini_batch import (
     VOICE_INSTRUCTION, GeminiBatch, audio_from_line, build_jsonl,
     build_request_body, collect_active, run_batch, run_in_waves, submit_pending,
-    write_wav,
+    write_wav_from_pcm_bytes,
 )
 from wordbank.manifest import DONE, PENDING, Manifest, SUBMITTED
 
@@ -91,7 +91,7 @@ def test_audio_from_line_decodes_base64():
 
 def test_write_wav_is_valid(tmp_path):
     p = tmp_path / "x.wav"
-    write_wav(p, b"\x01\x00" * 240)
+    write_wav_from_pcm_bytes(p, b"\x01\x00" * 240)
     assert p.read_bytes()[:4] == b"RIFF"
     with wave.open(str(p), "rb") as wf:
         assert wf.getnchannels() == 1 and wf.getframerate() == 24_000

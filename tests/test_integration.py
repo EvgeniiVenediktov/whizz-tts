@@ -163,6 +163,11 @@ def test_gender_pitch_direction(loaded_model):
     female = np.nanmedian([median_f0(loaded_model.generate(SENTENCE, instruct="female", seed=s)) for s in seeds])
     male = np.nanmedian([median_f0(loaded_model.generate(SENTENCE, instruct="male", seed=s)) for s in seeds])
     print(f"\nfemale median F0={female:.1f}Hz  male median F0={male:.1f}Hz")
+    # The 10% margin is an empirical threshold calibrated against the current
+    # OmniVoice model weights, not a principled spec — it just needs to
+    # comfortably clear generation noise. If the model is updated, this ratio
+    # may shift or flip; a failure here means "re-calibrate or investigate
+    # the new weights," not necessarily a code regression.
     assert female > male * 1.1, (
         f"gender control not working: female F0 {female:.1f}Hz should exceed "
         f"male F0 {male:.1f}Hz by >10%"

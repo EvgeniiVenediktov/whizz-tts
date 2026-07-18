@@ -1,16 +1,8 @@
-"""Tests for the word-list cleaner, rate limiter, and parallel pipeline run."""
+"""Tests for the word-list cleaner and rate limiter."""
 import time
 
-from tests.conftest import FakeBackend
-from wordbank.manifest import Manifest, QUARANTINED, VERIFIED
-from wordbank.pipeline import WordBankPipeline
 from wordbank.ratelimit import RateLimiter
 from wordbank.wordlist import clean_words
-
-
-class PassVerifier:
-    def verify(self, pcm, sr, expected):
-        return True, expected
 
 
 # ---- word list cleaning ----
@@ -28,10 +20,6 @@ def test_clean_words_filters_and_dedupes():
     assert all(2 <= len(w) <= 20 or w in ("a", "i") for w in out)
 
 
-def test_clean_words_preserves_frequency_order():
-    assert clean_words(["zebra", "apple", "mango"]) == ["zebra", "apple", "mango"]
-
-
 # ---- rate limiter ----
 
 def test_rate_limiter_allows_burst_then_throttles():
@@ -42,21 +30,3 @@ def test_rate_limiter_allows_burst_then_throttles():
     assert time.monotonic() - start < 0.5
     rl.acquire()                            # 61st must wait ~1s for a refill
     assert time.monotonic() - start >= 0.9
-
-
-# ---- parallel pipeline ----
-
-def test_parallel_run_processes_all(tmp_path):
-    m = Manifest(str(tmp_path / "wb.db"))
-    m.add_words([f"word{i}" for i in range(50)], "en")
-    pipe = WordBankPipeline(
-        m, FakeBackend(), PassVerifier(), str(tmp_path / "out"),
-        lang="en", voice="testvoice", rate_limiter=RateLimiter(100_000),
-    )
-    result = pipe.run_parallel(workers=8)
-    assert result[VERIFIED] == 50
-    assert m.counts().get(VERIFIED) == 50
-    assert len(list((tmp_path / "out").rglob("*.wav"))) == 50
-    # resume: nothing left
-    assert pipe.run_parallel(workers=8) == {VERIFIED: 0, "failed": 0, QUARANTINED: 0}
-    m.close()

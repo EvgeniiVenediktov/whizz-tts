@@ -1,7 +1,8 @@
 """Tests for the lightweight bank lookup + server bank endpoints."""
+import pytest
 from fastapi.testclient import TestClient
 
-from wordbank.gemini_batch import write_wav
+from wordbank.gemini_batch import write_wav_from_pcm_bytes
 from wordbank.lookup import BankLookup
 from wordbank.manifest import DONE, Manifest
 from wordbank.paths import mirror_path
@@ -112,7 +113,11 @@ def test_lookup_sees_rows_committed_after_open(tmp_path):
 
 # --- server endpoints ---
 
-def test_bank_endpoints(tmp_path, monkeypatch):
+@pytest.fixture
+def bank_endpoints_client(tmp_path, monkeypatch):
+    """TestClient wired to a bank with `cat` (DONE, OGG present) and `camel`
+    (DONE, but no OGG on disk) — shared setup for the /v1/bank* and
+    /v1/languages endpoint tests below."""
     # Production ships OGG only — no WAV root mounted.
     ogg_root = tmp_path / "words_ogg"
     ogg = ogg_root / "en-us/gemini-Kore/0/1_cat.ogg"
@@ -131,23 +136,38 @@ def test_bank_endpoints(tmp_path, monkeypatch):
     monkeypatch.setenv("WAV_ROOT", str(tmp_path / "no_wav"))   # WAV not shipped
     from src.server import app
     with TestClient(app) as c:
-        r = c.get("/v1/bank/cat")                              # default = OGG
-        assert r.status_code == 200
-        assert r.headers["content-type"].startswith("audio/ogg")
-        assert r.content[:4] == b"OggS"
+        yield c
 
-        # WAV requested but not shipped → 404 (production has no WAV)
-        assert c.get("/v1/bank/cat", params={"format": "wav"}).status_code == 404
 
-        assert c.get("/v1/bank/nope").status_code == 404       # not in bank
-        assert c.get("/v1/bank/camel").status_code == 404      # row exists, no ogg
+def test_bank_serves_ogg_by_default(bank_endpoints_client):
+    r = bank_endpoints_client.get("/v1/bank/cat")               # default = OGG
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("audio/ogg")
+    assert r.content[:4] == b"OggS"
 
-        words = c.get("/v1/bank", params={"prefix": "ca"}).json()["words"]
-        assert "cat" in words and "camel" in words
 
-        langs = c.get("/v1/languages").json()
-        assert {"code": "en-us", "words": 2} in langs["wordbank"]      # data-driven (cat, camel)
-        assert any(s["code"] == "en-us" for s in langs["generate"])    # curated list
+def test_bank_wav_not_shipped_returns_404(bank_endpoints_client):
+    # WAV requested but not shipped → 404 (production has no WAV)
+    assert bank_endpoints_client.get("/v1/bank/cat", params={"format": "wav"}).status_code == 404
+
+
+def test_bank_404_for_unknown_word(bank_endpoints_client):
+    assert bank_endpoints_client.get("/v1/bank/nope").status_code == 404       # not in bank
+
+
+def test_bank_missing_file_on_disk_returns_404(bank_endpoints_client):
+    assert bank_endpoints_client.get("/v1/bank/camel").status_code == 404      # row exists, no ogg
+
+
+def test_bank_prefix_search(bank_endpoints_client):
+    words = bank_endpoints_client.get("/v1/bank", params={"prefix": "ca"}).json()["words"]
+    assert "cat" in words and "camel" in words
+
+
+def test_languages_lists_wordbank(bank_endpoints_client):
+    langs = bank_endpoints_client.get("/v1/languages").json()
+    assert {"code": "en-us", "words": 2} in langs["wordbank"]      # data-driven (cat, camel)
+    assert any(s["code"] == "en-us" for s in langs["generate"])    # curated list
 
 
 # --- WAV/OGG mirror + compare ---
@@ -165,7 +185,7 @@ def test_bank_format_and_info(tmp_path, monkeypatch):
     rel = "en-us/gemini-Kore/0/1_cat.wav"       # path as stored in the manifest
     wav = wav_root / rel
     wav.parent.mkdir(parents=True)
-    write_wav(wav, b"\x01\x00" * 4800)
+    write_wav_from_pcm_bytes(wav, b"\x01\x00" * 4800)
     ogg = ogg_root / "en-us/gemini-Kore/0/1_cat.ogg"
     ogg.parent.mkdir(parents=True)
     ogg.write_bytes(b"OggS" + b"\x00" * 200)    # stand-in OGG copy
