@@ -38,11 +38,64 @@ and `WORDBANK_PLAN.md`.
 
 ## Key files
 - `src/server.py` API · `src/model.py` OmniVoice (lazy) · `src/audio.py` PCM→OGG
-- `wordbank/`: `manifest.py` (SQLite — `words` + `phrases` content tables (generic over `table`/`text_col`) + `voices` registry) · `gemini_batch.py` (Gemini batch → words) · `gemini_tts.py` (sync Gemini TTS for studio/refs) · `voices.py` (clip storage + path resolution) · `pipeline.py` + `backends/local.py` (local OmniVoice sync gen → phrases) · `lookup.py` (read-only merged search + voice/type) · `languages.py` · `config.py` · `__main__.py` (CLI: `generate` (phrases) / `gemini-voice` / `add-voice` / `voices` / `batch*` / `status` / `export`)
+- `wordbank/`: `manifest.py` (SQLite — `words` + `phrases` content tables (generic over `table`/`text_col`) + `voices` registry) · `gemini_batch.py` (Gemini batch → words) · `gemini_tts.py` (sync Gemini TTS for studio/refs) · `voices.py` (clip storage + path resolution) · `library.py` (deploy `describe`/`verify`) · `pipeline.py` + `backends/local.py` (local OmniVoice sync gen → phrases) · `lookup.py` (read-only merged search + voice/type) · `languages.py` · `config.py` · `__main__.py` (CLI: `generate` (phrases) / `gemini-voice` / `add-voice` / `voices` / `describe` / `verify` / `batch*` / `status` / `export`)
 - `scripts/`: `fetch_wordlist` · `make_accent_reference` · `encode_wavs` · `package_bank` · `pack.sh`/`unpack.sh` (one-tarball bundle: code+db+OGG) · `backfill_voice` · `gemini_batch_cleanup` · `gemini_batch_smoke` · `list_models` · `migrate_manifest_paths`
 - `frontend/index.html` also has the **Gemini voice studio** (author refs) + a saved-reference picker in the cloning panel.
 - `frontend/index.html` · `Dockerfile` (`--build-arg WITH_MODEL`) · `docker-compose.yml` (profiles `bank` / `full`)
 - Open work is the **TODO** at the bottom of `README.md` (verify voice cloning, en-GB bank, multi-language, JWT auth).
+
+---
+
+## Continuing development
+
+> **Always ask before starting work.** Even if a task below looks clear, confirm
+> the scope and priority with the user first. Do not pick up any item autonomously.
+
+### Outstanding product goals (in rough priority order)
+
+1. **Validate voice-cloning quality** — the en-GB phrase pipeline is wired but
+   the output hasn't been listened to. Generate a small set (`--lang en-gb
+   generate`) and present samples for review before expanding.
+2. **Fill the phrase bank** — author reference voices per accent (Gemini voice
+   studio → `add-voice`), then generate phrase sets per locale. Serving and
+   merged search (`/v1/search`) are already ready.
+3. **Multi-language support** — generation is data-driven; what's needed is a
+   word list + a reference voice per language, then a verified listen before
+   adding the locale to `wordbank/languages.py`.
+4. **JWT auth** — API is open; add bearer-token verification as a FastAPI
+   dependency on all write/synthesis routes (`/v1/tts`, `/v1/voices`,
+   `/v1/gemini/tts`). Read-only bank endpoints can remain public.
+
+### Code-quality backlog (from `review-report.json`)
+
+These are confirmed issues from the automated review. Fix in isolation; each
+is small and independent. Do not bundle multiple items into one PR without asking.
+
+**Must fix before production:**
+- `scripts/gemini_sync.py:19` — broken `import _safe` crashes on invocation;
+  replace with `from wordbank.paths import safe_filename`.
+- `src/server.py:46-49` — wildcard CORS + no auth on write endpoints; add
+  `CORS_ORIGINS` env var and API-key dependency.
+- `docker-entrypoint.sh:37-39` — `sh -c "$BANK_SYNC_CMD"` is a shell-injection
+  vector; replace with structured params (`SYNC_BUCKET`, `SYNC_PREFIX`).
+- `Dockerfile` / `docker-compose.yml` — add `HEALTHCHECK` wired to `/health`.
+- `docker-entrypoint.sh:34` — server starts on empty bank; add `exit 1` and
+  harden `/health` to return 503 when `bank.available` is False.
+- `src/server.py:233,267` — replace `asyncio.get_event_loop()` with
+  `asyncio.get_running_loop()` (deprecated Python 3.10+).
+
+**Clean up when convenient:**
+- `requirements.txt:14` — remove `google-cloud-texttospeech` (Chirp remnant).
+- `wordbank/gemini_batch.py:41` — shorten `VOICE_INSTRUCTION` and expose via
+  `WORDBANK_VOICE_INSTRUCTION` env var (~$1.80 savings per 50k-word bank).
+- `wordbank/gemini_tts.py:49` — cache `genai.Client()` at module level
+  (same pattern as `GeminiBatch._get_client`).
+- Rename `write_wav` functions (`gemini_batch.py` → `write_wav_from_pcm_bytes`,
+  `postproc.py` → `write_wav_from_array`).
+- Extract `SAMPLE_RATE = 24_000` into `wordbank/constants.py`; import everywhere.
+- Delete `tests/test_device.py` (all 6 tests are vacuous mocks of torch).
+- Refactor `test_local_backend.py` tests to assert reproducibility rather than
+  inspect internal call arguments.
 
 ---
 
@@ -104,21 +157,34 @@ python scripts/package_bank.py            # → dist/bank/  (words_ogg/ + wordba
 - The user uploads `dist/bank/` themselves (the script prints S3/GCS/rclone examples). **Do NOT upload unless asked**; never use destructive flags or make a bucket public.
 - Deploy: the container pulls `words_ogg/` + `wordbank.db` into its volume via `BANK_SYNC_CMD`.
 
-## Runbook: bundle the whole bank into one archive
+## Runbook: build the deployment package (description + archive)
 
-Trigger: *"make an archive"*, *"bundle the library + db"*, *"so I can download and run it elsewhere"*.
+Trigger: *"make an archive"*, *"bundle the library"*, *"deployment package"*, *"so I can deploy it elsewhere"*.
 
-Distinct from `package_bank.py` (which stages **data only** for upload to storage):
-`pack.sh` bundles **code + `wordbank.db` + the served OGG** (`output/words_ogg` +
-`output/voices`) into ONE tarball for a fresh machine. Excludes the multi-GB WAV
-masters (`output/words`). Plain `tar`/`bash`, no extra tooling.
+The image is **code only** — it never stores the bank. The **deployment package**
+is: the Docker image + `library.json` (description) + `tts-bank.tar.gz` (archive).
+`scripts/pack.sh` builds the latter two:
 ```bash
-bash scripts/pack.sh                        # → tts-bank.tar.gz  (gitignored)
-# on the target:
-mkdir tts-bank && tar xzf tts-bank.tar.gz -C tts-bank && cd tts-bank && bash scripts/unpack.sh
+bash scripts/pack.sh          # → library.json + tts-bank.tar.gz (both gitignored)
 ```
-- `unpack.sh` creates `.venv`, installs **`requirements-base.txt` only** (serving, no torch), and verifies the bank (word/phrase/OGG counts). Archive paths match the server defaults → no env config needed to serve.
-- Add live synth on the target with `MODEL_ENABLED=1` + `requirements-model.txt`.
+- `library.json` (`wordbank describe`): languages, voices, word/phrase counts, ogg
+  count, and the `folders` a provisioned volume must have. Also bundled inside the archive.
+- `tts-bank.tar.gz`: code + `wordbank.db` + served OGG (`output/words_ogg` + `output/voices`).
+  Excludes the multi-GB WAV masters (`output/words`).
+
+**Docker deploy** — put `library.json` + `tts-bank.tar.gz` on the (persistent)
+`/data` volume; `docker-entrypoint.sh` on boot:
+1. `python -m wordbank verify --desc $LIBRARY_DESC --root $DATA_DIR` (defaults
+   `/data/library.json`, `/data`) — checks the described folders exist and the
+   DB word/phrase counts (+ ogg count) match.
+2. If invalid, unpacks `$LIBRARY_ARCHIVE` (`/data/tts-bank.tar.gz`) into `/data`
+   (`output/words_ogg`→`/data/words_ogg`, `output/voices`→`/data/voices`,
+   `wordbank.db`→`/data/wordbank.db`, `library.json`), then re-verifies.
+3. Starts the server. Later restarts find the volume provisioned → no unpack.
+
+**Bare-metal**: `mkdir tts-bank && tar xzf tts-bank.tar.gz -C tts-bank && cd tts-bank
+&& bash scripts/unpack.sh` (`.venv` + `requirements-base.txt` only, verifies counts).
+Distinct from `package_bank.py`, which stages data-only for upload to object storage.
 
 ## Runbook: free the Gemini batch enqueued-token quota
 
