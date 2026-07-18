@@ -6,8 +6,9 @@ from typing import Annotated, Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 
+from wordbank.gemini_tts import DEFAULT_MODEL as GEMINI_TTS_DEFAULT_MODEL
 from wordbank.lookup import BankLookup
 
 # NOTE: src.model / src.audio (torch, omnivoice, numpy, soundfile) are imported
@@ -19,12 +20,21 @@ MAX_TEXT_LEN = int(os.getenv("MAX_TEXT_LEN", "2000"))
 MAX_REF_BYTES = int(os.getenv("MAX_REF_BYTES", str(10 * 1024 * 1024)))  # 10 MB
 FRONTEND_DIR = os.getenv("FRONTEND_DIR", "frontend")
 DEFAULT_LANG = os.getenv("DEFAULT_LANG", "en-us")
-GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts")
+GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", GEMINI_TTS_DEFAULT_MODEL)
 GEMINI_TTS_VOICE = os.getenv("GEMINI_TTS_VOICE", "Kore")
 
 
 def _truthy(val: Optional[str]) -> bool:
     return (val or "").lower() not in ("", "0", "false", "no", "off")
+
+
+def _cors_origins() -> list:
+    """Comma-separated CORS_ORIGINS env var -> origin list; unset -> ["*"]."""
+    raw = os.getenv("CORS_ORIGINS")
+    if not raw:
+        return ["*"]
+    origins = [o.strip() for o in raw.split(",")]
+    return [o for o in origins if o]
 
 
 @asynccontextmanager
@@ -43,17 +53,28 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="TTS Server", lifespan=lifespan)
 
-# CORS open for convenience; restrict allow_origins in production.
+# CORS_ORIGINS env var: comma-separated allowlist (e.g.
+# "https://app.example.com,https://admin.example.com"). Unset -> wildcard, so
+# local dev and the current deployment keep working unchanged. NOTE: CORS is a
+# browser-enforced control only — it stops a malicious *web page* from calling
+# this API cross-origin, but does nothing against curl/scripts/servers, which
+# ignore it entirely. It is not authentication and does not secure the API.
 app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+    CORSMiddleware, allow_origins=_cors_origins(),
+    allow_methods=["GET", "POST", "OPTIONS"], allow_headers=["*"],
 )
 
 
 @app.get("/health")
 def health():
     bank = app.state.bank
+    # Healthy iff the service can serve SOMETHING: the pre-generated bank, or
+    # live synthesis (MODEL_ENABLED). A model-only deploy with no bank is a
+    # legitimate config and must stay healthy; only "neither" is unhealthy.
+    healthy = bank.available or app.state.model_enabled
     info = {
         "status": "ok",
+        "healthy": healthy,
         "model": MODEL_ID,
         "model_enabled": app.state.model_enabled,
         "bank": bank.available,
@@ -67,7 +88,7 @@ def health():
             info["model_loaded"] = is_loaded()
         except Exception:
             info["model_loaded"] = False
-    return info
+    return JSONResponse(content=info, status_code=200 if healthy else 503)
 
 
 def _media_type(path: str) -> str:
@@ -230,7 +251,7 @@ async def tts(
         return generate(text, ref_path, ref_text, instruct, guidance_scale, seed)
 
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         audio = await loop.run_in_executor(None, _synthesize)
     except (ImportError, ModuleNotFoundError) as exc:
         raise HTTPException(503, f"synthesis model not available in this build: {exc}") from exc
@@ -264,7 +285,7 @@ async def gemini_tts(
         return pcm_to_wav_bytes(pcm)
 
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         wav = await loop.run_in_executor(None, _gen)
     except (ImportError, ModuleNotFoundError) as exc:
         raise HTTPException(503, f"google-genai not installed: {exc}") from exc

@@ -26,6 +26,22 @@ services:
       # LIBRARY_DESC: /data/library.json          # defaults; override if placed elsewhere
       # LIBRARY_ARCHIVE: /data/tts-bank.tar.gz
       # BANK_SYNC_CMD: "aws s3 sync s3://BUCKET/words_ogg /data/words_ogg && aws s3 cp s3://BUCKET/wordbank.db /data/wordbank.db"
+      # Structured, injection-free alternative to BANK_SYNC_CMD (uses `aws s3`).
+      # Pulls s3://BUCKET/PREFIX/words_ogg/ and s3://BUCKET/PREFIX/wordbank.db:
+      # SYNC_BUCKET: BUCKET
+      # SYNC_PREFIX: bank
+    # Same check the image's HEALTHCHECK declares — repeated explicitly so it's
+    # visible here and so `docker compose ps` / `depends_on: condition:
+    # service_healthy` work without needing to inspect the image. Values match
+    # the Dockerfile HEALTHCHECK (see justification there): 300s start-period
+    # covers the first-boot bank unpack (~129 MB / ~48k OGG files).
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 300s
     volumes:
       - bank-data:/data                             # persistent — provisioned on first boot
       - ./library.json:/data/library.json:ro         # description  ┐ deployment package
@@ -49,6 +65,16 @@ services:
       OGG_ROOT: /data/words_ogg
       VOICES_ROOT: /data/voices
       HF_HOME: /hf-cache                  # weights cached across restarts
+    # Longer start-period than tts-bank: PRELOAD_MODEL=1 loads OmniVoice weights
+    # at startup (first run also downloads them into hf-cache) on top of the
+    # same bank-unpack step, so first boot can legitimately take much longer.
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 900s
     volumes:
       - bank-data:/data
       - ./library.json:/data/library.json:ro
