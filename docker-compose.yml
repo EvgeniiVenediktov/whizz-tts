@@ -1,15 +1,15 @@
-# Workflow:
-#   1. local dev — generate audio (Gemini) + code changes
-#   2. build image (code only) + push OGG copies to storage
-#   3. deploy — container pulls OGG + manifest into the volume and serves; pulls
-#      model weights only when MODEL_ENABLED=1
+# The image is CODE ONLY. The bank lives on the /data volume; the container
+# provisions it on first boot (see docker-entrypoint.sh):
+#   deployment package = this image + library.json + tts-bank.tar.gz (scripts/pack.sh)
+# Mount the description + archive on the volume; on first `up` the entrypoint
+# verifies /data against library.json and unpacks the archive if needed. Later
+# restarts find the volume already provisioned and skip the unpack.
 #
-#   docker compose --profile bank up --build   → lightweight, OGG-only (no model)
-#   docker compose --profile full up --build   → adds live OmniVoice synthesis
+#   scripts/pack.sh                            # → library.json + tts-bank.tar.gz
+#   docker compose --profile bank up --build   # lightweight, OGG-only (no model)
+#   docker compose --profile full up --build   # adds live OmniVoice synthesis
 #
-# The image contains NO audio. WAV masters are never served in production (OGG
-# only). Below the bank dirs are bind-mounted from the host for local testing;
-# in production use a named volume populated by BANK_SYNC_CMD (see commented).
+# WAV masters are never served in production (OGG only).
 services:
   tts-bank:
     build:
@@ -22,15 +22,18 @@ services:
       SERVE_FRONTEND: "1"
       BANK_DB: /data/wordbank.db
       OGG_ROOT: /data/words_ogg
-      # WAV_ROOT: /data/words            # uncomment + mount below for dev WAV compare
-      # Production: pull the bank into the volume at startup instead of bind-mounting:
+      VOICES_ROOT: /data/voices
+      # LIBRARY_DESC: /data/library.json          # defaults; override if placed elsewhere
+      # LIBRARY_ARCHIVE: /data/tts-bank.tar.gz
       # BANK_SYNC_CMD: "aws s3 sync s3://BUCKET/words_ogg /data/words_ogg && aws s3 cp s3://BUCKET/wordbank.db /data/wordbank.db"
     volumes:
-      - ./output/words_ogg:/data/words_ogg:ro     # OGG copies (served)
-      - ./wordbank.db:/data/wordbank.db           # manifest
-      # - ./output/words:/data/words:ro           # WAV masters — dev compare only
-      # Production alternative (BANK_SYNC_CMD populates it):
-      # - bank-data:/data
+      - bank-data:/data                             # persistent — provisioned on first boot
+      - ./library.json:/data/library.json:ro         # description  ┐ deployment package
+      - ./tts-bank.tar.gz:/data/tts-bank.tar.gz:ro   # archive      ┘ (run scripts/pack.sh)
+      # Local-dev alternative — bind-mount an already-unpacked bank instead of the package:
+      # - ./output/words_ogg:/data/words_ogg:ro
+      # - ./wordbank.db:/data/wordbank.db
+      # - ./output/voices:/data/voices:ro
 
   tts-full:
     build:
@@ -44,10 +47,12 @@ services:
       SERVE_FRONTEND: "1"
       BANK_DB: /data/wordbank.db
       OGG_ROOT: /data/words_ogg
+      VOICES_ROOT: /data/voices
       HF_HOME: /hf-cache                  # weights cached across restarts
     volumes:
-      - ./output/words_ogg:/data/words_ogg:ro
-      - ./wordbank.db:/data/wordbank.db
+      - bank-data:/data
+      - ./library.json:/data/library.json:ro
+      - ./tts-bank.tar.gz:/data/tts-bank.tar.gz:ro
       - hf-cache:/hf-cache
 
 volumes:

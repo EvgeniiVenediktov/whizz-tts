@@ -89,24 +89,37 @@ docker compose --profile bank up --build
 docker compose --profile full up --build
 ```
 
-## Package the whole bank into one archive
+## Deployment package (image + description + archive)
 
-To move the bank to another machine without regenerating it, bundle the library
-+ `wordbank.db` + the served OGG into a single tarball (the multi-GB WAV masters
-are excluded). Uses plain `tar`/`bash` — no extra tooling.
+The image is **code only** — it never stores the bank. `scripts/pack.sh` produces
+the two data artifacts that ride alongside it:
 
 ```bash
-# On the source machine:
-bash scripts/pack.sh                      # → tts-bank.tar.gz  (~code + db + words_ogg)
-
-# On the target machine (download the tarball, then):
-mkdir tts-bank && tar xzf tts-bank.tar.gz -C tts-bank && cd tts-bank
-bash scripts/unpack.sh                    # creates .venv, installs serving deps, verifies the bank
-SERVE_FRONTEND=1 .venv/bin/uvicorn src.server:app --port 8000
+bash scripts/pack.sh
+# → library.json     description: languages, voices, word/phrase counts, folders
+# → tts-bank.tar.gz  library code + wordbank.db + served OGG (excludes WAV masters)
 ```
 
-`unpack.sh` installs only `requirements-base.txt` (FastAPI/uvicorn — no ML stack);
-paths inside the archive match the server's defaults, so no env config is needed.
+**Deploy = the Docker image + `library.json` + `tts-bank.tar.gz`.** Put the
+description and archive on the (persistent) volume; on first boot the container
+verifies the volume against `library.json` — described folders present, word/phrase
+counts and OGG count match — and unpacks the archive only if it isn't provisioned.
+Later restarts find the volume ready and skip the unpack.
+
+```bash
+docker compose --profile bank up --build   # mounts library.json + tts-bank.tar.gz on /data
+```
+
+Provisioning is `docker-entrypoint.sh` calling `python -m wordbank verify`; you can
+run the same check by hand: `python -m wordbank verify --desc library.json --root /data`.
+
+**Bare-metal (no Docker)** — unpack the archive and run directly:
+
+```bash
+mkdir tts-bank && tar xzf tts-bank.tar.gz -C tts-bank && cd tts-bank
+bash scripts/unpack.sh                     # .venv + serving deps (no ML stack), verifies the bank
+SERVE_FRONTEND=1 .venv/bin/uvicorn src.server:app --port 8000
+```
 
 ## Configuration (env)
 

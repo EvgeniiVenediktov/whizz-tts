@@ -1,7 +1,8 @@
 """Word-bank CLI:  python -m wordbank <command> ...
 
 Commands: generate (local OmniVoice) · add-voice / voices (clone references) ·
-batch / batch-submit / batch-collect / batch-run (Gemini async) · status · export.
+batch / batch-submit / batch-collect / batch-run (Gemini async) · describe / verify
+(deployment library description) · status · export.
 
   python -m wordbank --lang en-gb add-voice --ref-audio refs/en-gb/ref.wav \
       --ref-text-file refs/en-gb/ref.txt --source gemini
@@ -196,6 +197,34 @@ def cmd_batch_run(args, cfg: Config) -> None:
     m.close()
 
 
+def cmd_describe(args, cfg: Config) -> None:
+    """Emit a library description (languages/voices/counts/folders) as JSON."""
+    import json
+    from .library import describe
+
+    desc = describe(cfg.db, args.ogg_root, args.voices_dir)
+    text = json.dumps(desc, indent=2)
+    if args.output:
+        pathlib.Path(args.output).write_text(text + "\n", encoding="utf-8")
+        print(f"wrote {args.output}: {desc['words']} words, {desc['phrases']} phrases, "
+              f"{desc['ogg_files']} ogg, {len(desc['voices'])} voices")
+    else:
+        print(text)
+
+
+def cmd_verify(args, cfg: Config) -> None:
+    """Verify a mounted volume against a library description; exit 1 if invalid."""
+    from .library import verify
+
+    problems = verify(args.desc, args.root)
+    if problems:
+        print("library INVALID:")
+        for p in problems:
+            print(f"  - {p}")
+        sys.exit(1)
+    print(f"library OK: {args.root} matches {args.desc}")
+
+
 def cmd_status(args, cfg: Config) -> None:
     words = Manifest(cfg.db)
     phrases = Manifest(cfg.db, table="phrases", text_col="text")
@@ -294,6 +323,19 @@ def main(argv=None) -> None:
     gv.add_argument("--instruct", default=None, help="accent/style direction (not spoken)")
     gv.add_argument("--model", default=None, help="Gemini TTS model (default: 2.5-flash-preview-tts)")
     gv.set_defaults(func=cmd_gemini_voice)
+
+    de = sub.add_parser("describe",
+                        help="write a library description (langs/voices/counts) as JSON")
+    de.add_argument("--ogg-root", default="output/words_ogg", dest="ogg_root")
+    de.add_argument("--voices-dir", default="output/voices", dest="voices_dir")
+    de.add_argument("--output", default=None, help="path to write (default: stdout)")
+    de.set_defaults(func=cmd_describe)
+
+    ve = sub.add_parser("verify",
+                        help="verify a volume against a library description (exit 1 if invalid)")
+    ve.add_argument("--desc", required=True, help="library description JSON")
+    ve.add_argument("--root", required=True, help="data dir to check (folders + db)")
+    ve.set_defaults(func=cmd_verify)
 
     s = sub.add_parser("status", help="show counts by status")
     s.set_defaults(func=cmd_status)
