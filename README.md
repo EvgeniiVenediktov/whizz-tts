@@ -82,11 +82,14 @@ the `UNIQUE` index; prefix autocomplete uses an index range scan.
 # Dev (server + frontend, same origin; bank only, no model):
 SERVE_FRONTEND=1 .venv/bin/uvicorn src.server:app --port 8000   # → http://localhost:8000
 
-# Docker — lightweight bank-only (no torch):
-docker compose --profile bank up --build
+# Docker (production path — plain docker build/run, no compose):
+bash scripts/pack.sh          # → library.json + tts-bank.tar.gz
+scripts/docker-build.sh       # fat image: bank baked in, no torch
+scripts/docker-run.sh
 
-# Docker — with live synthesis (downloads weights to a cache volume):
-docker compose --profile full up --build
+# Docker compose — dev-only convenience, mounts library.json/tts-bank.tar.gz as a volume:
+docker compose --profile bank up --build   # lightweight bank-only (no torch)
+docker compose --profile full up --build   # + live synthesis (downloads weights to a cache volume)
 ```
 
 ## Deployment package (image + description + archive)

@@ -182,7 +182,22 @@ bash scripts/pack.sh          # → library.json + tts-bank.tar.gz (both gitigno
 - `tts-bank.tar.gz`: code + `wordbank.db` + served OGG (`output/words_ogg` + `output/voices`).
   Excludes the multi-GB WAV masters (`output/words`).
 
-**Docker deploy** — put `library.json` + `tts-bank.tar.gz` on the (persistent)
+**Docker deploy — two `--target`s, no compose in production** (compose stays
+dev-only convenience: `docker compose --profile bank up --build`):
+- `--target runtime` (default) — code only, bank comes from a mounted `/data`
+  volume (e.g. a k8s PVC) or `SYNC_BUCKET`/`BANK_SYNC_CMD` at boot.
+- `--target runtime-fat` — same image, `library.json` + `tts-bank.tar.gz`
+  baked in at `/data` at build time (`COPY` in the Dockerfile). No mount
+  needed; `docker-entrypoint.sh`'s verify/unpack runs unchanged, it just
+  finds the archive already there. For deploying before persistent storage
+  exists — every rollout re-bakes the bank into the image. Requires
+  `library.json`/`tts-bank.tar.gz` present at build time (`scripts/pack.sh`).
+
+`scripts/docker-build.sh` / `scripts/docker-run.sh` wrap the plain
+`docker build`/`docker run` for this (fat by default; `--thin` for the
+volume-mounted form; `--with-model` for `WITH_MODEL=1` + `MODEL_ENABLED=1`).
+
+Put `library.json` + `tts-bank.tar.gz` on the (persistent)
 `/data` volume; `docker-entrypoint.sh` on boot:
 0. If `SYNC_BUCKET`/`SYNC_PREFIX` (or `BANK_SYNC_CMD`) is set, pulls the bank
    into the volume. **This runs first** — it is a way of *provisioning* the

@@ -1,15 +1,45 @@
 #!/usr/bin/env bash
-# Run the server via docker compose. Needs library.json + tts-bank.tar.gz in
-# the repo root first (scripts/pack.sh) — mounted read-only for the entrypoint
-# to provision the /data volume on first boot.
-#   scripts/docker-run.sh            # bank-only, no model ever loaded
-#   scripts/docker-run.sh full       # live synthesis, model preloaded at startup
+# Run a server image built by scripts/docker-build.sh — plain `docker run`,
+# no compose, no persistent volume (that's wired up separately once real
+# storage exists, e.g. a k8s PVC).
+#
+#   scripts/docker-run.sh                # run whizz-tts:runtime-fat
+#   scripts/docker-run.sh --with-model    # run whizz-tts:runtime-fat-model
+#                                         # (MODEL_ENABLED=1, PRELOAD_MODEL=1)
+#   scripts/docker-run.sh --thin          # run whizz-tts:runtime, bind-mounting
+#                                         # local library.json + tts-bank.tar.gz
+#                                         # at /data -- a stand-in for a real
+#                                         # volume mount, local testing only
+#   scripts/docker-run.sh --image NAME    # override the image tag
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-PROFILE="${1:-bank}"
+TARGET=runtime-fat
+WITH_MODEL=0
+IMAGE=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --thin) TARGET=runtime ;;
+        --with-model) WITH_MODEL=1 ;;
+        --image) IMAGE="$2"; shift ;;
+        *) echo "unknown arg: $1" >&2; exit 1 ;;
+    esac
+    shift
+done
 
-[ -f library.json ]    || { echo "error: no library.json (run scripts/pack.sh)"    >&2; exit 1; }
-[ -f tts-bank.tar.gz ] || { echo "error: no tts-bank.tar.gz (run scripts/pack.sh)" >&2; exit 1; }
+if [ -z "$IMAGE" ]; then
+    IMAGE="whizz-tts:$TARGET"
+    [ "$WITH_MODEL" = "1" ] && IMAGE="$IMAGE-model"
+fi
 
-docker compose --profile "$PROFILE" up "tts-$PROFILE"
+ENV_ARGS=()
+[ "$WITH_MODEL" = "1" ] && ENV_ARGS+=(-e MODEL_ENABLED=1 -e PRELOAD_MODEL=1)
+
+MOUNT_ARGS=()
+if [ "$TARGET" = "runtime" ]; then
+    [ -f library.json ]    || { echo "error: no library.json (run scripts/pack.sh)"    >&2; exit 1; }
+    [ -f tts-bank.tar.gz ] || { echo "error: no tts-bank.tar.gz (run scripts/pack.sh)" >&2; exit 1; }
+    MOUNT_ARGS+=(-v "$PWD/library.json:/data/library.json:ro" -v "$PWD/tts-bank.tar.gz:/data/tts-bank.tar.gz:ro")
+fi
+
+docker run --rm -it -p 8000:8000 "${ENV_ARGS[@]}" "${MOUNT_ARGS[@]}" "$IMAGE"
