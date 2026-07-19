@@ -193,9 +193,13 @@ dev-only convenience: `docker compose --profile bank up --build`):
   exists — every rollout re-bakes the bank into the image. Requires
   `library.json`/`tts-bank.tar.gz` present at build time (`scripts/pack.sh`).
 
-`scripts/docker-build.sh` / `scripts/docker-run.sh` wrap the plain
-`docker build`/`docker run` for this (fat by default; `--thin` for the
-volume-mounted form; `--with-model` for `WITH_MODEL=1` + `MODEL_ENABLED=1`).
+`scripts/docker-build-thin.sh` / `scripts/docker-build-fat.sh` wrap the plain
+`docker build --target runtime` / `--target runtime-fat` (`--with-model` on
+either for `WITH_MODEL=1`, i.e. torch). `scripts/docker-run.sh thin|fat`
+wraps `docker run` (`--with-model` sets `MODEL_ENABLED=1`/`PRELOAD_MODEL=1`;
+`thin` bind-mounts local `library.json`/`tts-bank.tar.gz` at `/data` as a
+stand-in for a real volume, for local testing only). Tags: `whizz-tts:thin`,
+`whizz-tts:fat`, `-model` suffix with `--with-model`.
 
 Put `library.json` + `tts-bank.tar.gz` on the (persistent)
 `/data` volume; `docker-entrypoint.sh` on boot:
