@@ -49,6 +49,12 @@ class BankLookup:
             self._has_phrases = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='phrases'"
             ).fetchone() is not None
+            # Columns added to `phrases` over time (voice, seed, ref_audio,
+            # ref_text). Manifest ALTER-migrates on open, but this reader must
+            # serve old banks it never writes — select NULL for missing ones.
+            self._phrase_cols = {
+                r[1] for r in conn.execute("PRAGMA table_info(phrases)")
+            } if self._has_phrases else set()
 
     @property
     def available(self) -> bool:
@@ -108,8 +114,13 @@ class BankLookup:
             self._open()
             if self._conn is None or not self._has_phrases:
                 return None
-            sql = ("SELECT text, lang, file_path, status, voice, seed, "
-                   "ref_audio, ref_text FROM phrases "
+            if voice is not None and "voice" not in self._phrase_cols:
+                return None  # voice-pinned lookup can't match a voiceless bank
+            cols = ", ".join(
+                c if c in self._phrase_cols else f"NULL AS {c}"
+                for c in ("voice", "seed", "ref_audio", "ref_text")
+            )
+            sql = (f"SELECT text, lang, file_path, status, {cols} FROM phrases "
                    f"WHERE LOWER(text) = LOWER(?) AND lang = ? AND {_READY_SQL}")
             params = [text.strip(), lang]
             if voice is not None:
@@ -136,8 +147,9 @@ class BankLookup:
                     f"WHERE lang = ? AND word >= ? AND word < ? AND {_READY_SQL}")
                 params += [lang, p, _prefix_upper(p)]
             if kind in (None, "phrase") and self._has_phrases:
+                vp = "voice" if "voice" in self._phrase_cols else "NULL"
                 parts.append(
-                    "SELECT text, 'phrase' AS type, voice FROM phrases "
+                    f"SELECT text, 'phrase' AS type, {vp} AS voice FROM phrases "
                     f"WHERE lang = ? AND LOWER(text) LIKE ? AND {_READY_SQL}")
                 params += [lang, p + "%"]
             if not parts:

@@ -219,6 +219,7 @@
   </label>
   <div class="submit-row">
     <button type="submit" id="bank-play-btn">Look up</button>
+    <button type="submit" id="bank-speak-btn">Speak (generate if missing)</button>
     <span id="bank-status" style="font-size:0.85rem;color:#888"></span>
   </div>
   <div id="bank-compare" style="display:none;flex-direction:column;gap:14px">
@@ -452,6 +453,7 @@
   const GEMINI = `${API_BASE}/v1/gemini/tts`;
   const SEARCH = `${API_BASE}/v1/search`;
   const PHRASE = `${API_BASE}/v1/phrase`;
+  const SPEAK = `${API_BASE}/v1/speak`;
 
   // ---- API token (JWT) ----
   // Only the three write/synthesis routes (/v1/tts, /v1/gemini/tts, /v1/voices
@@ -560,6 +562,50 @@
   }
   bankBtn.addEventListener('click', lookupBank);
   bankWord.addEventListener('keydown', e => { if (e.key === 'Enter') lookupBank(); });
+
+  // ---- Speak: get-or-generate (bank hit, or Gemini synth + save to phrases) ----
+  const bankSpeakBtn = document.getElementById('bank-speak-btn');
+
+  async function refreshSuggestions(prefix) {
+    try {                                    // merged: words + phrases, tagged
+      const res = await fetch(`${SEARCH}?prefix=${encodeURIComponent(prefix)}&limit=10`);
+      const { results } = await res.json();
+      bankList.innerHTML = results.map(r =>
+        `<option value="${esc(r.text)}" label="${r.type}${r.voice ? ' · ' + r.voice : ''}">`).join('');
+    } catch { /* ignore autocomplete errors */ }
+  }
+
+  async function speakBank() {
+    const text = bankWord.value.trim();
+    if (!text) { bankWord.focus(); return; }
+    bankStatus.textContent = 'generating…';
+    bankSpeakBtn.disabled = true;
+    try {
+      const form = new FormData();
+      form.append('text', text);
+      const res = await fetch(SPEAK, { method: 'POST', headers: authHeaders(), body: form });
+      if (!res.ok) throw new Error(await readError(res));
+      const fromBank = res.headers.get('X-Source') === 'bank';
+      const blob = await res.blob();
+
+      bankCompare.style.display = 'flex';
+      wavRow.style.display = 'none';
+      wavPlayer.removeAttribute('src');
+      oggPlayer.style.display = 'block';
+      oggMissing.style.display = 'none';
+      oggSize.textContent = kb(blob.size);
+      oggPlayer.src = URL.createObjectURL(blob);
+      oggPlayer.play();
+
+      bankStatus.textContent = fromBank ? 'speak: served from bank' : 'speak: generated + saved to bank';
+      if (!fromBank) await refreshSuggestions(text);   // now indexed — show it as banked
+    } catch (e) {
+      bankStatus.textContent = e.message;
+    } finally {
+      bankSpeakBtn.disabled = false;
+    }
+  }
+  bankSpeakBtn.addEventListener('click', speakBank);
 
   // Mode tabs
   let activeMode = 'clone';

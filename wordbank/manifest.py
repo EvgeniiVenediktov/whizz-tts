@@ -220,6 +220,18 @@ class Manifest:
                 f"SELECT * FROM {self.table} ORDER BY id"
             ).fetchall()
 
+    def get_entry(self, text: str, lang: str, voice: Optional[str] = None):
+        """Fetch one row from this manifest's table by (text_col, lang), optionally
+        pinned to a voice. Returns the row or None. Unlike BankLookup.get*, this is
+        not status-scoped (used by writers to find a row they just inserted)."""
+        sql = f"SELECT * FROM {self.table} WHERE {self.text_col} = ? AND lang = ?"
+        params = [text, lang]
+        if voice is not None:
+            sql += " AND voice = ?"
+            params.append(voice)
+        with self._lock:
+            return self._conn.execute(sql, params).fetchone()
+
     # ---- voices (clone references) ----
 
     def add_voice(self, name: str, lang: str, ref_audio: str, *,

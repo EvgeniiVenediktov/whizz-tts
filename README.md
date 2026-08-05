@@ -74,6 +74,7 @@ the `UNIQUE` index; prefix autocomplete uses an index range scan.
 | `GET /v1/bank/{word}` · `/info` | serve a word (OGG default; `wav` dev-only) · sizes+type+voice |
 | `GET /v1/phrase?text=…` · `/info` | serve a phrase (by text, optional `voice`) · sizes+type+voice+seed+reference |
 | `POST /v1/tts` | live synthesis — `ref_audio` upload, a saved `voice=<name>`, or `instruct` (requires `MODEL_ENABLED`; else `503`) |
+| `POST /v1/speak` | get-or-generate — `text` (required), `lang` (default `en-us`), `voice`/`instruct` (optional, Gemini prebuilt). Bank hit → stored OGG, `X-Source: bank`. Miss → Gemini synth, saved into the phrase bank (`voice=gemini-<voice>`), served with `X-Source: gemini`; needs `GEMINI_API_KEY` only on a miss |
 | voice studio | `GET /v1/gemini/voices`, `POST /v1/gemini/tts`, `GET/POST /v1/voices`, `GET /v1/voices/{lang}/{name}/audio` — author + save clone references |
 
 ## Run
@@ -159,8 +160,9 @@ SERVE_FRONTEND=1 .venv/bin/uvicorn src.server:app --port 8000
 
 The API is **open by default** (dev mode). Setting `JWT_SECRET` turns on
 bearer-token auth for the write/synthesis routes — `POST /v1/tts`,
-`POST /v1/gemini/tts`, `POST /v1/voices` — via an HS256 `Authorization: Bearer
-<token>` check. Every `GET` endpoint and `/health` stay public either way. A
+`POST /v1/gemini/tts`, `POST /v1/voices`, `POST /v1/speak` — via an HS256
+`Authorization: Bearer <token>` check. Every `GET` endpoint and `/health` stay
+public either way. A
 missing/invalid/expired token gets a `401` with a `WWW-Authenticate: Bearer`
 header and a JSON `detail`. Optional `JWT_AUDIENCE` / `JWT_ISSUER` add `aud`/
 `iss` claim checks on top of the signature/expiry check.
@@ -175,6 +177,16 @@ JWT_SECRET=… python scripts/make_token.py --sub dev --ttl 3600
 
 ```bash
 curl -H "Authorization: Bearer $TOKEN" -F text="hello" http://localhost:8000/v1/tts -o out.ogg
+```
+
+`POST /v1/speak` is get-or-generate: a bank hit serves the stored OGG
+(`X-Source: bank`); a miss synthesizes via Gemini, saves it into the phrase
+bank (so the same text is a bank hit next time), and serves that
+(`X-Source: gemini`) — it needs `GEMINI_API_KEY` only when it actually has to
+generate.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" -F text="good morning" http://localhost:8000/v1/speak -o out.ogg
 ```
 
 **Health and startup.** `/health` returns **503** when the service can serve

@@ -147,18 +147,18 @@ def bank_suggest(prefix: str, lang: str = DEFAULT_LANG, limit: int = 10):
     return {"words": app.state.bank.suggest(prefix, lang, min(limit, 50))}
 
 
-def _serve_audio(rel: str, format: str):
+def _serve_audio(rel: str, format: str, headers: Optional[dict] = None):
     """Serve the OGG copy (default — what production ships) or, for dev compare,
     the WAV master (?format=wav, only if WAV_ROOT is mounted)."""
     if format == "wav":
         wav = _wav_abs(rel)
         if not os.path.exists(wav):
             raise HTTPException(404, "wav master not available (production serves ogg)")
-        return FileResponse(wav, media_type="audio/wav")
+        return FileResponse(wav, media_type="audio/wav", headers=headers)
     ogg = _ogg_abs(rel)
     if not os.path.exists(ogg):
         raise HTTPException(404, "ogg copy not available")
-    return FileResponse(ogg, media_type="audio/ogg")
+    return FileResponse(ogg, media_type="audio/ogg", headers=headers)
 
 
 @app.get("/v1/bank/{word}/info")
@@ -202,6 +202,95 @@ def phrase_get(text: str, lang: str = DEFAULT_LANG, voice: Optional[str] = None,
     if row is None:
         raise HTTPException(404, "not in phrase bank")
     return _serve_audio(row["file_path"], format)
+
+
+@app.post("/v1/speak", dependencies=[Depends(require_auth)])
+async def speak(
+    text: str = Form(...),
+    lang: Annotated[str, Form()] = DEFAULT_LANG,
+    voice: Annotated[Optional[str], Form()] = None,
+    instruct: Annotated[Optional[str], Form()] = None,
+):
+    """Get-or-generate: serve `text` from the bank (word or phrase) if it's
+    already there, otherwise synthesize it with Gemini and persist it into the
+    phrase bank so subsequent requests are served from disk. Along with
+    `/v1/voices`, this is the only other route that writes the bank.
+
+    `voice` is a Gemini prebuilt voice name (default GEMINI_TTS_VOICE); phrases
+    are stored/looked-up under the bank voice `gemini-<voice>`. Response carries
+    `X-Source: bank` or `X-Source: gemini`.
+    """
+    text = text.strip()
+    if not text:
+        raise HTTPException(400, "text must not be empty")
+    if len(text) > MAX_TEXT_LEN:
+        raise HTTPException(400, f"text exceeds {MAX_TEXT_LEN} characters")
+
+    bank_headers = {"X-Source": "bank"}
+
+    # 1. Bank lookup: single tokens may be in the word bank; anything may be in
+    # the phrase bank. A manifest row whose OGG is missing on disk is a MISS.
+    if not any(c.isspace() for c in text):
+        row = app.state.bank.get(text, lang)
+        if row is not None and os.path.exists(_ogg_abs(row["file_path"])):
+            return _serve_audio(row["file_path"], "ogg", headers=bank_headers)
+
+    row = app.state.bank.get_phrase(text, lang, voice=f"gemini-{voice}" if voice else None)
+    if row is not None and os.path.exists(_ogg_abs(row["file_path"])):
+        return _serve_audio(row["file_path"], "ogg", headers=bank_headers)
+
+    # 2. Miss -> generate with Gemini, off the event loop.
+    eff_voice = voice or GEMINI_TTS_VOICE
+
+    def _gen():
+        from wordbank.gemini_tts import synthesize_pcm  # lazy: genai
+        return synthesize_pcm(text, voice=eff_voice, instruct=instruct or "", model=GEMINI_TTS_MODEL)
+
+    try:
+        loop = asyncio.get_running_loop()
+        pcm = await loop.run_in_executor(None, _gen)
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise HTTPException(503, f"google-genai not installed: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(502, f"Gemini TTS failed: {exc}") from exc
+
+    try:
+        import numpy as np
+        from .audio import pcm_to_ogg  # lazy: needs numpy/soundfile/ffmpeg
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise HTTPException(503, f"audio encoding stack not installed: {exc}") from exc
+    audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+    ogg = pcm_to_ogg(audio)
+
+    # 3. Persist into the phrase bank (mirrors the save_voice writer below).
+    bank_voice = f"gemini-{eff_voice}"
+    from wordbank.manifest import DONE, Manifest
+    from wordbank.paths import safe_filename
+    m = Manifest(os.getenv("BANK_DB", "wordbank.db"), table="phrases", text_col="text")
+    try:
+        m.add_words([text], lang, voice=bank_voice)
+        row = m.get_entry(text, lang, bank_voice)
+        rel = os.path.join(lang, bank_voice, str(row["id"] // 1000),
+                           f"{row['id']}_{safe_filename(text)}.wav")
+        ogg_path = _ogg_abs(rel)
+        os.makedirs(os.path.dirname(ogg_path), exist_ok=True)
+        with open(ogg_path, "wb") as f:
+            f.write(ogg)
+        if os.path.isdir(app.state.wav_root):     # dev-only WAV master, best-effort
+            try:
+                from wordbank.gemini_tts import pcm_to_wav_bytes
+                wav_path = _wav_abs(rel)
+                os.makedirs(os.path.dirname(wav_path), exist_ok=True)
+                with open(wav_path, "wb") as f:
+                    f.write(pcm_to_wav_bytes(pcm))
+            except OSError:
+                pass
+        m.set_status(row["id"], DONE, file_path=rel, billed_chars=len(text), voice=bank_voice)
+    finally:
+        m.close()
+    app.state.bank.close()   # drop the memoized read conn so the new row is visible
+
+    return Response(content=ogg, media_type="audio/ogg", headers={"X-Source": "gemini"})
 
 
 @app.post("/v1/tts", dependencies=[Depends(require_auth)])
