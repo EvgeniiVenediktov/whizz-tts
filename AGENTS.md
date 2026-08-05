@@ -16,7 +16,12 @@ and `WORDBANK_PLAN.md`.
   - Install **`torch` and `torchaudio` from the same index**: `uv pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu`. Mixing the CPU index with default PyPI gives an ABI mismatch that surfaces as `OSError: Could not load .../_torchaudio.abi3.so`.
   - `src/audio.py` shells out to **ffmpeg**; `apt install ffmpeg`, or for a venv-local fallback `pip install imageio-ffmpeg` and symlink its binary into `.venv/bin/ffmpeg`.
   - Serving + the fast test suite need only: `fastapi uvicorn[standard] python-multipart pytest numpy soundfile httpx librosa`. `torch`/`omnivoice` are needed only for model tests and live synth.
-- **Tests:** `.venv/bin/pytest` (unit — fast, no model/cloud). `.venv/bin/pytest --integration tests/test_integration.py` loads OmniVoice (slow, needs the model).
+- **Tests:** `PATH="$PWD/.venv/bin:$PATH" .venv/bin/pytest` (unit — fast, no model/cloud).
+  The `PATH` prefix is **required**, not optional: `src/audio.py` shells out to `ffmpeg`,
+  which here is only a symlink inside `.venv/bin` (see the ffmpeg note below). Without it
+  7 tests fail with `FileNotFoundError: 'ffmpeg'` — a broken environment that looks like
+  broken code. Clean baseline is **91 passed, 9 skipped** in ~8s.
+  `.venv/bin/pytest --integration tests/test_integration.py` loads OmniVoice (slow, needs the model).
 - **Run server + UI (bank only):** `SERVE_FRONTEND=1 .venv/bin/uvicorn src.server:app --port 8000` → http://localhost:8000
 - **Creds:** `GEMINI_API_KEY` for word-bank generation/cleanup **and the voice-studio endpoints** (`/v1/gemini/tts`, `gemini-voice`); bank serving needs none. Secrets live in `.env` (gitignored).
 - **After editing `src/server.py` or `wordbank/lookup.py`, run `.venv/bin/pytest`** — it includes `tests/test_serves_real_bank.py`, which serves a real word from the local bank. Synthetic unit tests alone have repeatedly missed "server returns no audio" regressions (path resolution, WAL read visibility, env defaults). That test skips if no local bank, so also sanity-check by hand against the real data when you have it.

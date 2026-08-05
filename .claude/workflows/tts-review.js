@@ -98,7 +98,7 @@ log('Running 4 parallel triage auditors...')
 const [deadCode, bloat, tokenOpt, deployment] = await parallel([
 
   () => agent(
-    `You are a dead-code auditor for a Python TTS codebase at /Users/evgenii.venediktov/tts.
+    `You are a dead-code auditor for a Python TTS codebase at /home/evv/projects/whizz-tts.
 Read these files: wordbank/__main__.py, wordbank/pipeline.py, wordbank/ratelimit.py,
 wordbank/backends/local.py, wordbank/backends/base.py, requirements.txt,
 requirements-base.txt, requirements-model.txt, scripts/gemini_sync.py,
@@ -122,7 +122,7 @@ dimension value must be: "dead_code"`,
 
   () => agent(
     `You are a simplification auditor for a Python TTS MVP codebase at
-/Users/evgenii.venediktov/tts. Read these files: wordbank/gemini_batch.py,
+/home/evv/projects/whizz-tts. Read these files: wordbank/gemini_batch.py,
 wordbank/gemini_tts.py, wordbank/backends/local.py, wordbank/pipeline.py,
 wordbank/postproc.py, wordbank/manifest.py, src/server.py, src/audio.py.
 
@@ -203,7 +203,7 @@ log('Architect judge reading codebase independently...')
 
 const judgeResult = await agent(
   `You are a senior distributed-systems architect reviewing a Python TTS word-bank
-service at /Users/evgenii.venediktov/tts for production readiness. Read these files
+service at /home/evv/projects/whizz-tts for production readiness. Read these files
 INDEPENDENTLY — do not assume any prior review findings: src/server.py,
 wordbank/manifest.py, wordbank/lookup.py, wordbank/gemini_batch.py, Dockerfile,
 docker-compose.yml, docker-entrypoint.sh, README.md.
