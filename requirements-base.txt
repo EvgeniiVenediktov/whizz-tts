@@ -3,3 +3,4 @@
 fastapi>=0.111.0
 uvicorn[standard]>=0.29.0
 python-multipart>=0.0.9
+PyJWT>=2.8.0  # JWT bearer auth for write/synthesis routes; pure Python, no ML deps

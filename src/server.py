@@ -1,13 +1,15 @@
 import asyncio
+import logging
 import os
 import tempfile
 from contextlib import asynccontextmanager
 from typing import Annotated, Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 
+from .auth import require_auth
 from wordbank.gemini_tts import DEFAULT_MODEL as GEMINI_TTS_DEFAULT_MODEL
 from wordbank.lookup import BankLookup
 
@@ -47,6 +49,12 @@ async def lifespan(app: FastAPI):
     if app.state.model_enabled and _truthy(os.getenv("PRELOAD_MODEL")):
         from .model import load_model
         load_model(MODEL_ID)
+    # Auth is env-gated (JWT_SECRET) so dev setups and existing deploys keep
+    # working unauthenticated unless a secret is explicitly configured.
+    if not os.getenv("JWT_SECRET"):
+        logging.getLogger("uvicorn.error").warning(
+            "JWT_SECRET not set: /v1/tts, /v1/gemini/tts, /v1/voices are unauthenticated"
+        )
     yield
     app.state.bank.close()
 
@@ -196,7 +204,7 @@ def phrase_get(text: str, lang: str = DEFAULT_LANG, voice: Optional[str] = None,
     return _serve_audio(row["file_path"], format)
 
 
-@app.post("/v1/tts")
+@app.post("/v1/tts", dependencies=[Depends(require_auth)])
 async def tts(
     text: str = Form(...),
     ref_text: Annotated[Optional[str], Form()] = None,
@@ -267,7 +275,7 @@ async def tts(
 
 # --- Voice studio: author Gemini references, save + reuse them for cloning ---
 
-@app.post("/v1/gemini/tts")
+@app.post("/v1/gemini/tts", dependencies=[Depends(require_auth)])
 async def gemini_tts(
     text: str = Form(...),
     voice: Annotated[str, Form()] = GEMINI_TTS_VOICE,
@@ -321,7 +329,7 @@ def voice_audio(lang: str, name: str):
     return FileResponse(path, media_type=_media_type(path))
 
 
-@app.post("/v1/voices")
+@app.post("/v1/voices", dependencies=[Depends(require_auth)])
 async def save_voice(
     name: str = Form(...),
     ref_text: str = Form(...),

@@ -23,7 +23,7 @@ and `WORDBANK_PLAN.md`.
   broken code. Clean baseline is **91 passed, 9 skipped** in ~8s.
   `.venv/bin/pytest --integration tests/test_integration.py` loads OmniVoice (slow, needs the model).
 - **Run server + UI (bank only):** `SERVE_FRONTEND=1 .venv/bin/uvicorn src.server:app --port 8000` → http://localhost:8000
-- **Creds:** `GEMINI_API_KEY` for word-bank generation/cleanup **and the voice-studio endpoints** (`/v1/gemini/tts`, `gemini-voice`); bank serving needs none. Secrets live in `.env` (gitignored).
+- **Creds:** `GEMINI_API_KEY` for word-bank generation/cleanup **and the voice-studio endpoints** (`/v1/gemini/tts`, `gemini-voice`); bank serving needs none. `JWT_SECRET` (optional) — when set, `/v1/tts`, `/v1/gemini/tts`, and `POST /v1/voices` require a bearer token (unset = open, dev mode). Secrets live in `.env` (gitignored).
 - **After editing `src/server.py` or `wordbank/lookup.py`, run `.venv/bin/pytest`** — it includes `tests/test_serves_real_bank.py`, which serves a real word from the local bank. Synthetic unit tests alone have repeatedly missed "server returns no audio" regressions (path resolution, WAL read visibility, env defaults). That test skips if no local bank, so also sanity-check by hand against the real data when you have it.
 
 ## Data & state (important)
@@ -74,22 +74,21 @@ and `WORDBANK_PLAN.md`.
 3. **Multi-language support** — generation is data-driven; what's needed is a
    word list + a reference voice per language, then a verified listen before
    adding the locale to `wordbank/languages.py`.
-4. **JWT auth** — API is open; add bearer-token verification as a FastAPI
-   dependency on all write/synthesis routes (`/v1/tts`, `/v1/voices`,
-   `/v1/gemini/tts`). Read-only bank endpoints can remain public.
+4. **JWT auth** — **done.** Chosen over API-key (the review's suggestion and
+   this TODO were the same layer — one decision covers both). HS256 via
+   `JWT_SECRET`, checked by a FastAPI dependency on `/v1/tts`, `/v1/gemini/tts`,
+   and `POST /v1/voices`; read-only bank endpoints stay public. Env-gated:
+   `JWT_SECRET` unset = open/dev, set = required. Optional `JWT_AUDIENCE`/
+   `JWT_ISSUER` add claim checks. Mint tokens with `scripts/make_token.py
+   --sub <name> --ttl 3600`.
 
 ### Code-quality backlog (from `review-report.json`)
 
 The review's dead-code, bloat, and test-quality items are **done** (see git log:
 dead code removal → naming/constants → verify fix → thread-safety → tests →
-deployment hardening). What remains:
+deployment hardening → JWT auth). What remains:
 
 **Still open:**
-- **Auth** — the API is open; all write/synthesis routes (`/v1/tts`, `/v1/voices`,
-  `/v1/gemini/tts`) are unauthenticated. The review suggested an API-key
-  dependency, the TODO below calls for JWT — **they are the same layer, so pick
-  one before building it.** `CORS_ORIGINS` narrows browser access but is *not*
-  authentication and stops no non-browser client.
 - `src/device.py` has no fast-suite coverage. `tests/test_device.py` was deleted
   (all 6 tests asserted only that `unittest.mock` returns what it was told). A
   real check belongs in the `--integration` suite, against actual hardware.

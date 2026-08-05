@@ -378,6 +378,11 @@
   <p class="hint">Generate a phrase with Gemini, listen, and save good ones as OmniVoice clone references. Saved references appear in the cloning picker above. <span style="color:#c9973a">Server needs <code>GEMINI_API_KEY</code>.</span></p>
 
   <label class="field-label">
+    API token <span style="color:#444;text-transform:none;letter-spacing:0;font-size:0.75rem">only needed if the server has JWT auth enabled (<code>JWT_SECRET</code> set) — mint one with <code>scripts/make_token.py</code>; stored in this browser only</span>
+    <input type="password" id="api-token" placeholder="paste a bearer token…" autocomplete="off">
+  </label>
+
+  <label class="field-label">
     Phrase
     <textarea id="g-text">this was such a unique experience</textarea>
   </label>
@@ -447,6 +452,31 @@
   const GEMINI = `${API_BASE}/v1/gemini/tts`;
   const SEARCH = `${API_BASE}/v1/search`;
   const PHRASE = `${API_BASE}/v1/phrase`;
+
+  // ---- API token (JWT) ----
+  // Only the three write/synthesis routes (/v1/tts, /v1/gemini/tts, /v1/voices
+  // POST) need this — the server is env-gated (JWT_SECRET unset = open/dev).
+  // Stored in localStorage so it survives reloads; never sent to any other origin.
+  const apiTokenEl = document.getElementById('api-token');
+  apiTokenEl.value = localStorage.getItem('jwt_token') || '';
+  apiTokenEl.addEventListener('change', () => {
+    const v = apiTokenEl.value.trim();
+    if (v) localStorage.setItem('jwt_token', v);
+    else localStorage.removeItem('jwt_token');
+  });
+  function authHeaders() {
+    const t = localStorage.getItem('jwt_token');
+    return t ? { 'Authorization': `Bearer ${t}` } : {};
+  }
+  // Shared error-message extraction for the protected POSTs — flags 401s
+  // clearly so a missing/expired token doesn't read as a generic failure.
+  async function readError(res) {
+    const body = await res.json().catch(() => ({ detail: res.statusText }));
+    const detail = body.detail ?? res.statusText;
+    return res.status === 401
+      ? `Unauthorized — set or refresh your API token above (${detail})`
+      : detail;
+  }
 
   // ---- Word bank lookup ----
   const bankWord = document.getElementById('bank-word');
@@ -652,11 +682,8 @@
       const seed = document.getElementById('seed').value.trim();
       if (seed !== '') form.append('seed', seed);
 
-      const res = await fetch(API, { method: 'POST', body: form });
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({ detail: res.statusText }));
-        throw new Error(body.detail ?? res.statusText);
-      }
+      const res = await fetch(API, { method: 'POST', headers: authHeaders(), body: form });
+      if (!res.ok) throw new Error(await readError(res));
 
       const blob = await res.blob();
       const player = document.getElementById('player');
@@ -745,11 +772,8 @@
       form.append('voice', document.getElementById('g-voice').value.trim() || 'Kore');
       const ins = document.getElementById('g-instruct').value.trim();
       if (ins) form.append('instruct', ins);
-      const res = await fetch(GEMINI, { method: 'POST', body: form });
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({ detail: res.statusText }));
-        throw new Error(body.detail ?? res.statusText);
-      }
+      const res = await fetch(GEMINI, { method: 'POST', headers: authHeaders(), body: form });
+      if (!res.ok) throw new Error(await readError(res));
       lastGeminiWav = await res.blob();
       const player = document.getElementById('g-player');
       player.src = URL.createObjectURL(lastGeminiWav);
@@ -780,11 +804,8 @@
       if (ins) form.append('instruct', ins);
       form.append('source', 'gemini');
       form.append('audio', lastGeminiWav, `${name}.wav`);
-      const res = await fetch(VOICES, { method: 'POST', body: form });
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({ detail: res.statusText }));
-        throw new Error(body.detail ?? res.statusText);
-      }
+      const res = await fetch(VOICES, { method: 'POST', headers: authHeaders(), body: form });
+      if (!res.ok) throw new Error(await readError(res));
       status.textContent = `saved “${name}” (${lang}) — now in the cloning picker above`;
       await loadVoices(name);
     } catch (e) {

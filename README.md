@@ -150,8 +150,32 @@ SERVE_FRONTEND=1 .venv/bin/uvicorn src.server:app --port 8000
 | `PRELOAD_MODEL` | off | load weights at startup vs first request |
 | `SERVE_FRONTEND` | off | serve the static UI from the API |
 | `CORS_ORIGINS` | `*` (any) | comma-separated allowed origins. **Browser-enforced only — not authentication**; it does nothing against `curl` or any non-browser client |
+| `JWT_SECRET` | unset | enables bearer-token auth on write/synthesis routes (see [Auth](#auth)); unset = open/dev |
+| `JWT_AUDIENCE` / `JWT_ISSUER` | unset | optional — if set, tokens must carry a matching `aud`/`iss` claim |
 | `SYNC_BUCKET` / `SYNC_PREFIX` | — | pull the bank from S3 at container start (structured + quoted; preferred over `BANK_SYNC_CMD`) |
 | `BANK_SYNC_CMD` | — | escape hatch: arbitrary shell command run at container start to pull the bank into the volume. Runs via `sh -c` — **set it only from trusted configuration** |
+
+## Auth
+
+The API is **open by default** (dev mode). Setting `JWT_SECRET` turns on
+bearer-token auth for the write/synthesis routes — `POST /v1/tts`,
+`POST /v1/gemini/tts`, `POST /v1/voices` — via an HS256 `Authorization: Bearer
+<token>` check. Every `GET` endpoint and `/health` stay public either way. A
+missing/invalid/expired token gets a `401` with a `WWW-Authenticate: Bearer`
+header and a JSON `detail`. Optional `JWT_AUDIENCE` / `JWT_ISSUER` add `aud`/
+`iss` claim checks on top of the signature/expiry check.
+
+Use a secret of at least 32 bytes (e.g. `openssl rand -hex 32`) — PyJWT warns
+on shorter HS256 keys (RFC 7518). Mint a token with `scripts/make_token.py`
+(reads `JWT_SECRET` from the environment, prints the token to stdout):
+
+```bash
+JWT_SECRET=… python scripts/make_token.py --sub dev --ttl 3600
+```
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" -F text="hello" http://localhost:8000/v1/tts -o out.ogg
+```
 
 **Health and startup.** `/health` returns **503** when the service can serve
 nothing — no bank *and* `MODEL_ENABLED` off — and 200 otherwise (a model-only
@@ -190,4 +214,4 @@ pytest --integration tests/test_integration.py      # loads OmniVoice (slow)
 - [ ] **Validate voice-cloning quality** — the local phrase pipeline is wired (records seed + reference per clip) but the cloning *quality* hasn't been judged against a real accent reference. Generate an en-GB set and listen.
 - [ ] **Fill the phrase bank** — the `phrases` table, merged `/v1/search`, and the voice studio all work; what's left is authoring reference voices and generating phrase sets per accent. See AGENTS.md → *Runbook: accent bank via local OmniVoice + Gemini reference*.
 - [ ] **Add multi-language support** — same local-clone pattern per locale; serving + `/v1/languages` are already data-driven (language-scoped lookup + `(lang, word)` index), so it's mostly a generation + word-list task per language.
-- [ ] **Add JWT auth** — the API is currently open; protect it behind bearer tokens (verify signature/expiry, optional scopes for `/v1/tts` vs read-only bank access).
+- [x] **Add JWT auth** — bearer tokens (HS256, `JWT_SECRET`) protect `/v1/tts`, `/v1/gemini/tts`, and `POST /v1/voices`; read-only bank endpoints stay public. See [Auth](#auth) below.
