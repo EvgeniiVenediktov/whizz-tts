@@ -1,122 +1,186 @@
-"""Tests for the get-or-generate /v1/speak endpoint: bank hit vs. Gemini miss,
-persistence into the phrase bank, and auth/validation."""
-import numpy as np
+"""/v1/speak get-or-generate: voice selection, bank hit vs Gemini miss,
+persistence, and the saved format. Real handler over a tmp bank; Gemini faked."""
+import io
+
 import pytest
+import soundfile as sf
 from fastapi.testclient import TestClient
 
 from wordbank.manifest import DONE, Manifest
 
 
-def _fake_pcm(duration_s: float = 0.2, sample_rate: int = 24_000) -> bytes:
-    """Short 24 kHz sine as 16-bit mono PCM bytes, standing in for Gemini output."""
-    n = int(duration_s * sample_rate)
-    t = np.linspace(0, duration_s, n, endpoint=False)
-    return (np.sin(2 * np.pi * 440 * t) * 16000).astype(np.int16).tobytes()
+def _speak(client, **data):
+    return client.post("/v1/speak", data=data)
 
 
-@pytest.fixture
-def speak_client(tmp_path, monkeypatch):
-    """TestClient wired to an empty tmp bank + WAV/OGG roots, with Gemini
-    synthesis mocked. The handler's lazy `from wordbank.gemini_tts import
-    synthesize_pcm` binds at call time, so patching the module (not
-    src.server) is what actually takes effect."""
-    import wordbank.gemini_tts as gemini_tts_mod
+def _phrase_rows(paths):
+    m = Manifest(str(paths.db), table="phrases", text_col="text")
+    try:
+        return [dict(r) for r in m.iter_rows()]
+    finally:
+        m.close()
 
-    calls = []
 
-    def fake_synthesize_pcm(text, voice="Kore", instruct="", model=None):
-        calls.append((text, voice, instruct))
-        return _fake_pcm()
+def _bank_word(paths, word, voice, file_voice="Kore"):
+    """A done word with its OGG on disk; `voice=None` mimics a bank predating
+    the voice column (only the file path says which voice made it)."""
+    rel = f"en-us/gemini-{file_voice}/0/1_{word}.wav"
+    ogg = paths.ogg / (rel[:-4] + ".ogg")
+    ogg.parent.mkdir(parents=True, exist_ok=True)
+    ogg.write_bytes(b"OggS-word-" + word.encode())
+    m = Manifest(str(paths.db))
+    m.add_words([word], "en-us", voice=voice)
+    m.set_status(m.iter_rows()[0]["id"], DONE, file_path=rel, voice=voice)
+    m.close()
+    return ogg.read_bytes()
 
-    monkeypatch.setattr(gemini_tts_mod, "synthesize_pcm", fake_synthesize_pcm)
 
-    wav_root = tmp_path / "words"
-    wav_root.mkdir()   # dev WAV root present -> also exercises the WAV-master write
-    monkeypatch.setenv("BANK_DB", str(tmp_path / "wb.db"))
-    monkeypatch.setenv("OGG_ROOT", str(tmp_path / "words_ogg"))
-    monkeypatch.setenv("WAV_ROOT", str(wav_root))
+def _bank_phrase(paths, text, voice):
+    rel = f"en-us/{voice}/0/{voice}.wav"
+    ogg = paths.ogg / (rel[:-4] + ".ogg")
+    ogg.parent.mkdir(parents=True, exist_ok=True)
+    ogg.write_bytes(b"OggS-" + voice.encode())
+    m = Manifest(str(paths.db), table="phrases", text_col="text")
+    m.add_words([text], "en-us", voice=voice)
+    m.set_status(m.get_entry(text, "en-us", voice)["id"], DONE, file_path=rel, voice=voice)
+    m.close()
+    return ogg.read_bytes()
 
+
+def test_miss_generates_in_selected_voice_and_persists(client):
+    r = _speak(client, text="hello there", voice="Puck")
+
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"].startswith("audio/ogg")
+    assert r.headers["x-source"] == "gemini" and r.headers["x-voice"] == "gemini-Puck"
+    assert client.gemini.calls == [("hello there", "Puck", "")]
+    pcm, sr = sf.read(io.BytesIO(r.content))
+    assert abs(len(pcm) / sr - 0.5) < 0.05          # the whole 0.5 s clip decodes
+
+    [row] = _phrase_rows(client.paths)
+    assert row["status"] == DONE and row["voice"] == "gemini-Puck"
+    assert row["file_path"].startswith("en-us/gemini-Puck/phrases/")
+    saved = client.paths.ogg / (row["file_path"][:-4] + ".ogg")
+    assert saved.read_bytes() == r.content          # what was served is what was banked
+    assert not (client.paths.wav / row["file_path"]).exists()   # no WAV root -> no master
+
+
+def test_repeat_is_a_bank_hit_and_each_voice_is_banked_separately(client):
+    first = _speak(client, text="hello there", voice="Puck")
+    again = _speak(client, text="Hello there", voice="puck")   # text + voice case-insensitive
+    assert again.headers["x-source"] == "bank" and again.content == first.content
+
+    other = _speak(client, text="hello there", voice="Charon")
+    assert other.headers["x-source"] == "gemini" and other.headers["x-voice"] == "gemini-Charon"
+
+    assert [voice for _, voice, _ in client.gemini.calls] == ["Puck", "Charon"]
+    assert sorted(r["voice"] for r in _phrase_rows(client.paths)) == ["gemini-Charon", "gemini-Puck"]
+    results = client.get("/v1/search", params={"prefix": "hello"}).json()["results"]
+    assert {r["voice"] for r in results} == {"gemini-Puck", "gemini-Charon"}
+
+
+def test_unknown_voice_is_rejected_before_calling_gemini(client):
+    r = _speak(client, text="hello there", voice="Bogus")
+    assert r.status_code == 400 and "Bogus" in r.json()["detail"]
+    assert client.gemini.calls == []
+
+
+def test_word_bank_hit_honours_the_selected_voice(client):
+    word_ogg = _bank_word(client.paths, "cat", voice="Kore")
+
+    for data in ({"voice": "kore"}, {}):                        # same voice, or none
+        r = _speak(client, text="cat", **data)
+        assert r.headers["x-source"] == "bank" and r.content == word_ogg
+        assert r.headers["x-voice"] == "Kore"
+    assert client.gemini.calls == []
+
+    r = _speak(client, text="cat", voice="Puck")                # banked word is Kore
+    assert r.headers["x-source"] == "gemini" and r.headers["x-voice"] == "gemini-Puck"
+    assert client.gemini.calls == [("cat", "Puck", "")]
+
+
+def test_word_without_recorded_voice_matches_on_its_file_path(client):
+    word_ogg = _bank_word(client.paths, "cat", voice=None, file_voice="Kore")
+
+    assert _speak(client, text="cat", voice="Kore").content == word_ogg
+    assert _speak(client, text="cat", voice="Puck").headers["x-source"] == "gemini"
+
+
+def test_no_voice_prefers_the_default_voice_then_any_banked(client):
+    _bank_phrase(client.paths, "hello there", "gemini-Puck")    # banked first
+    kore = _bank_phrase(client.paths, "hello there", "gemini-Kore")
+    r = _speak(client, text="hello there")
+    assert r.content == kore and r.headers["x-voice"] == "gemini-Kore"
+
+    local = _bank_phrase(client.paths, "good morning", "local-en-gb")
+    r = _speak(client, text="good morning")
+    assert r.content == local and r.headers["x-voice"] == "local-en-gb"
+    assert client.gemini.calls == []
+
+    r = _speak(client, text="good morning", voice="Kore")       # pinned: local clip doesn't count
+    assert r.headers["x-source"] == "gemini" and r.headers["x-voice"] == "gemini-Kore"
+
+
+def test_instruct_is_a_one_off_render_never_banked(client):
+    _bank_phrase(client.paths, "hello there", "gemini-Puck")
+
+    for _ in range(2):
+        r = _speak(client, text="hello there", voice="Puck", instruct="whisper it")
+        assert r.status_code == 200 and r.headers["x-source"] == "gemini"
+    assert client.gemini.calls == [("hello there", "Puck", "whisper it")] * 2
+    assert [r["voice"] for r in _phrase_rows(client.paths)] == ["gemini-Puck"]  # unchanged
+
+
+def test_banked_row_whose_ogg_is_missing_is_regenerated(client):
+    _speak(client, text="hello there", voice="Puck")
+    [row] = _phrase_rows(client.paths)
+    ogg = client.paths.ogg / (row["file_path"][:-4] + ".ogg")
+    ogg.unlink()
+
+    r = _speak(client, text="hello there", voice="Puck")
+    assert r.headers["x-source"] == "gemini" and ogg.read_bytes() == r.content
+    assert len(_phrase_rows(client.paths)) == 1
+
+
+def test_gemini_failure_is_502_and_saves_nothing(client):
+    client.gemini.error = RuntimeError("quota exhausted")
+    r = _speak(client, text="hello there", voice="Puck")
+    assert r.status_code == 502 and "quota exhausted" in r.json()["detail"]
+    assert _phrase_rows(client.paths) == []
+
+
+def test_saved_clip_uses_the_bank_ogg_profile(client):
+    """Banked clips match the batch bank (16k libopus), not the 64k live default."""
+    r = _speak(client, text="hello there", voice="Puck")        # 0.5 s of noise
+    kbps = len(r.content) * 8 / 0.5 / 1000
+    assert kbps < 24, f"{kbps:.0f} kbps — not the 16k bank profile"
+
+
+def test_missing_ffmpeg_is_503_and_saves_nothing(client, monkeypatch):
+    monkeypatch.setenv("PATH", "")
+    r = _speak(client, text="hello there", voice="Puck")
+    assert r.status_code == 503 and "ffmpeg" in r.json()["detail"]
+    assert _phrase_rows(client.paths) == []
+
+
+@pytest.mark.parametrize("text", ["   ", "a" * 2001])
+def test_empty_or_too_long_text_is_400(client, text):
+    assert _speak(client, text=text).status_code == 400
+    assert client.gemini.calls == []
+
+
+def test_bankless_deploy_first_write_creates_the_bank(bank_env, fake_gemini, monkeypatch, tmp_path):
+    """No bank yet, only a Gemini key: healthy, and the first miss creates the DB
+    (parent dir included) so later requests are bank hits."""
+    db = tmp_path / "fresh" / "volume" / "wordbank.db"
+    monkeypatch.setenv("BANK_DB", str(db))
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     from src.server import app
     with TestClient(app) as c:
-        c.calls = calls
-        yield c
+        health = c.get("/health")
+        assert health.status_code == 200 and health.json()["bank"] is False
 
-
-def test_speak_miss_generates_and_persists(speak_client, tmp_path):
-    from src.server import GEMINI_TTS_VOICE
-
-    r = speak_client.post("/v1/speak", data={"text": "hello there", "lang": "en-us"})
-    assert r.status_code == 200
-    assert r.headers["content-type"].startswith("audio/ogg")
-    assert r.headers["x-source"] == "gemini"
-    assert r.content and r.content[:4] == b"OggS"
-    assert len(speak_client.calls) == 1
-
-    m = Manifest(str(tmp_path / "wb.db"), table="phrases", text_col="text")
-    row = m.get_entry("hello there", "en-us", f"gemini-{GEMINI_TTS_VOICE}")
-    assert row is not None
-    assert row["status"] == DONE
-    assert row["voice"] == f"gemini-{GEMINI_TTS_VOICE}"
-
-    rel_wav = row["file_path"]
-    ogg_path = tmp_path / "words_ogg" / (rel_wav[:-4] + ".ogg")
-    assert ogg_path.exists()
-    wav_path = tmp_path / "words" / rel_wav
-    assert wav_path.exists()   # best-effort dev master, WAV_ROOT was present
-    m.close()
-
-
-def test_speak_second_request_serves_from_bank(speak_client):
-    r1 = speak_client.post("/v1/speak", data={"text": "hello there", "lang": "en-us"})
-    assert r1.headers["x-source"] == "gemini"
-
-    r2 = speak_client.post("/v1/speak", data={"text": "hello there", "lang": "en-us"})
-    assert r2.status_code == 200
-    assert r2.headers["x-source"] == "bank"
-    assert r2.content[:4] == b"OggS"
-    assert len(speak_client.calls) == 1   # Gemini was NOT called again
-
-
-def test_speak_serves_existing_word_from_bank(speak_client, tmp_path):
-    ogg = tmp_path / "words_ogg" / "en-us/gemini-Kore/0/1_cat.ogg"
-    ogg.parent.mkdir(parents=True)
-    ogg.write_bytes(b"OggS" + b"\x00" * 50)
-
-    m = Manifest(str(tmp_path / "wb.db"))
-    m.add_words(["cat"], "en-us")
-    row_id = m.iter_rows()[0]["id"]
-    m.set_status(row_id, DONE, file_path="en-us/gemini-Kore/0/1_cat.wav", voice="Kore")
-    m.close()
-
-    r = speak_client.post("/v1/speak", data={"text": "cat", "lang": "en-us"})
-    assert r.status_code == 200
-    assert r.headers["x-source"] == "bank"
-    assert r.content[:4] == b"OggS"
-    assert speak_client.calls == []   # no Gemini call for a word-bank hit
-
-
-def test_speak_generated_phrase_appears_in_search(speak_client):
-    speak_client.post("/v1/speak", data={"text": "hello there", "lang": "en-us"})
-    results = speak_client.get(
-        "/v1/search", params={"prefix": "hello", "lang": "en-us"}
-    ).json()["results"]
-    assert any(r["text"] == "hello there" and r["type"] == "phrase" for r in results)
-
-
-def test_speak_requires_auth_when_secret_set(speak_client, monkeypatch):
-    monkeypatch.setenv("JWT_SECRET", "test-secret-0123456789abcdef0123456789abcdef")
-    r = speak_client.post("/v1/speak", data={"text": "hello there"})
-    assert r.status_code == 401
-    assert speak_client.calls == []
-
-
-def test_speak_text_too_long_400(speak_client):
-    r = speak_client.post("/v1/speak", data={"text": "a" * 2001})
-    assert r.status_code == 400
-    assert speak_client.calls == []
-
-
-def test_speak_empty_text_400(speak_client):
-    r = speak_client.post("/v1/speak", data={"text": "   "})
-    assert r.status_code == 400
-    assert speak_client.calls == []
+        assert _speak(c, text="hello there").headers["x-source"] == "gemini"
+        assert db.exists()
+        assert _speak(c, text="hello there").headers["x-source"] == "bank"
+        assert c.get("/health").json()["bank"] is True

@@ -1,6 +1,7 @@
 # Two flavors via --build-arg WITH_MODEL, and two --target stages for how the
 # bank gets onto the container:
-#   WITH_MODEL=0 (default) → lightweight bank-only server (~150 MB, no torch)
+#   WITH_MODEL=0 (default) → lightweight bank server, no torch: serves the bank
+#                            and fills misses via Gemini (/v1/speak)
 #   WITH_MODEL=1           → adds live OmniVoice synthesis (multi-GB, CPU torch)
 #
 #   --target runtime (default) → CODE ONLY, never stores the bank. The bank
@@ -25,12 +26,18 @@ WORKDIR /app
 
 ARG WITH_MODEL=0
 
-# Base server deps (always).
+# Base server deps (always). src/audio.py calls `ffmpeg` from PATH, so expose
+# imageio-ffmpeg's static binary there (/v1/speak encodes Gemini output to OGG).
 COPY requirements-base.txt requirements-model.txt ./
-RUN pip install -r requirements-base.txt
+RUN pip install -r requirements-base.txt && \
+    ln -s "$(python -c 'import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())')" \
+        /usr/local/bin/ffmpeg && \
+    ffmpeg -hide_banner -encoders | grep -q libopus
 
-# Optional ML stack + ffmpeg, only for the model build. CPU torch from the
-# dedicated wheel index keeps it as small as possible (no CUDA).
+# Optional ML stack, only for the model build. (Its apt ffmpeg predates the
+# base layer's static one; kept so the model build's audio decoding is
+# unchanged.) CPU torch from the dedicated wheel index keeps it as small as
+# possible (no CUDA).
 RUN if [ "$WITH_MODEL" = "1" ]; then \
         apt-get update && apt-get install -y --no-install-recommends ffmpeg && \
         rm -rf /var/lib/apt/lists/* && \

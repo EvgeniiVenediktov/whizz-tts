@@ -217,6 +217,10 @@
     <input type="text" id="bank-word" list="bank-suggest" placeholder="type a word or phrase…" autocomplete="off">
     <datalist id="bank-suggest"></datalist>
   </label>
+  <label class="field-label">
+    Speak voice <span style="color:#444;text-transform:none;letter-spacing:0;font-size:0.75rem">— Gemini voice for Speak; “any” serves whatever is banked, else generates in the default voice</span>
+    <select id="bank-voice"><option value="">— any banked / default —</option></select>
+  </label>
   <div class="submit-row">
     <button type="submit" id="bank-play-btn">Look up</button>
     <button type="submit" id="bank-speak-btn">Speak (generate if missing)</button>
@@ -583,9 +587,12 @@
     try {
       const form = new FormData();
       form.append('text', text);
+      const voice = document.getElementById('bank-voice').value;
+      if (voice) form.append('voice', voice);
       const res = await fetch(SPEAK, { method: 'POST', headers: authHeaders(), body: form });
       if (!res.ok) throw new Error(await readError(res));
       const fromBank = res.headers.get('X-Source') === 'bank';
+      const gotVoice = res.headers.get('X-Voice');
       const blob = await res.blob();
 
       bankCompare.style.display = 'flex';
@@ -597,7 +604,8 @@
       oggPlayer.src = URL.createObjectURL(blob);
       oggPlayer.play();
 
-      bankStatus.textContent = fromBank ? 'speak: served from bank' : 'speak: generated + saved to bank';
+      bankStatus.textContent = (fromBank ? 'speak: served from bank' : 'speak: generated + saved to bank')
+        + (gotVoice ? ` · voice: ${gotVoice}` : '');
       if (!fromBank) await refreshSuggestions(text);   // now indexed — show it as banked
     } catch (e) {
       bankStatus.textContent = e.message;
@@ -764,21 +772,24 @@
   }
   loadVoices();
 
-  // Populate the Gemini voice dropdown — 30 style presets, not language-bound.
-  // Grouped Female / Male (community-perceived gender).
+  // Populate the Gemini voice dropdowns (studio + Speak) — 30 style presets,
+  // not language-bound. Grouped Female / Male (community-perceived gender).
   async function loadGeminiVoices() {
     try {
       const res = await fetch(`${API_BASE}/v1/gemini/voices`);
       const { voices } = await res.json();
-      const sel = document.getElementById('g-voice');
       const group = (label, gender) => {
         const items = voices.filter(v => v.gender === gender);
         return items.length ? `<optgroup label="${label}">` + items.map(v =>
           `<option value="${v.name}">${v.name} — ${v.style}</option>`).join('') + '</optgroup>' : '';
       };
-      sel.innerHTML = group('Female', 'female') + group('Male', 'male');
+      const options = group('Female', 'female') + group('Male', 'male');
+      const sel = document.getElementById('g-voice');
+      sel.innerHTML = options;
       sel.value = 'Kore';
-    } catch { /* keep the default Kore option */ }
+      const speakSel = document.getElementById('bank-voice');
+      speakSel.innerHTML = speakSel.options[0].outerHTML + options;
+    } catch { /* keep the default options */ }
   }
   loadGeminiVoices();
 

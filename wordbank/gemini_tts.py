@@ -6,6 +6,7 @@ Lazily imports google-genai; needs GEMINI_API_KEY in the environment.
 """
 import io
 import wave
+from typing import Optional
 
 from .constants import SAMPLE_RATE  # Gemini TTS emits 24 kHz / 16-bit mono PCM
 DEFAULT_MODEL = "gemini-2.5-flash-preview-tts"
@@ -34,6 +35,16 @@ VOICES = [
     ("Vindemiatrix", "Gentle", "female"), ("Sadachbia", "Lively", "male"),
     ("Sadaltager", "Knowledgeable", "male"), ("Sulafat", "Warm", "female"),
 ]
+
+_VOICE_NAMES = {name.lower(): name for name, _, _ in VOICES}
+
+
+def canonical_voice(name: str) -> Optional[str]:
+    """Case-insensitive match against VOICES -> the canonical spelling ("puck"
+    -> "Puck"), or None if it isn't a prebuilt voice. Banked clips are keyed by
+    voice name, so normalizing here keeps "puck"/"Puck" one bank entry."""
+    return _VOICE_NAMES.get(name.strip().lower())
+
 
 _client = None
 

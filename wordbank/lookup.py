@@ -9,6 +9,8 @@ import sqlite3
 import threading
 from typing import List, Optional
 
+from .paths import voice_from_path
+
 _READY = ("done", "verified")
 _READY_SQL = "status IN ({})".format(", ".join(f"'{s}'" for s in _READY))
 
@@ -92,24 +94,36 @@ class BankLookup:
             ).fetchall()
         return [{"code": r[0], "words": r[1]} for r in rows]
 
-    def get(self, word: str, lang: str = "en") -> Optional[sqlite3.Row]:
-        """Exact word match (case-insensitive). Returns the row or None."""
+    def get(self, word: str, lang: str = "en",
+            voice: Optional[str] = None) -> Optional[sqlite3.Row]:
+        """Exact word match (case-insensitive). Returns the row or None.
+
+        If `voice` (a bare Gemini name, e.g. "Kore") is given, the word must have
+        been generated with it. Rows without a recorded voice (banks predating the
+        column, or not yet backfilled) fall back to the voice in their file_path.
+        """
         w = word.strip().lower()
         with self._lock:
             self._open()
             if self._conn is None:
                 return None
-            voice = "voice" if self._words_has_voice else "NULL AS voice"
-            return self._conn.execute(
-                f"SELECT word, lang, file_path, status, {voice} FROM words "
+            cols = "voice" if self._words_has_voice else "NULL AS voice"
+            row = self._conn.execute(
+                f"SELECT word, lang, file_path, status, {cols} FROM words "
                 f"WHERE word = ? AND lang = ? AND {_READY_SQL}",
                 (w, lang),
             ).fetchone()
+        if row is not None and voice is not None:
+            row_voice = row["voice"] or voice_from_path(row["file_path"] or "")
+            if row_voice != voice:
+                return None
+        return row
 
     def get_phrase(self, text: str, lang: str = "en",
                    voice: Optional[str] = None) -> Optional[sqlite3.Row]:
         """Exact phrase match (case-insensitive). If voice is omitted, returns any
-        voice for that phrase. Returns the row or None (also None if no phrases)."""
+        voice for that phrase (the earliest banked, so the choice is stable).
+        Returns the row or None (also None if no phrases)."""
         with self._lock:
             self._open()
             if self._conn is None or not self._has_phrases:
@@ -126,7 +140,7 @@ class BankLookup:
             if voice is not None:
                 sql += " AND voice = ?"
                 params.append(voice)
-            return self._conn.execute(sql + " LIMIT 1", params).fetchone()
+            return self._conn.execute(sql + " ORDER BY id LIMIT 1", params).fetchone()
 
     def search(self, prefix: str, lang: str = "en", limit: int = 10,
                kind: Optional[str] = None) -> List[dict]:

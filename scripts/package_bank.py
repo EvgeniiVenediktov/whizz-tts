@@ -19,6 +19,9 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).parent.parent
+sys.path.insert(0, str(ROOT))
+
+from wordbank.constants import BANK_OGG_APPLICATION, BANK_OGG_BITRATE  # noqa: E402
 
 
 def _stage_ogg(ogg_root: str, dst: pathlib.Path) -> int:
@@ -42,8 +45,8 @@ def main() -> None:
     p.add_argument("--ogg-root", default="output/words_ogg", help="OGG copies (encoded here)")
     p.add_argument("--db", default="wordbank.db", help="manifest")
     p.add_argument("--out-dir", default="dist/bank", help="staging dir you upload from")
-    p.add_argument("--bitrate", default="16k")
-    p.add_argument("--application", default="voip", choices=["voip", "audio", "lowdelay"])
+    p.add_argument("--bitrate", default=BANK_OGG_BITRATE)
+    p.add_argument("--application", default=BANK_OGG_APPLICATION, choices=["voip", "audio", "lowdelay"])
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--force", action="store_true", help="re-encode existing OGG copies")
     args = p.parse_args()

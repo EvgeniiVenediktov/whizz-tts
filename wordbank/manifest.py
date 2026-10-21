@@ -109,6 +109,36 @@ class Manifest:
                     self._conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {decl}")
                 except sqlite3.OperationalError:
                     pass  # column already exists
+        self._migrate_phrase_key()
+
+    def _migrate_phrase_key(self) -> None:
+        """`phrases` tables created before `voice` existed carry UNIQUE(text, lang),
+        which ALTER can't widen: the same text in a second voice was silently
+        dropped by INSERT OR IGNORE (and /v1/speak then failed to find its row).
+        Rebuild such a table once with the current UNIQUE(text, lang, voice)."""
+        keys = [
+            [c[2] for c in self._conn.execute(f'PRAGMA index_info("{idx[1]}")')]
+            for idx in self._conn.execute("PRAGMA index_list(phrases)")
+            if idx[2] and idx[3] == "u"
+        ]
+        if ["text", "lang"] not in keys:
+            return
+        cols = ", ".join(r[1] for r in self._conn.execute("PRAGMA table_info(phrases)"))
+        start = _SCHEMA.index("CREATE TABLE IF NOT EXISTS phrases")
+        create = _SCHEMA[start:_SCHEMA.index(");", start) + 2]
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                self._conn.execute("ALTER TABLE phrases RENAME TO phrases_old")
+                self._conn.execute(create)
+                self._conn.execute(f"INSERT INTO phrases ({cols}) SELECT {cols} FROM phrases_old")
+                self._conn.execute("DROP TABLE phrases_old")
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_phrases_lang_text ON phrases(lang, text)")
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
 
     def close(self) -> None:
         with self._lock:

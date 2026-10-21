@@ -17,9 +17,11 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pytest
-import torch
 
-import src.model as model_mod
+torch = pytest.importorskip("torch")       # real src.model: needs the model build
+pytest.importorskip("omnivoice")
+
+import src.model as model_mod  # noqa: E402
 
 
 @pytest.fixture

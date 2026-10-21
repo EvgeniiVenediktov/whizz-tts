@@ -1,16 +1,47 @@
-"""Unit tests for the /v1/tts and /health endpoints (model mocked)."""
+"""/health, CORS, and /v1/tts (OmniVoice faked via the `fake_model` fixture)."""
+import io
+import os
+import sys
+
+import numpy as np
+import pytest
+import soundfile as sf
+from fastapi.testclient import TestClient
+
+from wordbank.manifest import DONE, Manifest
 
 
-def test_health(client):
-    r = client.get("/health")
-    assert r.status_code == 200
+def _tts_pcm(client, **data):
+    r = client.post("/v1/tts", data=data)
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"] == "audio/ogg"
+    return sf.read(io.BytesIO(r.content))[0]
+
+
+@pytest.mark.parametrize("bank,model,gemini,status", [
+    (True, False, False, 200),
+    (False, True, False, 200),     # live-synthesis-only deploy
+    (False, False, True, 200),     # Gemini get-or-generate deploy (/v1/speak)
+    (False, False, False, 503),    # can serve nothing
+])
+def test_health_is_healthy_iff_something_can_serve(bank_env, fake_model, monkeypatch,
+                                                   bank, model, gemini, status):
+    if bank:
+        m = Manifest(str(bank_env.db))
+        m.add_words(["cat"], "en-us")
+        m.set_status(m.iter_rows()[0]["id"], DONE, file_path="en-us/x/0/1_cat.wav")
+        m.close()
+    if model:
+        monkeypatch.setenv("MODEL_ENABLED", "1")
+    if gemini:
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    from src.server import app
+    with TestClient(app) as c:
+        r = c.get("/health")
     body = r.json()
-    assert body["status"] == "ok"
-    assert "device" in body
-    assert "model" in body
-    # bank available (real wordbank.db) -> healthy regardless of MODEL_ENABLED.
-    assert body["healthy"] is True
-    assert body["bank"] is True
+    assert r.status_code == status and body["healthy"] is (status == 200)
+    assert (body["bank"], body["model_enabled"], body["gemini"]) == (bank, model, gemini)
+    assert body["bank_words"] == (1 if bank else 0)
 
 
 def test_cors_default_allows_any_origin(client):
@@ -19,158 +50,7 @@ def test_cors_default_allows_any_origin(client):
     assert r.headers.get("access-control-allow-origin") == "*"
 
 
-def test_tts_no_ref(client):
-    """Text only — auto voice mode."""
-    r = client.post("/v1/tts", data={"text": "Hello world"})
-    assert r.status_code == 200
-    assert r.headers["content-type"] == "audio/ogg"
-    assert r.content[:4] == b"OggS"
-
-
-def test_tts_with_ref_audio_and_text(client, silent_wav):
-    r = client.post(
-        "/v1/tts",
-        data={"text": "Hello world", "ref_text": "This is my voice."},
-        files={"ref_audio": ("ref.wav", silent_wav, "audio/wav")},
-    )
-    assert r.status_code == 200
-    assert r.content[:4] == b"OggS"
-
-
-def test_tts_with_ref_audio_no_ref_text(client, silent_wav):
-    """ref_audio without ref_text — model should auto-transcribe."""
-    r = client.post(
-        "/v1/tts",
-        data={"text": "Hello world"},
-        files={"ref_audio": ("ref.wav", silent_wav, "audio/wav")},
-    )
-    assert r.status_code == 200
-    assert r.content[:4] == b"OggS"
-
-
-def test_tts_text_too_long(client):
-    r = client.post("/v1/tts", data={"text": "x" * 2001})
-    assert r.status_code == 400
-
-
-def test_tts_ref_audio_too_large(client):
-    big = b"\x00" * (10 * 1024 * 1024 + 1)
-    r = client.post(
-        "/v1/tts",
-        data={"text": "Hello"},
-        files={"ref_audio": ("big.wav", big, "audio/wav")},
-    )
-    assert r.status_code == 413
-
-
-def test_tts_missing_text(client):
-    r = client.post("/v1/tts", data={})
-    assert r.status_code == 422
-
-
-def test_tts_forwards_guidance_and_seed(client):
-    """seed (int) determines the generated audio: same seed -> identical
-    response bytes, different seed -> different bytes.
-
-    This drives the real HTTP contract (request in, audio out) rather than
-    inspecting the kwargs generate() was called with, so it survives a
-    refactor to how guidance_scale/seed are threaded through internally
-    (e.g. bundled into a dataclass) as long as the seed still determines
-    the output.
-    """
-    import io
-
-    import numpy as np
-    import soundfile as sf
-    import src.model as model_mod
-    from unittest.mock import patch
-
-    import zlib
-
-    def deterministic_generate(text, ref_audio_path=None, ref_text=None,
-                                instruct=None, guidance_scale=None, seed=None):
-        # Stand-in model: PCM is a pure function of every value the handler
-        # forwards, so dropping any one of them changes the audio.
-        key = f"{seed}|{guidance_scale}|{instruct}|{text}".encode()
-        rng = np.random.RandomState(zlib.crc32(key))
-        return rng.uniform(-1, 1, 4800).astype(np.float32)
-
-    def synth(seed, guidance="3.5"):
-        with patch.object(model_mod, "generate", deterministic_generate):
-            r = client.post(
-                "/v1/tts",
-                data={"text": "hi", "instruct": "female",
-                      "guidance_scale": guidance, "seed": str(seed)},
-            )
-        assert r.status_code == 200
-        assert r.headers["content-type"] == "audio/ogg"
-        pcm, _ = sf.read(io.BytesIO(r.content))
-        return pcm
-
-    pcm_seed_42_a = synth(42)
-    pcm_seed_42_b = synth(42)
-    pcm_seed_43 = synth(43)
-
-    assert np.array_equal(pcm_seed_42_a, pcm_seed_42_b)        # same seed -> identical audio
-    assert not np.array_equal(pcm_seed_42_a, pcm_seed_43)      # different seed -> different audio
-
-    # guidance_scale must reach the model too (the endpoint accepts it, so a
-    # handler that silently dropped it would otherwise go unnoticed).
-    assert not np.array_equal(pcm_seed_42_a, synth(42, guidance="7.0"))
-
-
-def test_tts_disabled_returns_503(monkeypatch, tmp_path):
-    """With MODEL_ENABLED off, /v1/tts is unavailable but the bank still serves."""
-    monkeypatch.setenv("MODEL_ENABLED", "0")
-    monkeypatch.setenv("BANK_DB", str(tmp_path / "none.db"))
-    import src.server as server_mod
-    from fastapi.testclient import TestClient
-    with TestClient(server_mod.app) as c:
-        assert c.post("/v1/tts", data={"text": "hi"}).status_code == 503
-        assert c.get("/health").json()["model_enabled"] is False
-
-
-# NOTE: the tests below each spin up their own TestClient (re-running lifespan
-# on the shared module-level app, like test_tts_disabled_returns_503 above) or
-# reload the module outright, both of which mutate/replace state the module-
-# scoped `client` fixture depends on. They must stay after every `client`-based
-# test in this file.
-
-def test_health_503_when_bank_unavailable_and_model_disabled(monkeypatch, tmp_path):
-    """Neither the bank nor live synthesis can serve anything -> 503."""
-    monkeypatch.setenv("MODEL_ENABLED", "0")
-    monkeypatch.setenv("BANK_DB", str(tmp_path / "none.db"))
-    import src.server as server_mod
-    from fastapi.testclient import TestClient
-    with TestClient(server_mod.app) as c:
-        r = c.get("/health")
-        assert r.status_code == 503
-        body = r.json()
-        assert body["healthy"] is False
-        assert body["bank"] is False
-        assert body["model_enabled"] is False
-        # body shape unchanged -- same keys as the healthy case.
-        assert set(body) >= {"status", "healthy", "model", "model_enabled",
-                              "bank", "bank_path", "bank_words"}
-
-
-def test_health_200_when_model_only(monkeypatch, tmp_path):
-    """No bank, but MODEL_ENABLED on -> still healthy (model-only deploy is
-    legitimate; this is the regression test for the bank-only 503 mistake)."""
-    monkeypatch.setenv("MODEL_ENABLED", "1")
-    monkeypatch.setenv("BANK_DB", str(tmp_path / "none.db"))
-    import src.server as server_mod
-    from fastapi.testclient import TestClient
-    with TestClient(server_mod.app) as c:
-        r = c.get("/health")
-        assert r.status_code == 200
-        body = r.json()
-        assert body["healthy"] is True
-        assert body["bank"] is False
-        assert body["model_enabled"] is True
-
-
-def test_cors_restricted_rejects_disallowed_origin(monkeypatch):
+def test_cors_restricted_rejects_disallowed_origin(bank_env, monkeypatch):
     """CORS_ORIGINS set -> only listed origins are reflected back; the
     middleware is configured at import time from the env, so this needs a
     fresh module reload with the env var already set."""
@@ -179,13 +59,75 @@ def test_cors_restricted_rejects_disallowed_origin(monkeypatch):
     monkeypatch.setenv("CORS_ORIGINS", " https://app.example.com , ")
     importlib.reload(server_mod)
     try:
-        from fastapi.testclient import TestClient
         with TestClient(server_mod.app) as c:
             allowed = c.get("/health", headers={"Origin": "https://app.example.com"})
             assert allowed.headers.get("access-control-allow-origin") == "https://app.example.com"
-
             disallowed = c.get("/health", headers={"Origin": "https://evil.example.com"})
             assert "access-control-allow-origin" not in disallowed.headers
     finally:
         monkeypatch.delenv("CORS_ORIGINS", raising=False)
         importlib.reload(server_mod)  # restore the default wildcard config
+
+
+def test_tts_text_only_reaches_model_without_reference(client):
+    pcm = _tts_pcm(client, text="Hello world")
+    assert len(pcm) > 0
+    [call] = client.model.calls
+    assert call["text"] == "Hello world"
+    assert call["ref_audio_path"] is None and call["ref_text"] is None
+
+
+@pytest.mark.parametrize("ref_text", ["This is my voice.", None])
+def test_tts_uploaded_reference_reaches_model_then_is_deleted(client, silent_wav, ref_text):
+    data = {"text": "Hello world", **({"ref_text": ref_text} if ref_text else {})}
+    r = client.post("/v1/tts", data=data,
+                    files={"ref_audio": ("ref.wav", silent_wav, "audio/wav")})
+    assert r.status_code == 200, r.text
+    [call] = client.model.calls
+    assert call["ref_bytes"] == silent_wav          # the upload itself, byte for byte
+    assert call["ref_text"] == ref_text             # None -> model auto-transcribes
+    assert not os.path.exists(call["ref_audio_path"])   # temp clip cleaned up
+
+
+def test_tts_seed_and_guidance_determine_the_audio(client):
+    """Drives the HTTP contract (request in, audio out): the fake model's output
+    is a pure function of its inputs, so a dropped field changes nothing."""
+    def synth(seed, guidance="3.5"):
+        return _tts_pcm(client, text="hi", instruct="female",
+                        guidance_scale=guidance, seed=str(seed))
+
+    a = synth(42)
+    assert np.array_equal(a, synth(42))
+    assert not np.array_equal(a, synth(43))
+    assert not np.array_equal(a, synth(42, guidance="7.0"))
+
+
+def test_tts_text_too_long(client):
+    assert client.post("/v1/tts", data={"text": "x" * 2001}).status_code == 400
+    assert client.model.calls == []
+
+
+def test_tts_ref_audio_too_large(client):
+    big = b"\x00" * (10 * 1024 * 1024 + 1)
+    r = client.post("/v1/tts", data={"text": "Hello"},
+                    files={"ref_audio": ("big.wav", big, "audio/wav")})
+    assert r.status_code == 413
+    assert client.model.calls == []
+
+
+def test_tts_disabled_returns_503(bank_env):
+    """With MODEL_ENABLED off, /v1/tts is unavailable."""
+    from src.server import app
+    with TestClient(app) as c:
+        assert c.post("/v1/tts", data={"text": "hi"}).status_code == 503
+
+
+def test_tts_enabled_without_model_build_returns_503(bank_env, monkeypatch):
+    """MODEL_ENABLED=1 on a bank-only image (no torch/omnivoice) is a clear
+    503, not a 500 from a failed import."""
+    monkeypatch.setenv("MODEL_ENABLED", "1")
+    monkeypatch.setitem(sys.modules, "src.model", None)    # makes the import fail
+    from src.server import app
+    with TestClient(app) as c:
+        r = c.post("/v1/tts", data={"text": "hi"})
+    assert r.status_code == 503 and "not available" in r.json()["detail"]

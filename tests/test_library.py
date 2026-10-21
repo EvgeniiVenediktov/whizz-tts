@@ -132,3 +132,30 @@ def test_verify_explicit_kwargs_beat_root(tmp_path):
                       ogg_root=str(tmp_path / "words_ogg"),
                       voices_root=str(tmp_path / "voices"))
     assert problems == []
+
+
+def test_verify_accepts_a_bank_grown_at_runtime(tmp_path):
+    """/v1/speak adds phrases + OGGs to the live volume. A restart must still
+    verify, or the entrypoint re-unpacks the archive over the grown DB."""
+    _seed_root(tmp_path)
+    db = str(tmp_path / "wordbank.db")
+    desc = describe(db, str(tmp_path / "words_ogg"), str(tmp_path / "voices"))
+    (tmp_path / "library.json").write_text(json.dumps(desc))
+
+    pm = Manifest(db, table="phrases", text_col="text")
+    pm.add_words(["good morning"], "en-us", voice="gemini-Puck")
+    rel = "en-us/gemini-Puck/phrases/0/2_good-morning.wav"
+    pm.set_status(pm.get_entry("good morning", "en-us", "gemini-Puck")["id"], DONE,
+                  file_path=rel, voice="gemini-Puck")
+    pm.close()
+    ogg = tmp_path / "words_ogg" / (rel[:-4] + ".ogg")
+    ogg.parent.mkdir(parents=True)
+    ogg.write_bytes(b"OggS")
+    assert verify(str(tmp_path / "library.json"), str(tmp_path)) == []
+
+    # Words are never added at runtime, so a word-count change is still drift.
+    wm = Manifest(db)
+    wm.add_words(["emu"], "en-us")
+    wm.set_status(wm.get_entry("emu", "en-us")["id"], DONE, file_path="en-us/x/0/9_emu.wav")
+    wm.close()
+    assert any("word count" in p for p in verify(str(tmp_path / "library.json"), str(tmp_path)))

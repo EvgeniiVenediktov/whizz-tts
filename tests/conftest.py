@@ -1,5 +1,8 @@
 import io
+import sys
+import types
 import wave
+import zlib
 
 import numpy as np
 import pytest
@@ -33,6 +36,13 @@ def make_wav_bytes(duration_s: float = 1.0, sample_rate: int = 24_000) -> bytes:
     return buf.getvalue()
 
 
+def noise_pcm16(duration_s: float = 1.0, sample_rate: int = 24_000, seed: int = 0) -> bytes:
+    """White noise as 16-bit mono PCM bytes (Gemini's output format). Noise, not
+    a tone, so Opus actually spends its bitrate and file size reflects it."""
+    rng = np.random.RandomState(seed)
+    return (rng.uniform(-0.5, 0.5, int(duration_s * sample_rate)) * 32767).astype("<i2").tobytes()
+
+
 class FakeBackend:
     """Generic TTSBackend test double — returns a short sine clip as PCM."""
     name = "fake"
@@ -51,42 +61,82 @@ def silent_wav() -> bytes:
 
 
 @pytest.fixture
-def client():
-    """FastAPI test client with the model enabled but mocked out.
+def bank_env(tmp_path, monkeypatch):
+    """Point the server at an empty tmp bank (BANK_DB / OGG_ROOT / WAV_ROOT /
+    VOICES_ROOT), so no test reads or writes the developer's real bank."""
+    paths = types.SimpleNamespace(
+        db=tmp_path / "wb.db", ogg=tmp_path / "words_ogg",
+        wav=tmp_path / "words", voices=tmp_path / "voices",
+    )
+    monkeypatch.setenv("BANK_DB", str(paths.db))
+    monkeypatch.setenv("OGG_ROOT", str(paths.ogg))
+    monkeypatch.setenv("WAV_ROOT", str(paths.wav))
+    monkeypatch.setenv("VOICES_ROOT", str(paths.voices))
+    for var in ("JWT_SECRET", "GEMINI_API_KEY", "GOOGLE_API_KEY", "MODEL_ENABLED"):
+        monkeypatch.delenv(var, raising=False)
+    return paths
 
-    The synth handler imports src.model lazily, so we patch the names on
-    src.model (the lazy `from .model import ...` binds to them at call time).
-    MODEL_ENABLED is forced on so /v1/tts is reachable.
 
-    Function-scoped ON PURPOSE. `src.server.app` is a module-level singleton, so
-    a module-scoped client stays open across other tests — and any test that
-    opens its own TestClient on that same app (to check env-dependent behavior)
-    wipes `app.state` on exit, leaving this client's app half torn down. That
-    surfaced as `AttributeError: 'State' object has no attribute 'model_enabled'`
-    in whichever unrelated test happened to run next, so the suite only passed
-    in declaration order. Re-entering the lifespan per test is cheap (the model
-    is mocked) and removes the ordering hazard entirely.
+@pytest.fixture
+def fake_model(monkeypatch):
+    """Stand-in for `src.model`, installed in sys.modules so the server's lazy
+    `from .model import ...` binds to it — the suite needs no torch/omnivoice.
+
+    generate() returns PCM that is a pure function of every argument (and of the
+    reference clip's bytes), so tests can check what reached the model through
+    the audio itself; `calls` also records each call's arguments.
     """
-    import os
-    import src.model as model_mod
-    import src.server as server_mod
-    from unittest.mock import patch
+    mod = types.ModuleType("src.model")
+    mod.calls = []
 
-    def fake_generate(text, ref_audio_path=None, ref_text=None,
-                      instruct=None, guidance_scale=None, seed=None):
-        return np.zeros(12_000, dtype=np.float32)
+    def generate(text, ref_audio_path=None, ref_text=None, instruct=None,
+                 guidance_scale=None, seed=None):
+        ref_bytes = open(ref_audio_path, "rb").read() if ref_audio_path else None
+        mod.calls.append(dict(text=text, ref_audio_path=ref_audio_path, ref_bytes=ref_bytes,
+                              ref_text=ref_text, instruct=instruct,
+                              guidance_scale=guidance_scale, seed=seed))
+        key = f"{text}|{ref_bytes!r}|{ref_text}|{instruct}|{guidance_scale}|{seed}".encode()
+        return np.random.RandomState(zlib.crc32(key)).uniform(-1, 1, 4800).astype(np.float32)
 
-    prev = os.environ.get("MODEL_ENABLED")
-    os.environ["MODEL_ENABLED"] = "1"
-    try:
-        with patch.object(model_mod, "_model", object()), \
-             patch.object(model_mod, "_device", "cpu"), \
-             patch.object(model_mod, "ensure_loaded", lambda *a, **kw: None), \
-             patch.object(model_mod, "generate", fake_generate):
-            with TestClient(server_mod.app) as c:
-                yield c
-    finally:
-        if prev is None:
-            os.environ.pop("MODEL_ENABLED", None)
-        else:
-            os.environ["MODEL_ENABLED"] = prev
+    mod.generate = generate
+    mod.ensure_loaded = lambda *a, **kw: None
+    mod.load_model = lambda *a, **kw: None
+    mod.get_device = lambda: "cpu"
+    mod.is_loaded = lambda: True
+    monkeypatch.setitem(sys.modules, "src.model", mod)
+    return mod
+
+
+@pytest.fixture
+def fake_gemini(monkeypatch):
+    """Patch Gemini synthesis (the handlers import it lazily from
+    wordbank.gemini_tts, so patching the module is what takes effect).
+    `calls` records (text, voice, instruct); set `error` to make it raise."""
+    import wordbank.gemini_tts as gemini_tts_mod
+
+    state = types.SimpleNamespace(calls=[], error=None)
+
+    def synthesize_pcm(text, voice="Kore", instruct="", model=None):
+        state.calls.append((text, voice, instruct))
+        if state.error is not None:
+            raise state.error
+        return noise_pcm16(0.5, seed=zlib.crc32(f"{text}|{voice}|{instruct}".encode()))
+
+    monkeypatch.setattr(gemini_tts_mod, "synthesize_pcm", synthesize_pcm)
+    return state
+
+
+@pytest.fixture
+def client(bank_env, fake_model, fake_gemini, monkeypatch):
+    """App client over an empty tmp bank, with the model enabled but faked and
+    Gemini faked. `client.model` / `client.gemini` expose the fakes.
+
+    Function-scoped ON PURPOSE: `src.server.app` is a module-level singleton and
+    TestClient re-runs its lifespan, so a longer-lived client would be torn down
+    by any test that opens its own.
+    """
+    monkeypatch.setenv("MODEL_ENABLED", "1")
+    from src.server import app
+    with TestClient(app) as c:
+        c.model, c.gemini, c.paths = fake_model, fake_gemini, bank_env
+        yield c

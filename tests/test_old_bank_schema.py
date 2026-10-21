@@ -7,7 +7,10 @@ on the real 2025 word bank that fresh-schema test fixtures could never catch.
 """
 import sqlite3
 
+from fastapi.testclient import TestClient
+
 from wordbank.lookup import BankLookup
+from wordbank.manifest import Manifest
 
 _OLD_SCHEMA = """
 CREATE TABLE words (
@@ -74,3 +77,34 @@ def test_search_on_old_schema_bank(tmp_path):
     assert [r["text"] for r in results] == ["good morning"]
     assert results[0]["type"] == "phrase" and results[0]["voice"] is None
     bank.close()
+
+
+def test_manifest_migrates_old_phrase_key_so_a_second_voice_fits(tmp_path):
+    """Old phrases tables have UNIQUE(text, lang); ALTER adds `voice` but can't
+    widen the key, so the same text in another voice used to be silently dropped."""
+    db = str(tmp_path / "old.db")
+    _make_old_bank(db)
+    m = Manifest(db, table="phrases", text_col="text")
+    assert m.add_words(["good morning"], "en-us", voice="gemini-Puck") == 1
+    assert m.add_words(["good morning"], "en-us", voice="gemini-Puck") == 0   # still deduped
+    m.close()
+
+    m = Manifest(db, table="phrases", text_col="text")    # reopen: no second rebuild
+    rows = {r["voice"]: r for r in m.iter_rows()}
+    assert set(rows) == {None, "gemini-Puck"}
+    assert rows[None]["status"] == "done"                 # original row kept intact
+    assert rows[None]["file_path"] == "en/local/1/1_good_morning.wav"
+    assert m.voices() == []                               # voices table created too
+    m.close()
+
+
+def test_speak_into_old_schema_bank(tmp_path, bank_env, fake_gemini):
+    """End to end: /v1/speak on the real (old-schema) bank, for a phrase that
+    already exists without a voice, generates, saves, and then serves it."""
+    _make_old_bank(str(bank_env.db))
+    from src.server import app
+    with TestClient(app) as c:
+        miss = c.post("/v1/speak", data={"text": "good morning", "voice": "Puck"})
+        assert miss.status_code == 200, miss.text
+        hit = c.post("/v1/speak", data={"text": "good morning", "voice": "Puck"})
+        assert hit.headers["x-source"] == "bank" and hit.content == miss.content

@@ -18,11 +18,12 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 
+from wordbank.constants import BANK_OGG_APPLICATION, BANK_OGG_BITRATE
 from wordbank.paths import mirror_path
 
 
 def encode_one(wav: pathlib.Path, src_root: str, dest_root: str, bitrate: str,
-               application: str = "voip", force: bool = False):
+               application: str = BANK_OGG_APPLICATION, force: bool = False):
     dest = mirror_path(str(wav), src_root, dest_root, ".ogg")
     if dest is None:
         return (str(wav), 0, 0, "outside src root")
@@ -47,8 +48,8 @@ def main() -> None:
     p.add_argument("src", help="root of WAV masters (left untouched)")
     p.add_argument("dest", help="root for the OGG copies (mirrored structure)")
     p.add_argument("--workers", type=int, default=8)
-    p.add_argument("--bitrate", default="16k")
-    p.add_argument("--application", default="voip",
+    p.add_argument("--bitrate", default=BANK_OGG_BITRATE)
+    p.add_argument("--application", default=BANK_OGG_APPLICATION,
                    choices=["voip", "audio", "lowdelay"],
                    help="libopus mode; 'voip' is tuned for speech at low bitrates")
     p.add_argument("--force", action="store_true",

@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import subprocess
 import tempfile
 from contextlib import asynccontextmanager
 from typing import Annotated, Optional
@@ -10,12 +11,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 
 from .auth import require_auth
-from wordbank.gemini_tts import DEFAULT_MODEL as GEMINI_TTS_DEFAULT_MODEL
+from wordbank.constants import BANK_OGG_APPLICATION, BANK_OGG_BITRATE
+from wordbank.gemini_tts import DEFAULT_MODEL as GEMINI_TTS_DEFAULT_MODEL, canonical_voice
 from wordbank.lookup import BankLookup
+from wordbank.paths import voice_from_path
 
-# NOTE: src.model / src.audio (torch, omnivoice, numpy, soundfile) are imported
-# LAZILY inside the synthesis handler — so a bank-only build with MODEL_ENABLED
-# off needs none of the ML stack installed.
+# NOTE: src.model (torch, omnivoice) and src.audio (ffmpeg) are imported LAZILY
+# inside the synthesis handlers — so a bank-only build with MODEL_ENABLED off
+# needs none of the ML stack installed.
 
 MODEL_ID = os.getenv("MODEL_ID", "k2-fsa/OmniVoice")
 MAX_TEXT_LEN = int(os.getenv("MAX_TEXT_LEN", "2000"))
@@ -28,6 +31,24 @@ GEMINI_TTS_VOICE = os.getenv("GEMINI_TTS_VOICE", "Kore")
 
 def _truthy(val: Optional[str]) -> bool:
     return (val or "").lower() not in ("", "0", "false", "no", "off")
+
+
+def _gemini_configured() -> bool:
+    """google-genai authenticates from GEMINI_API_KEY (or GOOGLE_API_KEY). With
+    one set, /v1/speak can fill bank misses, so the service can serve even
+    without a bank. Read per call, like JWT_SECRET."""
+    return bool(os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"))
+
+
+def _gemini_voice(voice: Optional[str]) -> Optional[str]:
+    """Canonical prebuilt-voice name for a request field, None when omitted.
+    An unknown name is a 400 here rather than a 502 from a wasted Gemini call."""
+    if not voice or not voice.strip():
+        return None
+    canon = canonical_voice(voice)
+    if canon is None:
+        raise HTTPException(400, f"unknown Gemini voice {voice!r} (see /v1/gemini/voices)")
+    return canon
 
 
 def _cors_origins() -> list:
@@ -53,7 +74,7 @@ async def lifespan(app: FastAPI):
     # working unauthenticated unless a secret is explicitly configured.
     if not os.getenv("JWT_SECRET"):
         logging.getLogger("uvicorn.error").warning(
-            "JWT_SECRET not set: /v1/tts, /v1/gemini/tts, /v1/voices are unauthenticated"
+            "JWT_SECRET not set: /v1/tts, /v1/speak, /v1/gemini/tts, /v1/voices are unauthenticated"
         )
     yield
     app.state.bank.close()
@@ -76,15 +97,17 @@ app.add_middleware(
 @app.get("/health")
 def health():
     bank = app.state.bank
-    # Healthy iff the service can serve SOMETHING: the pre-generated bank, or
-    # live synthesis (MODEL_ENABLED). A model-only deploy with no bank is a
-    # legitimate config and must stay healthy; only "neither" is unhealthy.
-    healthy = bank.available or app.state.model_enabled
+    # Healthy iff the service can serve SOMETHING: the pre-generated bank, live
+    # synthesis (MODEL_ENABLED), or Gemini get-or-generate (/v1/speak). A deploy
+    # with no bank but either synth path is legitimate; only "none" is unhealthy.
+    gemini = _gemini_configured()
+    healthy = bank.available or app.state.model_enabled or gemini
     info = {
         "status": "ok",
         "healthy": healthy,
         "model": MODEL_ID,
         "model_enabled": app.state.model_enabled,
+        "gemini": gemini,
         "bank": bank.available,
         "bank_path": bank.path,
         "bank_words": bank.count(),
@@ -204,6 +227,13 @@ def phrase_get(text: str, lang: str = DEFAULT_LANG, voice: Optional[str] = None,
     return _serve_audio(row["file_path"], format)
 
 
+def _bank_voice_headers(source: str, voice: Optional[str]) -> dict:
+    """X-Source plus X-Voice (the voice label as /v1/search reports it). Labels
+    of local voices are user-chosen; a non-ASCII one is omitted, since headers
+    are latin-1 and a failed encode would 500 an otherwise good bank hit."""
+    return {"X-Source": source, **({"X-Voice": voice} if voice and voice.isascii() else {})}
+
+
 @app.post("/v1/speak", dependencies=[Depends(require_auth)])
 async def speak(
     text: str = Form(...),
@@ -216,35 +246,47 @@ async def speak(
     phrase bank so subsequent requests are served from disk. Along with
     `/v1/voices`, this is the only other route that writes the bank.
 
-    `voice` is a Gemini prebuilt voice name (default GEMINI_TTS_VOICE); phrases
-    are stored/looked-up under the bank voice `gemini-<voice>`. Response carries
-    `X-Source: bank` or `X-Source: gemini`.
+    `voice` is a Gemini prebuilt voice name (case-insensitive). When given, only
+    a recording in that voice is served — words match the bare name ("Kore"),
+    phrases the bank voice `gemini-<voice>` — and a miss is generated in it.
+    When omitted, any banked recording serves (the default GEMINI_TTS_VOICE
+    first) and a miss is generated in the default voice.
+
+    `instruct` (style direction) makes the request a one-off: the bank has no
+    key for style, so it is neither looked up nor saved.
+
+    Response headers: `X-Source: bank|gemini`, `X-Voice: <voice label>`.
     """
     text = text.strip()
     if not text:
         raise HTTPException(400, "text must not be empty")
     if len(text) > MAX_TEXT_LEN:
         raise HTTPException(400, f"text exceeds {MAX_TEXT_LEN} characters")
-
-    bank_headers = {"X-Source": "bank"}
+    voice = _gemini_voice(voice)
+    instruct = (instruct or "").strip()
+    eff_voice = voice or canonical_voice(GEMINI_TTS_VOICE) or GEMINI_TTS_VOICE
+    bank_voice = f"gemini-{eff_voice}"
 
     # 1. Bank lookup: single tokens may be in the word bank; anything may be in
     # the phrase bank. A manifest row whose OGG is missing on disk is a MISS.
-    if not any(c.isspace() for c in text):
-        row = app.state.bank.get(text, lang)
-        if row is not None and os.path.exists(_ogg_abs(row["file_path"])):
-            return _serve_audio(row["file_path"], "ogg", headers=bank_headers)
+    if not instruct:
+        if not any(c.isspace() for c in text):
+            row = app.state.bank.get(text, lang, voice=voice)
+            if row is not None and os.path.exists(_ogg_abs(row["file_path"])):
+                row_voice = row["voice"] or voice_from_path(row["file_path"] or "")
+                return _serve_audio(row["file_path"], "ogg",
+                                    headers=_bank_voice_headers("bank", row_voice))
 
-    row = app.state.bank.get_phrase(text, lang, voice=f"gemini-{voice}" if voice else None)
-    if row is not None and os.path.exists(_ogg_abs(row["file_path"])):
-        return _serve_audio(row["file_path"], "ogg", headers=bank_headers)
+        for pinned in ([bank_voice] if voice else [bank_voice, None]):
+            row = app.state.bank.get_phrase(text, lang, voice=pinned)
+            if row is not None and os.path.exists(_ogg_abs(row["file_path"])):
+                return _serve_audio(row["file_path"], "ogg",
+                                    headers=_bank_voice_headers("bank", row["voice"]))
 
     # 2. Miss -> generate with Gemini, off the event loop.
-    eff_voice = voice or GEMINI_TTS_VOICE
-
     def _gen():
         from wordbank.gemini_tts import synthesize_pcm  # lazy: genai
-        return synthesize_pcm(text, voice=eff_voice, instruct=instruct or "", model=GEMINI_TTS_MODEL)
+        return synthesize_pcm(text, voice=eff_voice, instruct=instruct, model=GEMINI_TTS_MODEL)
 
     try:
         loop = asyncio.get_running_loop()
@@ -254,23 +296,33 @@ async def speak(
     except Exception as exc:
         raise HTTPException(502, f"Gemini TTS failed: {exc}") from exc
 
+    # Encoded in the bank's own OGG profile, so a clip saved here matches the
+    # batch-encoded ones (scripts/encode_wavs.py uses the same constants).
+    from .audio import pcm16_to_ogg  # lazy: shells out to ffmpeg
     try:
-        import numpy as np
-        from .audio import pcm_to_ogg  # lazy: needs numpy/soundfile/ffmpeg
-    except (ImportError, ModuleNotFoundError) as exc:
-        raise HTTPException(503, f"audio encoding stack not installed: {exc}") from exc
-    audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-    ogg = pcm_to_ogg(audio)
+        ogg = pcm16_to_ogg(pcm, bitrate=BANK_OGG_BITRATE, application=BANK_OGG_APPLICATION)
+    except FileNotFoundError as exc:
+        raise HTTPException(503, f"ffmpeg not installed: {exc}") from exc
+    except subprocess.CalledProcessError as exc:
+        raise HTTPException(500, f"OGG encoding failed: {exc.stderr.decode(errors='replace')}") from exc
+
+    if instruct:
+        return Response(content=ogg, media_type="audio/ogg",
+                        headers=_bank_voice_headers("gemini", bank_voice))
 
     # 3. Persist into the phrase bank (mirrors the save_voice writer below).
-    bank_voice = f"gemini-{eff_voice}"
+    # Phrases get their own `phrases/` subtree: phrase and word ids are separate
+    # sequences, so `<lang>/gemini-<voice>/<n>/<id>_<slug>` alone could collide
+    # with a word clip of the same id, voice, and slug.
     from wordbank.manifest import DONE, Manifest
     from wordbank.paths import safe_filename
-    m = Manifest(os.getenv("BANK_DB", "wordbank.db"), table="phrases", text_col="text")
+    db = os.getenv("BANK_DB", "wordbank.db")
+    os.makedirs(os.path.dirname(db) or ".", exist_ok=True)   # bank-less deploy: first write creates it
+    m = Manifest(db, table="phrases", text_col="text")
     try:
         m.add_words([text], lang, voice=bank_voice)
         row = m.get_entry(text, lang, bank_voice)
-        rel = os.path.join(lang, bank_voice, str(row["id"] // 1000),
+        rel = os.path.join(lang, bank_voice, "phrases", str(row["id"] // 1000),
                            f"{row['id']}_{safe_filename(text)}.wav")
         ogg_path = _ogg_abs(rel)
         os.makedirs(os.path.dirname(ogg_path), exist_ok=True)
@@ -290,7 +342,8 @@ async def speak(
         m.close()
     app.state.bank.close()   # drop the memoized read conn so the new row is visible
 
-    return Response(content=ogg, media_type="audio/ogg", headers={"X-Source": "gemini"})
+    return Response(content=ogg, media_type="audio/ogg",
+                    headers=_bank_voice_headers("gemini", bank_voice))
 
 
 @app.post("/v1/tts", dependencies=[Depends(require_auth)])
@@ -358,7 +411,7 @@ async def tts(
         if cleanup_ref and ref_path is not None:
             os.unlink(ref_path)
 
-    from .audio import pcm_to_ogg  # lazy: needs numpy/soundfile/ffmpeg
+    from .audio import pcm_to_ogg  # lazy: shells out to ffmpeg
     return Response(content=pcm_to_ogg(audio), media_type="audio/ogg")
 
 
@@ -375,6 +428,7 @@ async def gemini_tts(
     before saving as a clone reference. Needs GEMINI_API_KEY on the server."""
     if len(text) > MAX_TEXT_LEN:
         raise HTTPException(400, f"text exceeds {MAX_TEXT_LEN} characters")
+    voice = _gemini_voice(voice) or GEMINI_TTS_VOICE
 
     def _gen():
         from wordbank.gemini_tts import pcm_to_wav_bytes, synthesize_pcm  # lazy: genai

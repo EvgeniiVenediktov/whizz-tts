@@ -68,13 +68,13 @@ the `UNIQUE` index; prefix autocomplete uses an index range scan.
 
 | Endpoint | Purpose |
 |----------|---------|
-| `GET /health` | status, bank path/word-count, model flag |
+| `GET /health` | status, bank path/word-count, model + Gemini flags |
 | `GET /v1/languages` | `wordbank` + `phrasebank` (data-driven langs + counts) **and** `generate` (curated, verified list the model can generate) |
 | `GET /v1/search?prefix=he` | **merged** word+phrase autocomplete; each result carries a `type` flag (`word`\|`phrase`) and its `voice` (`kind=word\|phrase` restricts) |
 | `GET /v1/bank/{word}` · `/info` | serve a word (OGG default; `wav` dev-only) · sizes+type+voice |
 | `GET /v1/phrase?text=…` · `/info` | serve a phrase (by text, optional `voice`) · sizes+type+voice+seed+reference |
 | `POST /v1/tts` | live synthesis — `ref_audio` upload, a saved `voice=<name>`, or `instruct` (requires `MODEL_ENABLED`; else `503`) |
-| `POST /v1/speak` | get-or-generate — `text` (required), `lang` (default `en-us`), `voice`/`instruct` (optional, Gemini prebuilt). Bank hit → stored OGG, `X-Source: bank`. Miss → Gemini synth, saved into the phrase bank (`voice=gemini-<voice>`), served with `X-Source: gemini`; needs `GEMINI_API_KEY` only on a miss |
+| `POST /v1/speak` | get-or-generate — `text` (required), `lang` (default `en-us`), `voice` (optional Gemini prebuilt, case-insensitive; unknown → `400`), `instruct` (optional). Bank hit in that voice → stored OGG, `X-Source: bank`. Miss → Gemini synth in that voice, saved into the phrase bank (`voice=gemini-<Voice>`), served with `X-Source: gemini`; `X-Voice` names the voice served. Needs `GEMINI_API_KEY` only on a miss |
 | voice studio | `GET /v1/gemini/voices`, `POST /v1/gemini/tts`, `GET/POST /v1/voices`, `GET /v1/voices/{lang}/{name}/audio` — author + save clone references |
 
 ## Run
@@ -183,15 +183,20 @@ curl -H "Authorization: Bearer $TOKEN" -F text="hello" http://localhost:8000/v1/
 (`X-Source: bank`); a miss synthesizes via Gemini, saves it into the phrase
 bank (so the same text is a bank hit next time), and serves that
 (`X-Source: gemini`) — it needs `GEMINI_API_KEY` only when it actually has to
-generate.
+generate. `voice` pins the recording: `voice=Puck` only ever serves or generates
+Puck (a banked Kore word is not a hit). Without `voice`, any banked recording
+serves (the default `GEMINI_TTS_VOICE` first) and a miss uses the default.
+`instruct` (style direction) is a one-off render — never looked up or saved,
+since the bank has no key for style.
 
 ```bash
-curl -H "Authorization: Bearer $TOKEN" -F text="good morning" http://localhost:8000/v1/speak -o out.ogg
+curl -H "Authorization: Bearer $TOKEN" -F text="good morning" -F voice=Puck http://localhost:8000/v1/speak -o out.ogg
 ```
 
 **Health and startup.** `/health` returns **503** when the service can serve
-nothing — no bank *and* `MODEL_ENABLED` off — and 200 otherwise (a model-only
-deployment with no bank is legitimate and stays healthy). `docker-entrypoint.sh`
+nothing — no bank, `MODEL_ENABLED` off, *and* no `GEMINI_API_KEY` — and 200
+otherwise (a model-only or Gemini-only deployment with no bank is legitimate and
+stays healthy; the first `/v1/speak` miss creates the bank on the volume). `docker-entrypoint.sh`
 applies the same rule: it refuses to start (`exit 1`) rather than come up and
 404 every lookup, and the image's `HEALTHCHECK` is wired to `/health` with a
 start period generous enough to cover first-boot archive unpacking.

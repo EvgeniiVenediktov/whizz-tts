@@ -42,6 +42,12 @@ def verify(desc_path: str, root: Optional[str] = None, *, db: Optional[str] = No
            ogg_root: Optional[str] = None, voices_root: Optional[str] = None) -> List[str]:
     """Check a bank against the description. Returns a list of problems (empty = OK).
 
+    The word count must match exactly. Phrase and OGG counts are minimums: the
+    running server adds phrases (and their OGGs) via /v1/speak, so a volume that
+    has served traffic legitimately holds more than the packaged library. Exact
+    matching there made every restart after a /v1/speak write fail verification
+    and re-unpack the archive over the grown wordbank.db.
+
     Layout resolution (each of db/ogg_root/voices_root resolves independently):
       - explicit `db=`/`ogg_root=`/`voices_root=` kwargs always win.
       - else if `root` is given: the flat deploy layout — `root/desc["db"]`,
@@ -87,12 +93,12 @@ def verify(desc_path: str, root: Optional[str] = None, *, db: Optional[str] = No
     bl.close()
     if "words" in desc and words != desc["words"]:
         problems.append(f"word count {words} != expected {desc['words']} (db: {db_path.resolve()})")
-    if "phrases" in desc and phrases != desc["phrases"]:
-        problems.append(f"phrase count {phrases} != expected {desc['phrases']} (db: {db_path.resolve()})")
+    if "phrases" in desc and phrases < desc["phrases"]:
+        problems.append(f"phrase count {phrases} < expected {desc['phrases']} (db: {db_path.resolve()})")
     if "ogg_files" in desc:
         tree = pathlib.Path(ogg_root)
         n = sum(1 for _ in tree.rglob("*.ogg")) if tree.is_dir() else 0
-        if n != desc["ogg_files"]:
+        if n < desc["ogg_files"]:
             problems.append(
-                f"ogg files {n} != expected {desc['ogg_files']} (looked in {tree.resolve()})")
+                f"ogg files {n} < expected {desc['ogg_files']} (looked in {tree.resolve()})")
     return problems

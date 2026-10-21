@@ -54,20 +54,6 @@ def test_same_name_different_lang_coexist(tmp_path):
     m.close()
 
 
-def test_voices_table_added_to_preexisting_db(tmp_path):
-    """A manifest created before `voices` existed gets the table on next open."""
-    db = str(tmp_path / "wb.db")
-    m = Manifest(db)
-    m.add_words(["cat"], "en-us")
-    m.close()
-    # Re-open (simulates upgrading code against an old DB) — must not error.
-    m2 = Manifest(db)
-    assert m2.voices() == []
-    m2.add_voice("en-gb", "en-gb", "refs/en-gb/ref.wav")
-    assert len(m2.voices()) == 1
-    m2.close()
-
-
 # ---- storage + resolution helpers ----
 
 def test_save_voice_clip_writes_file_and_registers(tmp_path):
