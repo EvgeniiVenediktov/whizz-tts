@@ -20,12 +20,12 @@ and `WORDBANK_PLAN.md`.
   The `PATH` prefix is **required**, not optional: `src/audio.py` shells out to `ffmpeg`,
   which here is only a symlink inside `.venv/bin` (see the ffmpeg note below). Without it
   7 tests fail with `FileNotFoundError: 'ffmpeg'` — a broken environment that looks like
-  broken code. Clean baseline with only the serving deps below is **129 passed, 11 skipped**
-  in ~12s; with torch + omnivoice installed, **131 passed, 10 skipped** (the model-lock
+  broken code. Clean baseline with only the serving deps below is **131 passed, 11 skipped**
+  in ~12s; with torch + omnivoice installed, **133 passed, 10 skipped** (the model-lock
   tests run instead of skipping).
   `.venv/bin/pytest --integration tests/test_integration.py` loads OmniVoice (slow, needs the model).
 - **Run server + UI (bank only):** `PATH="$PWD/.venv/bin:$PATH" SERVE_FRONTEND=1 .venv/bin/uvicorn src.server:app --port 8000` → http://localhost:8000. The PATH prefix matters for the same ffmpeg reason as the tests: `/v1/speak` misses encode OGG server-side, and without it they 503 with `ffmpeg not installed`.
-- **Creds:** `GEMINI_API_KEY` for word-bank generation/cleanup **and the voice-studio endpoints** (`/v1/gemini/tts`, `gemini-voice`); bank serving needs none. `JWT_SECRET` (optional) — when set, `/v1/tts`, `/v1/speak`, `/v1/gemini/tts`, and `POST /v1/voices` require a bearer token (unset = open, dev mode). Secrets live in `.env` (gitignored).
+- **Creds:** `GEMINI_API_KEY` for word-bank generation/cleanup **and the voice-studio endpoints** (`/v1/gemini/tts`, `gemini-voice`); bank serving needs none. `JWT_SECRET` (optional) — when set, `/v1/tts`, `/v1/speak`, `/v1/gemini/tts`, and `POST /v1/voices` require a bearer token (unset = open, dev mode); generate it with `scripts/make_jwt_secret.py` (writes `.env`, never prints it; `--rotate` to replace). Secrets live in `.env` (gitignored, `0600`) — never print or cat it.
 - **After editing `src/server.py` or `wordbank/lookup.py`, run `.venv/bin/pytest`** — it includes `tests/test_serves_real_bank.py`, which serves a real word from the local bank. Synthetic unit tests alone have repeatedly missed "server returns no audio" regressions (path resolution, WAL read visibility, env defaults). That test skips if no local bank, so also sanity-check by hand against the real data when you have it.
 
 ## Data & state (important)
@@ -81,7 +81,8 @@ and `WORDBANK_PLAN.md`.
    `JWT_SECRET`, checked by a FastAPI dependency on `/v1/tts`, `/v1/gemini/tts`,
    and `POST /v1/voices`; read-only bank endpoints stay public. Env-gated:
    `JWT_SECRET` unset = open/dev, set = required. Optional `JWT_AUDIENCE`/
-   `JWT_ISSUER` add claim checks. Mint tokens with `scripts/make_token.py
+   `JWT_ISSUER` add claim checks. Generate the secret into `.env` with
+   `scripts/make_jwt_secret.py`; mint tokens with `scripts/make_token.py
    --sub <name> --ttl 3600`.
 
 ### Code-quality backlog (from `review-report.json`)

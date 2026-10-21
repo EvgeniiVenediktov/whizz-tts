@@ -169,12 +169,17 @@ missing/invalid/expired token gets a `401` with a `WWW-Authenticate: Bearer`
 header and a JSON `detail`. Optional `JWT_AUDIENCE` / `JWT_ISSUER` add `aud`/
 `iss` claim checks on top of the signature/expiry check.
 
-Use a secret of at least 32 bytes (e.g. `openssl rand -hex 32`) — PyJWT warns
-on shorter HS256 keys (RFC 7518). Mint a token with `scripts/make_token.py`
-(reads `JWT_SECRET` from the environment, prints the token to stdout):
+Use a secret of at least 32 bytes — PyJWT warns on shorter HS256 keys (RFC
+7518). `scripts/make_jwt_secret.py` generates one (64 CSPRNG bytes) straight
+into `.env`, never printing it, and sets the file to `0600`; re-running keeps an
+existing secret, `--rotate` replaces it (invalidating every issued token). Mint
+a token with `scripts/make_token.py` (reads `JWT_SECRET` from the environment,
+prints the token to stdout):
 
 ```bash
-JWT_SECRET=… python scripts/make_token.py --sub dev --ttl 3600
+python scripts/make_jwt_secret.py
+set -a; . ./.env; set +a
+python scripts/make_token.py --sub dev --ttl 3600
 ```
 
 ```bash
