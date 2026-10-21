@@ -51,3 +51,46 @@ def test_rerun_keeps_the_secret_and_rotate_replaces_it(tmp_path):
     assert rotated not in (first, "dup")
     text = env.read_text()
     assert text.count("JWT_SECRET=") == 1 and "GEMINI_API_KEY=k\n" in text
+
+
+EDGE_SCRIPT = REPO_ROOT / "scripts" / "make_edge_env.py"
+
+
+def _edge_env(tmp_path, *args):
+    return subprocess.run([sys.executable, str(EDGE_SCRIPT), "--upstream-env", str(tmp_path / ".env"),
+                           "--env-file", str(tmp_path / ".env.edge"), *args],
+                          capture_output=True, text=True)
+
+
+def _sourced(env_file, key):
+    return subprocess.run(["sh", "-c", f'. "{env_file}" && printf %s "${key}"'],
+                          capture_output=True, text=True, check=True).stdout
+
+
+def test_edge_env_gets_an_upstream_token_and_its_own_secret(tmp_path):
+    _run(tmp_path / ".env")                                  # the upstream's secret
+    upstream_secret = _secret(tmp_path / ".env")
+
+    r = _edge_env(tmp_path, "--upstream", "https://tts.example.com/", "--ttl-days", "30")
+    assert r.returncode == 0, r.stderr
+    edge = tmp_path / ".env.edge"
+    token = _sourced(edge, "SPEAK_UPSTREAM_TOKEN")
+    edge_secret = _secret(edge)
+    assert _sourced(edge, "SPEAK_UPSTREAM_URL") == "https://tts.example.com"
+    claims = jwt.decode(token, upstream_secret, algorithms=["HS256"])   # upstream accepts it
+    assert claims["sub"] == "edge" and 29 * 86400 < claims["exp"] - claims["iat"] <= 30 * 86400
+    assert edge_secret != upstream_secret and len(edge_secret) >= 64
+    assert token not in r.stdout and edge_secret not in r.stdout and upstream_secret not in r.stdout
+    assert stat.S_IMODE(edge.stat().st_mode) == 0o600
+
+    # re-run: fresh token (renewal), same edge secret (site tokens keep working)
+    assert _edge_env(tmp_path, "--upstream", "https://tts.example.com").returncode == 0
+    assert _sourced(edge, "SPEAK_UPSTREAM_TOKEN") != token
+    assert _secret(edge) == edge_secret
+
+
+def test_edge_env_refuses_without_an_upstream_secret(tmp_path):
+    (tmp_path / ".env").write_text("GEMINI_API_KEY=k\n")
+    r = _edge_env(tmp_path, "--upstream", "https://tts.example.com")
+    assert r.returncode != 0 and "no JWT_SECRET" in r.stderr
+    assert not (tmp_path / ".env.edge").exists()

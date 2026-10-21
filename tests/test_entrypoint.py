@@ -79,6 +79,11 @@ def test_empty_volume_with_gemini_key_starts_synthesis_only(tmp_path):
     assert "synthesis-only" in out
 
 
+def test_empty_edge_volume_starts_on_its_upstream(tmp_path):
+    code, out = _entrypoint(tmp_path, SPEAK_UPSTREAM_URL="https://upstream.example.com")
+    assert code == 0 and out.rstrip().endswith("STARTED")
+
+
 def test_restart_on_runtime_built_bank_says_so(tmp_path):
     """Gemini-only volume after /v1/speak saved phrases: no description, but the
     bank is real, so the log must not claim there is no bank."""

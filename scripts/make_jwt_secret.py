@@ -16,25 +16,45 @@ import secrets
 import tempfile
 
 KEY = "JWT_SECRET"
-_LINE = re.compile(rf"^\s*(export\s+)?{KEY}\s*=")
 
 
-def write_secret(env_file: pathlib.Path, rotate: bool = False) -> str:
-    """Add (or with rotate=True, replace) JWT_SECRET in env_file. Returns
-    "added", "rotated", or "kept" (present and rotate=False: file untouched)."""
+def _matches(key: str):
+    return re.compile(rf"^\s*(export\s+)?{re.escape(key)}\s*=").match
+
+
+def read_env(env_file: pathlib.Path) -> dict:
+    """KEY=value pairs from an env file (optional `export`, optional quotes)."""
+    values = {}
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            m = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$", line)
+            if m:
+                values[m.group(1)] = m.group(2).strip("'\"")
+    return values
+
+
+def update_env(env_file: pathlib.Path, values: dict, replace: bool = True) -> dict:
+    """Set KEY=value lines in env_file, leaving every other line untouched.
+    With replace=False an existing key is kept as is. Returns {key: "added" |
+    "replaced" | "kept"}. Rewritten atomically, mode 0600; values never logged."""
     lines = env_file.read_text().splitlines(keepends=True) if env_file.exists() else []
-    found = [i for i, line in enumerate(lines) if _LINE.match(line)]
-    if found and not rotate:
-        return "kept"
-
-    new_line = f"{KEY}={secrets.token_urlsafe(64)}\n"
-    if found:
-        lines[found[0]] = new_line
-        lines = [line for i, line in enumerate(lines) if i not in found[1:]]
-    else:
-        if lines and not lines[-1].endswith("\n"):
-            lines[-1] += "\n"
-        lines.append(new_line)
+    result = {}
+    for key, value in values.items():
+        match = _matches(key)
+        found = [i for i, line in enumerate(lines) if match(line)]
+        if found and not replace:
+            result[key] = "kept"
+            continue
+        new_line = f"{key}={value}\n"
+        if found:
+            lines[found[0]] = new_line
+            lines = [line for i, line in enumerate(lines) if i not in found[1:]]
+            result[key] = "replaced"
+        else:
+            if lines and not lines[-1].endswith("\n"):
+                lines[-1] += "\n"
+            lines.append(new_line)
+            result[key] = "added"
 
     fd, tmp = tempfile.mkstemp(dir=env_file.parent, prefix=f".{env_file.name}.")
     try:
@@ -44,7 +64,18 @@ def write_secret(env_file: pathlib.Path, rotate: bool = False) -> str:
     except BaseException:
         os.unlink(tmp)
         raise
-    return "rotated" if found else "added"
+    return result
+
+
+def new_secret() -> str:
+    return secrets.token_urlsafe(64)
+
+
+def write_secret(env_file: pathlib.Path, rotate: bool = False) -> str:
+    """Add (or with rotate=True, replace) JWT_SECRET in env_file. Returns
+    "added", "rotated", or "kept" (present and rotate=False: value untouched)."""
+    result = update_env(env_file, {KEY: new_secret()}, replace=rotate)[KEY]
+    return {"replaced": "rotated"}.get(result, result)
 
 
 def main() -> None:

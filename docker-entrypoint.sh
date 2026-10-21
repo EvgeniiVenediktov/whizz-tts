@@ -14,9 +14,10 @@
 #
 # A container that ends up with NO usable bank AND no synthesis path can serve
 # nothing, so it refuses to start (exit 1) rather than come up "healthy" and
-# 404 every lookup. Exceptions, both valid bank-less deployments: MODEL_ENABLED=1
-# (live OmniVoice) and GEMINI_API_KEY/GOOGLE_API_KEY set (/v1/speak generates
-# misses and builds the phrase bank on the volume). /health applies the same
+# 404 every lookup. Exceptions, all valid bank-less deployments: MODEL_ENABLED=1
+# (live OmniVoice), GEMINI_API_KEY/GOOGLE_API_KEY set, or SPEAK_UPSTREAM_URL set
+# (edge mode) — /v1/speak then generates misses and builds the phrase bank on
+# the volume. /health applies the same
 # rule (200, not 503), so the entrypoint mirrors it instead of hard-blocking.
 #
 # Bank sync: two ways to pull the bank into the volume before/instead of the
@@ -49,15 +50,16 @@ model_enabled() {
     esac
 }
 
-# Mirrors src/server.py's /health rule: either synthesis path can serve with no bank.
+# Mirrors src/server.py's /health rule: any synthesis path can serve with no bank
+# (live OmniVoice, Gemini, or an upstream server in edge mode).
 can_synthesize() {
-    model_enabled || [ -n "${GEMINI_API_KEY:-}${GOOGLE_API_KEY:-}" ]
+    model_enabled || [ -n "${GEMINI_API_KEY:-}${GOOGLE_API_KEY:-}${SPEAK_UPSTREAM_URL:-}" ]
 }
 
 # Shared explanation for "nothing usable" failures.
 serving_nothing_msg() {
     cat <<EOF
-[entrypoint] ERROR: no usable bank and no synthesis (MODEL_ENABLED=${MODEL_ENABLED:-0}, no GEMINI_API_KEY) — this container can serve nothing, refusing to start.
+[entrypoint] ERROR: no usable bank and no synthesis (MODEL_ENABLED=${MODEL_ENABLED:-0}, no GEMINI_API_KEY, no SPEAK_UPSTREAM_URL) — this container can serve nothing, refusing to start.
 [entrypoint]   Looked for a description at: $LIBRARY_DESC
 [entrypoint]   Looked for an archive at:     $LIBRARY_ARCHIVE
 [entrypoint]   Fix one of:
@@ -67,7 +69,7 @@ serving_nothing_msg() {
 [entrypoint]     - Point LIBRARY_DESC / LIBRARY_ARCHIVE at wherever you did place them.
 [entrypoint]     - Set SYNC_BUCKET/SYNC_PREFIX (or BANK_SYNC_CMD) to pull the bank from
 [entrypoint]       storage before boot.
-[entrypoint]     - Set MODEL_ENABLED=1 or GEMINI_API_KEY for a synthesis-only deployment (no bank).
+[entrypoint]     - Set MODEL_ENABLED=1, GEMINI_API_KEY, or SPEAK_UPSTREAM_URL for a synthesis-only deployment (no bank).
 EOF
 }
 
@@ -116,7 +118,7 @@ elif [ -f "$LIBRARY_ARCHIVE" ]; then
     if python -m wordbank verify --desc "$LIBRARY_DESC" --root "$DATA_DIR"; then
         echo "[entrypoint] library verified after unpack — starting"
     elif can_synthesize; then
-        echo "[entrypoint] WARNING: still invalid after unpacking $LIBRARY_ARCHIVE (see verification problems above) — synthesis is available (MODEL_ENABLED / GEMINI_API_KEY), continuing in synthesis-only mode (bank unavailable)"
+        echo "[entrypoint] WARNING: still invalid after unpacking $LIBRARY_ARCHIVE (see verification problems above) — synthesis is available (MODEL_ENABLED / GEMINI_API_KEY / SPEAK_UPSTREAM_URL), continuing in synthesis-only mode (bank unavailable)"
     else
         echo "[entrypoint] ERROR: still invalid after unpacking $LIBRARY_ARCHIVE (see verification problems above)." >&2
         echo "[entrypoint]   The archive at $LIBRARY_ARCHIVE doesn't match $LIBRARY_DESC (corrupt archive, stale description, or a failed extraction)." >&2
@@ -130,7 +132,7 @@ elif [ ! -f "$LIBRARY_DESC" ] && [ -f "$BANK_DB" ] && can_synthesize; then
 else
     echo "[entrypoint] volume not provisioned and no archive at $LIBRARY_ARCHIVE"
     if can_synthesize; then
-        echo "[entrypoint] WARNING: no bank and no archive — synthesis is available (MODEL_ENABLED / GEMINI_API_KEY), continuing in synthesis-only mode (bank unavailable)"
+        echo "[entrypoint] WARNING: no bank and no archive — synthesis is available (MODEL_ENABLED / GEMINI_API_KEY / SPEAK_UPSTREAM_URL), continuing in synthesis-only mode (bank unavailable)"
     else
         serving_nothing_msg >&2
         exit 1

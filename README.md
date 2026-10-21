@@ -99,6 +99,46 @@ docker compose --profile bank up --build   # lightweight bank-only (no torch)
 docker compose --profile full up --build   # + live synthesis (downloads weights to a cache volume)
 ```
 
+## Edge cache
+
+An **edge** is the same image deployed next to a client (e.g. the website's
+backend), holding its own copy of the bank. `/v1/speak` hits are served from
+its volume; misses are fetched from the **upstream** server's `/v1/speak`,
+saved, and served, so each new clip crosses the network once. The edge holds
+no Gemini key, only a token for the upstream.
+
+```
+site backend --JWT(edge secret)--> edge (bank on /data) --miss, JWT(upstream secret)--> upstream (Gemini)
+```
+
+- Same request/voice semantics as the upstream; `X-Source: upstream` marks a
+  clip just fetched. The voice is forwarded as requested, and the clip is filed
+  under the voice upstream reports (`X-Voice`).
+- `instruct` requests are forwarded and never saved.
+- Concurrent misses for one clip are fetched once (single-flight, also on the
+  upstream for Gemini calls).
+- Upstream `400` passes through; a rejected edge token, an upstream error, a
+  non-OGG reply, or an unreachable upstream is `502`; a timeout is `504`.
+  Nothing is saved on failure.
+
+Set up (on the machine holding the upstream's `.env`):
+```bash
+python scripts/make_edge_env.py --upstream https://tts.example.com   # -> .env.edge (0600)
+set -a; . ./.env.edge; set +a
+python scripts/make_token.py --sub site --ttl 31536000   # the site backend's token for the edge
+```
+`.env.edge` gets `SPEAK_UPSTREAM_URL`, `SPEAK_UPSTREAM_TOKEN` (365 days by
+default; re-run to renew; the edge logs a warning at startup within 30 days of
+expiry) and the edge's **own** `JWT_SECRET`, kept across re-runs. Seed the bank
+by putting `library.json` + `tts-bank.tar.gz` on the edge's `/data` (as for any
+deployment), then run:
+```bash
+ENV_FILE=.env.edge scripts/docker-run.sh edge          # local; volume whizz-tts-edge-data
+```
+In production that is the thin image with `SPEAK_UPSTREAM_URL`,
+`SPEAK_UPSTREAM_TOKEN`, `JWT_SECRET` and a persistent `/data`; one instance per
+volume. The upstream must be reachable from the edge over HTTPS.
+
 ## Deployment package (image + description + archive)
 
 The image is **code only** — it never stores the bank. `scripts/pack.sh` produces
@@ -157,6 +197,9 @@ SERVE_FRONTEND=1 .venv/bin/uvicorn src.server:app --port 8000
 | `JWT_AUDIENCE` / `JWT_ISSUER` | unset | optional — if set, tokens must carry a matching `aud`/`iss` claim |
 | `SYNC_BUCKET` / `SYNC_PREFIX` | — | pull the bank from S3 at container start (structured + quoted; preferred over `BANK_SYNC_CMD`) |
 | `BANK_SYNC_CMD` | — | escape hatch: arbitrary shell command run at container start to pull the bank into the volume. Runs via `sh -c` — **set it only from trusted configuration** |
+| `SPEAK_UPSTREAM_URL` | unset | **edge mode**: `/v1/speak` misses are fetched from this whizz-tts server instead of Gemini (see [Edge cache](#edge-cache)) |
+| `SPEAK_UPSTREAM_TOKEN` | unset | bearer token for the upstream (signed with the upstream's `JWT_SECRET`; `scripts/make_edge_env.py` mints it) |
+| `SPEAK_UPSTREAM_TIMEOUT` | `60` | seconds to wait for the upstream before answering `504` |
 
 ## Auth
 
