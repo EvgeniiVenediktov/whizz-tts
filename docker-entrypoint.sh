@@ -98,6 +98,17 @@ if python -m wordbank verify --desc "$LIBRARY_DESC" --root "$DATA_DIR"; then
 elif [ -f "$LIBRARY_ARCHIVE" ]; then
     echo "[entrypoint] volume not provisioned — unpacking $LIBRARY_ARCHIVE -> $DATA_DIR"
     mkdir -p "$DATA_DIR"
+    # A DB already here (e.g. phrases /v1/speak saved before the archive was
+    # added) would be overwritten by the archive's, and a leftover -wal could be
+    # replayed onto the new file. Move it aside, WAL/SHM included, so nothing is
+    # lost or corrupted; its phrases can be merged back from the backup.
+    if [ -f "$BANK_DB" ]; then
+        backup="$BANK_DB.pre-unpack-$(date +%Y%m%d-%H%M%S)"
+        for ext in "" -wal -shm; do
+            if [ -f "$BANK_DB$ext" ]; then mv "$BANK_DB$ext" "$backup$ext"; fi
+        done
+        echo "[entrypoint] existing $BANK_DB moved to $backup before unpacking"
+    fi
     tar xzf "$LIBRARY_ARCHIVE" -C "$DATA_DIR" --strip-components=1 output/words_ogg
     tar xzf "$LIBRARY_ARCHIVE" -C "$DATA_DIR" wordbank.db
     tar xzf "$LIBRARY_ARCHIVE" -C "$DATA_DIR" --strip-components=1 output/voices 2>/dev/null || true
@@ -112,6 +123,10 @@ elif [ -f "$LIBRARY_ARCHIVE" ]; then
         echo "[entrypoint]   Fix: regenerate both with 'bash scripts/pack.sh' and re-place library.json + tts-bank.tar.gz on the volume, or set MODEL_ENABLED=1 / GEMINI_API_KEY to run synthesis-only." >&2
         exit 1
     fi
+elif [ ! -f "$LIBRARY_DESC" ] && [ -f "$BANK_DB" ] && can_synthesize; then
+    # Synthesis-only deployment on a later boot: the bank here was built at
+    # runtime by /v1/speak, so there is no description to verify it against.
+    echo "[entrypoint] no library description at $LIBRARY_DESC — serving the bank built at runtime ($BANK_DB) + synthesis for misses"
 else
     echo "[entrypoint] volume not provisioned and no archive at $LIBRARY_ARCHIVE"
     if can_synthesize; then

@@ -20,8 +20,8 @@ and `WORDBANK_PLAN.md`.
   The `PATH` prefix is **required**, not optional: `src/audio.py` shells out to `ffmpeg`,
   which here is only a symlink inside `.venv/bin` (see the ffmpeg note below). Without it
   7 tests fail with `FileNotFoundError: 'ffmpeg'` — a broken environment that looks like
-  broken code. Clean baseline with only the serving deps below is **123 passed, 11 skipped**
-  in ~12s; with torch + omnivoice installed, **125 passed, 10 skipped** (the model-lock
+  broken code. Clean baseline with only the serving deps below is **129 passed, 11 skipped**
+  in ~12s; with torch + omnivoice installed, **131 passed, 10 skipped** (the model-lock
   tests run instead of skipping).
   `.venv/bin/pytest --integration tests/test_integration.py` loads OmniVoice (slow, needs the model).
 - **Run server + UI (bank only):** `PATH="$PWD/.venv/bin:$PATH" SERVE_FRONTEND=1 .venv/bin/uvicorn src.server:app --port 8000` → http://localhost:8000. The PATH prefix matters for the same ffmpeg reason as the tests: `/v1/speak` misses encode OGG server-side, and without it they 503 with `ffmpeg not installed`.
@@ -202,9 +202,14 @@ dev-only convenience: `docker compose --profile bank up --build`):
 `scripts/docker-build-thin.sh` / `scripts/docker-build-fat.sh` wrap the plain
 `docker build --target runtime` / `--target runtime-fat` (`--with-model` on
 either for `WITH_MODEL=1`, i.e. torch). `scripts/docker-run.sh thin|fat`
-wraps `docker run` (`--with-model` sets `MODEL_ENABLED=1`/`PRELOAD_MODEL=1`;
-`thin` bind-mounts local `library.json`/`tts-bank.tar.gz` at `/data` as a
-stand-in for a real volume, for local testing only). Tags: `whizz-tts:thin`,
+wraps `docker run`: `/data` is a named volume (`whizz-tts-<mode>-data`,
+`DATA_VOLUME` overrides) so `/v1/speak` phrases survive restarts;
+`--with-model` sets `MODEL_ENABLED=1`/`PRELOAD_MODEL=1`; `thin` bind-mounts
+local `library.json`/`tts-bank.tar.gz` onto `/data` when both exist, else runs
+bank-less (needs `GEMINI_API_KEY` or `--with-model`). `GEMINI_API_KEY`/
+`GOOGLE_API_KEY`/`JWT_SECRET` pass through by name (`./.env` loaded first);
+`DOCKER_DNS=8.8.8.8` sets the container resolver, for a local DNS that won't
+resolve `generativelanguage.googleapis.com`. Tags: `whizz-tts:thin`,
 `whizz-tts:fat`, `-model` suffix with `--with-model`.
 
 Put `library.json` + `tts-bank.tar.gz` on the (persistent)
@@ -220,7 +225,12 @@ Put `library.json` + `tts-bank.tar.gz` on the (persistent)
    after a speak write re-unpack the archive over the grown `wordbank.db`).
 2. If invalid, unpacks `$LIBRARY_ARCHIVE` (`/data/tts-bank.tar.gz`) into `/data`
    (`output/words_ogg`→`/data/words_ogg`, `output/voices`→`/data/voices`,
-   `wordbank.db`→`/data/wordbank.db`, `library.json`), then re-verifies.
+   `wordbank.db`→`/data/wordbank.db`, `library.json`), then re-verifies. An
+   existing `wordbank.db` (+ `-wal`/`-shm`), e.g. phrases `/v1/speak` saved
+   before the archive was added, is first moved to
+   `wordbank.db.pre-unpack-<timestamp>` — never overwritten. A volume with a
+   runtime-built bank but no `library.json` starts as-is when synthesis is
+   available (logged as such, not as "no bank").
 3. **Refuses to start (`exit 1`) if there is still no usable bank** — rather than
    coming up "healthy" and 404-ing every lookup. Exceptions, both valid bank-less
    deployments that degrade to a warning instead: `MODEL_ENABLED=1` (live

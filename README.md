@@ -90,7 +90,9 @@ scripts/docker-run.sh fat
 
 # scripts/docker-build-thin.sh builds code-only (no baked bank; needs a
 # mounted /data volume, e.g. a k8s PVC); scripts/docker-run.sh thin runs it
-# locally with library.json/tts-bank.tar.gz bind-mounted as a stand-in.
+# locally on a named /data volume, with library.json/tts-bank.tar.gz
+# bind-mounted when present, else bank-less via GEMINI_API_KEY from .env:
+scripts/docker-build-thin.sh && scripts/docker-run.sh thin   # DOCKER_DNS=8.8.8.8 if local DNS blocks Gemini
 
 # Docker compose — dev-only convenience, mounts library.json/tts-bank.tar.gz as a volume:
 docker compose --profile bank up --build   # lightweight bank-only (no torch)

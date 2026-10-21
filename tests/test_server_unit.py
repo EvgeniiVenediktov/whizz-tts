@@ -50,6 +50,15 @@ def test_cors_default_allows_any_origin(client):
     assert r.headers.get("access-control-allow-origin") == "*"
 
 
+def test_cors_exposes_speak_metadata_headers(client):
+    """Cross-origin JS can only read X-Source/X-Voice if they're exposed."""
+    r = client.post("/v1/speak", data={"text": "hello there", "voice": "Puck"},
+                    headers={"Origin": "https://app.example.com"})
+    assert r.status_code == 200 and r.headers["x-voice"] == "gemini-Puck"
+    exposed = {h.strip().lower() for h in r.headers["access-control-expose-headers"].split(",")}
+    assert {"x-source", "x-voice"} <= exposed
+
+
 def test_cors_restricted_rejects_disallowed_origin(bank_env, monkeypatch):
     """CORS_ORIGINS set -> only listed origins are reflected back; the
     middleware is configured at import time from the env, so this needs a

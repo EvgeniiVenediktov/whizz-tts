@@ -91,6 +91,9 @@ app = FastAPI(title="TTS Server", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware, allow_origins=_cors_origins(),
     allow_methods=["GET", "POST", "OPTIONS"], allow_headers=["*"],
+    # /v1/speak metadata; browsers hide non-safelisted headers from
+    # cross-origin JS unless they're exposed.
+    expose_headers=["X-Source", "X-Voice"],
 )
 
 
