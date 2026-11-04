@@ -115,6 +115,10 @@ site backend --JWT(edge secret)--> edge (bank on /data) --miss, JWT(upstream sec
   clip just fetched. The voice is forwarded as requested, and the clip is filed
   under the voice upstream reports (`X-Voice`).
 - `instruct` requests are forwarded and never saved.
+- **Stateless upstream:** run the upstream with `SPEAK_STORE=0` and it never
+  writes the bank — misses are generated with Gemini and returned only, so the
+  clips live solely on the edges. It still serves hits from a bank if one is
+  mounted. Concurrent identical misses share one Gemini call.
 - Concurrent misses for one clip are fetched once (single-flight, also on the
   upstream for Gemini calls).
 - Upstream `400` passes through; a rejected edge token, an upstream error, a
@@ -198,6 +202,7 @@ SERVE_FRONTEND=1 .venv/bin/uvicorn src.server:app --port 8000
 | `SYNC_BUCKET` / `SYNC_PREFIX` | — | pull the bank from S3 at container start (structured + quoted; preferred over `BANK_SYNC_CMD`) |
 | `BANK_SYNC_CMD` | — | escape hatch: arbitrary shell command run at container start to pull the bank into the volume. Runs via `sh -c` — **set it only from trusted configuration** |
 | `SPEAK_UPSTREAM_URL` | unset | **edge mode**: `/v1/speak` misses are fetched from this whizz-tts server instead of Gemini (see [Edge cache](#edge-cache)) |
+| `SPEAK_STORE` | `1` | `0` = `/v1/speak` never writes the bank (stateless upstream for edges); misses are generated and returned only. `/health` reports it as `store` |
 | `SPEAK_UPSTREAM_TOKEN` | unset | bearer token for the upstream (signed with the upstream's `JWT_SECRET`; `scripts/make_edge_env.py` mints it) |
 | `SPEAK_UPSTREAM_TIMEOUT` | `60` | seconds to wait for the upstream before answering `504` |
 

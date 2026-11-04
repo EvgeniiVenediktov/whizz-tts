@@ -184,3 +184,62 @@ def test_bankless_deploy_first_write_creates_the_bank(bank_env, fake_gemini, mon
         assert db.exists()
         assert _speak(c, text="hello there").headers["x-source"] == "bank"
         assert c.get("/health").json()["bank"] is True
+
+
+# --- SPEAK_STORE=0: stateless upstream (generates, never writes) -------------
+
+def _ogg_files(paths):
+    return list(paths.ogg.rglob("*.ogg")) if paths.ogg.exists() else []
+
+
+def test_store_off_serves_the_miss_and_writes_nothing(client, monkeypatch):
+    monkeypatch.setenv("SPEAK_STORE", "0")
+    r = _speak(client, text="hello there", voice="Puck")
+    assert r.status_code == 200, r.text
+    assert r.headers["x-source"] == "gemini" and r.headers["x-voice"] == "gemini-Puck"
+    assert r.content[:4] == b"OggS"
+    assert _phrase_rows(client.paths) == [] and _ogg_files(client.paths) == []
+
+    again = _speak(client, text="hello there", voice="Puck")   # nothing banked -> generated again
+    assert again.status_code == 200 and again.headers["x-source"] == "gemini"
+    assert len(client.gemini.calls) == 2
+    assert client.get("/health").json()["store"] is False
+
+
+def test_store_off_still_serves_an_existing_bank(client, monkeypatch):
+    banked = _bank_phrase(client.paths, "hello there", "gemini-Puck")
+    monkeypatch.setenv("SPEAK_STORE", "0")
+    r = _speak(client, text="hello there", voice="Puck")
+    assert r.headers["x-source"] == "bank" and r.content == banked
+    assert client.gemini.calls == []
+
+
+def test_store_off_gemini_failure_is_502(client, monkeypatch):
+    monkeypatch.setenv("SPEAK_STORE", "0")
+    client.gemini.error = RuntimeError("quota exhausted")
+    r = _speak(client, text="hello there", voice="Puck")
+    assert r.status_code == 502 and "quota exhausted" in r.json()["detail"]
+    client.gemini.error = None
+    assert _speak(client, text="hello there", voice="Puck").status_code == 200   # failure not cached
+
+
+def test_store_off_concurrent_misses_share_one_generation(client, monkeypatch):
+    """No saved clip for queued twins to find, so the burst shares one result."""
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+    import wordbank.gemini_tts as gemini_tts_mod
+
+    monkeypatch.setenv("SPEAK_STORE", "0")
+    fast = gemini_tts_mod.synthesize_pcm
+
+    def slow(*a, **kw):
+        time.sleep(0.3)
+        return fast(*a, **kw)
+    monkeypatch.setattr(gemini_tts_mod, "synthesize_pcm", slow)
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        rs = list(pool.map(lambda _: _speak(client, text="hello there", voice="Puck"), range(6)))
+    assert all(r.status_code == 200 for r in rs)
+    assert len({r.content for r in rs}) == 1
+    assert len(client.gemini.calls) == 1
+    assert _phrase_rows(client.paths) == []

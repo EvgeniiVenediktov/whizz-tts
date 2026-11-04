@@ -226,14 +226,16 @@ uvicorn.run("src.server:app", host="127.0.0.1", port=int(sys.argv[1]), log_level
 """
 
 
-def test_edge_against_a_real_upstream_server(bank_env, fake_gemini, tmp_path, monkeypatch):
+@pytest.mark.parametrize("store", ["1", "0"], ids=["upstream-stores", "upstream-stateless"])
+def test_edge_against_a_real_upstream_server(bank_env, fake_gemini, tmp_path, monkeypatch, store):
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
     secret = "upstream-secret-0123456789abcdef0123456789"
     up_dir = tmp_path / "upstream"
     env = {**os.environ, "BANK_DB": str(up_dir / "wordbank.db"), "OGG_ROOT": str(up_dir / "ogg"),
-           "WAV_ROOT": str(up_dir / "wav"), "JWT_SECRET": secret, "GEMINI_API_KEY": "fake"}
+           "WAV_ROOT": str(up_dir / "wav"), "JWT_SECRET": secret, "GEMINI_API_KEY": "fake",
+           "SPEAK_STORE": store}
     env.pop("SPEAK_UPSTREAM_URL", None)
     proc = subprocess.Popen([sys.executable, "-c", _UPSTREAM_SERVER, str(port)], cwd=REPO_ROOT,
                             env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -264,9 +266,14 @@ def test_edge_against_a_real_upstream_server(bank_env, fake_gemini, tmp_path, mo
             hit = _speak(c, text="hello there", voice="Puck")
             assert hit.headers["x-source"] == "bank" and hit.content == miss.content
 
-        # upstream banked it too, so a second edge would get it without Gemini
         found = urllib.request.urlopen(url + "/v1/search?prefix=hello").read()
-        assert b"gemini-Puck" in found
+        if store == "1":
+            # upstream banked it too, so a second edge would get it without Gemini
+            assert b"gemini-Puck" in found
+        else:
+            # stateless upstream: the clip lives only on the edge
+            assert b"gemini-Puck" not in found
+            assert not up_dir.exists()
         assert fake_gemini.calls == []                  # the edge process never called Gemini
     finally:
         proc.terminate()

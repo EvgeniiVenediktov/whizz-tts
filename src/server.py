@@ -50,6 +50,13 @@ def _upstream_url() -> Optional[str]:
     return os.getenv("SPEAK_UPSTREAM_URL") or None
 
 
+def _speak_store() -> bool:
+    """SPEAK_STORE=0: /v1/speak never writes the bank — a stateless Gemini
+    front for edges, which hold the clips. Hits from an existing bank are still
+    served (reads aren't storage). Default on. Read per call."""
+    return os.getenv("SPEAK_STORE", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
 def _warn_about_upstream_token(log: logging.Logger) -> None:
     """Edge mode authenticates upstream with a static token; once it lapses
     every miss fails, so flag a missing, unreadable, or expiring one at startup."""
@@ -145,6 +152,7 @@ def health():
         "model_enabled": app.state.model_enabled,
         "gemini": gemini,
         "upstream": upstream,
+        "store": _speak_store(),
         "bank": bank.available,
         "bank_path": bank.path,
         "bank_words": bank.count(),
@@ -295,6 +303,21 @@ def _speak_bank_hit(text: str, lang: str, voice: Optional[str], bank_voice: str)
 # enough: the bank is one SQLite file, so a deployment is one server process.
 _miss_locks: dict = {}
 
+# With SPEAK_STORE=0 there is no saved clip for queued twins to find, so a
+# store-less miss is coalesced instead: (key) -> the in-flight generation task,
+# whose result every concurrent request for that clip shares.
+_inflight: dict = {}
+
+
+async def _coalesced(key: tuple, factory):
+    task = _inflight.get(key)
+    if task is None:
+        task = asyncio.ensure_future(factory())
+        _inflight[key] = task
+        task.add_done_callback(lambda _t: _inflight.pop(key, None))
+    # shield: one client disconnecting must not cancel the others' generation
+    return await asyncio.shield(task)
+
 
 @asynccontextmanager
 async def _single_flight(key: tuple):
@@ -404,6 +427,8 @@ async def speak(
     A miss is synthesized with Gemini, or — in edge mode (SPEAK_UPSTREAM_URL
     set) — fetched from the upstream server's /v1/speak, so an edge needs no
     Gemini key. Concurrent misses for the same clip are generated once.
+    With SPEAK_STORE=0 nothing is saved: misses are generated and returned
+    only (the stateless upstream that edges cache from).
 
     `voice` is a Gemini prebuilt voice name (case-insensitive). When given, only
     a recording in that voice is served — words match the bare name ("Kore"),
@@ -442,6 +467,10 @@ async def speak(
     hit = _speak_bank_hit(text, lang, voice, bank_voice)
     if hit is not None:
         return hit
+    if not _speak_store():
+        ogg, label, source, _, _ = await _coalesced((text.lower(), lang, bank_voice), _generate)
+        return Response(content=ogg, media_type="audio/ogg",
+                        headers=_bank_voice_headers(source, label))
     async with _single_flight((text.lower(), lang, bank_voice)):
         hit = _speak_bank_hit(text, lang, voice, bank_voice)   # a queued twin may have saved it
         if hit is not None:

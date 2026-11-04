@@ -72,7 +72,7 @@ def bank_env(tmp_path, monkeypatch):
     monkeypatch.setenv("OGG_ROOT", str(paths.ogg))
     monkeypatch.setenv("WAV_ROOT", str(paths.wav))
     monkeypatch.setenv("VOICES_ROOT", str(paths.voices))
-    for var in ("JWT_SECRET", "GEMINI_API_KEY", "GOOGLE_API_KEY", "MODEL_ENABLED"):
+    for var in ("JWT_SECRET", "GEMINI_API_KEY", "GOOGLE_API_KEY", "MODEL_ENABLED", "SPEAK_STORE"):
         monkeypatch.delenv(var, raising=False)
     return paths
 
