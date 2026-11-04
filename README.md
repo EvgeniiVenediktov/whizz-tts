@@ -129,7 +129,8 @@ used only when generating). Bank hit (words table for single tokens, phrases
 otherwise) → stored OGG with `X-Source: bank`; miss → Gemini synth, persisted
 into the phrase bank, returned with `X-Source: gemini`. `instruct` is not part
 of the bank key — a banked phrase wins over a new instruct variant. Errors:
-`400` empty/oversize text, `502` Gemini failure, `503` encoding stack absent.
+`400` empty/oversize text, `502` Gemini failure (detail names the `finish_reason` when it
+returned no audio), `503` encoding stack absent.
 
 **`POST /v1/tts`** — live OmniVoice synthesis (`MODEL_ENABLED` required, else
 `503`). `text` (required, ≤ `MAX_TEXT_LEN`) · `ref_audio` (clip upload, ≤
@@ -276,6 +277,7 @@ SERVE_FRONTEND=1 .venv/bin/uvicorn src.server:app --port 8000
 | `JWT_AUDIENCE` / `JWT_ISSUER` | unset | optional — if set, tokens must carry a matching `aud`/`iss` claim |
 | `SYNC_BUCKET` / `SYNC_PREFIX` | — | pull the bank from S3 at container start (structured + quoted; preferred over `BANK_SYNC_CMD`) |
 | `BANK_SYNC_CMD` | — | escape hatch: arbitrary shell command run at container start to pull the bank into the volume. Runs via `sh -c` — **set it only from trusted configuration** |
+| `GEMINI_TTS_EMPTY_RETRIES` | `2` | extra attempts when Gemini TTS returns no audio with a transient `finish_reason` (`OTHER`/unset); blocks (`SAFETY`, `PROHIBITED_CONTENT`, a prompt `block_reason`, ...) are never retried. A final empty response is a `502` naming the reason |
 | `SPEAK_UPSTREAM_URL` | unset | **edge mode**: `/v1/speak` misses are fetched from this whizz-tts server instead of Gemini (see [Edge cache](#edge-cache)) |
 | `SPEAK_STORE` | `1` | `0` = `/v1/speak` never writes the bank (stateless upstream for edges); misses are generated and returned only. `/health` reports it as `store` |
 | `SPEAK_UPSTREAM_TOKEN` | unset | bearer token for the upstream (signed with the upstream's `JWT_SECRET`; `scripts/make_edge_env.py` mints it) |
