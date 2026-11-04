@@ -71,11 +71,86 @@ the `UNIQUE` index; prefix autocomplete uses an index range scan.
 | `GET /health` | status, bank path/word-count, model + Gemini flags |
 | `GET /v1/languages` | `wordbank` + `phrasebank` (data-driven langs + counts) **and** `generate` (curated, verified list the model can generate) |
 | `GET /v1/search?prefix=he` | **merged** word+phrase autocomplete; each result carries a `type` flag (`word`\|`phrase`) and its `voice` (`kind=word\|phrase` restricts) |
+| `GET /v1/bank?prefix=he` | word-only autocomplete (index range scan) |
 | `GET /v1/bank/{word}` · `/info` | serve a word (OGG default; `wav` dev-only) · sizes+type+voice |
 | `GET /v1/phrase?text=…` · `/info` | serve a phrase (by text, optional `voice`) · sizes+type+voice+seed+reference |
 | `POST /v1/tts` | live synthesis — `ref_audio` upload, a saved `voice=<name>`, or `instruct` (requires `MODEL_ENABLED`; else `503`) |
 | `POST /v1/speak` | get-or-generate — `text` (required), `lang` (default `en-us`), `voice` (optional Gemini prebuilt, case-insensitive; unknown → `400`), `instruct` (optional). Bank hit in that voice → stored OGG, `X-Source: bank`. Miss → Gemini synth in that voice, saved into the phrase bank (`voice=gemini-<Voice>`), served with `X-Source: gemini`; `X-Voice` names the voice served. Needs `GEMINI_API_KEY` only on a miss |
 | voice studio | `GET /v1/gemini/voices`, `POST /v1/gemini/tts`, `GET/POST /v1/voices`, `GET /v1/voices/{lang}/{name}/audio` — author + save clone references |
+
+### Endpoint reference
+
+Read-only endpoints are public. The `POST` routes marked **JWT** require
+`Authorization: Bearer <token>` when `JWT_SECRET` is set (see [Auth](#auth));
+with it unset the whole API is open (dev mode).
+
+#### Read-only (bank + status)
+
+**`GET /health`** — no params. `{status, healthy, model, model_enabled, bank,
+bank_path, bank_words}` (+ `device`/`model_loaded` when the model is enabled).
+`200` if the service can serve *something* (bank or live model), else `503`.
+
+**`GET /v1/languages`** — no params. `{wordbank, phrasebank, generate}`:
+the first two are data-driven `{code, words}` counts from the bank; `generate`
+is the curated, listen-verified list generation supports.
+
+**`GET /v1/search`** — `prefix` (required) · `lang` (default `en-us`) ·
+`limit` (default 10, capped 50) · `kind` (`word`|`phrase`, optional filter).
+Merged prefix search; each result is `{text, type: word|phrase, voice}`.
+
+**`GET /v1/bank`** — `prefix` · `lang` · `limit` (same defaults). Word-only
+autocomplete → `{words: [...]}`.
+
+**`GET /v1/bank/{word}`** — `lang` (default `en-us`) · `format` (`ogg` default;
+`wav` serves the dev master and 404s in production). The word's audio, or 404
+`not in bank`.
+**`GET /v1/bank/{word}/info`** — same params; `{word, type, voice, wav: {exists,
+bytes}, ogg: {...}}` for the compare UI.
+
+**`GET /v1/phrase`** — `text` (required) · `lang` · `voice` (optional — pin a
+specific voice; omitted = any) · `format`. The phrase's audio, or 404.
+**`GET /v1/phrase/info`** — same params, plus provenance in the response:
+`seed`, `ref_audio`, `ref_text`.
+
+**`GET /v1/gemini/voices`** — no params. The 30 prebuilt Gemini voices
+`{name, style, gender}`. Voices are style presets, **not** language-bound —
+Gemini auto-detects language from the text.
+
+**`GET /v1/voices`** — `lang` (optional filter). Saved clone references
+`{name, lang, ref_audio, ref_text, instruct, source}`.
+**`GET /v1/voices/{lang}/{name}/audio`** — the stored reference clip itself.
+
+#### Write / synthesis (JWT, multipart form fields)
+
+**`POST /v1/speak`** — get-or-generate. `text` (required, ≤ `MAX_TEXT_LEN`) ·
+`lang` (default `en-us`) · `voice` (Gemini prebuilt, default `GEMINI_TTS_VOICE`
+= Kore; also pins the bank lookup to `gemini-<voice>`) · `instruct` (style hint,
+used only when generating). Bank hit (words table for single tokens, phrases
+otherwise) → stored OGG with `X-Source: bank`; miss → Gemini synth, persisted
+into the phrase bank, returned with `X-Source: gemini`. `instruct` is not part
+of the bank key — a banked phrase wins over a new instruct variant. Errors:
+`400` empty/oversize text, `502` Gemini failure, `503` encoding stack absent.
+
+**`POST /v1/tts`** — live OmniVoice synthesis (`MODEL_ENABLED` required, else
+`503`). `text` (required, ≤ `MAX_TEXT_LEN`) · `ref_audio` (clip upload, ≤
+`MAX_REF_BYTES` = 10 MB) · `ref_text` (transcript of the clip) · `voice` (a
+*saved* reference name — cloned from the stored clip) · `lang` · `instruct`
+(voice-design prompt) · `guidance_scale` (float) · `seed` (int, reproducible
+RNG). Modes: `ref_audio`[+`ref_text`] one-off cloning; `voice` saved-reference
+cloning; `instruct` voice design; none → auto voice. Returns OGG.
+
+**`POST /v1/gemini/tts`** — studio preview. `text` (required, ≤ `MAX_TEXT_LEN`)
+· `voice` (default `GEMINI_TTS_VOICE`) · `instruct` (style) · `model` (default
+`GEMINI_TTS_MODEL`). Synthesizes one phrase with Gemini and returns **WAV**
+(not banked — save keepers via `POST /v1/voices`). Needs `GEMINI_API_KEY`;
+`502` on upstream failure.
+
+**`POST /v1/voices`** — save a clone reference. `name` (required) · `ref_text`
+(required — transcript) · `audio` (required WAV upload, RIFF-checked, ≤ 10 MB)
+· `lang` (default `en-us`) · `instruct` · `source` (default `gemini`). Writes
+the clip under `VOICES_ROOT` and upserts the `voices` registry on
+`(name, lang)`; the saved name is then usable as `/v1/tts` `voice=` and appears
+in `GET /v1/voices`.
 
 ## Run
 
