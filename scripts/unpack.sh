@@ -45,4 +45,3 @@ echo
 echo "run the server:"
 echo "  SERVE_FRONTEND=1 .venv/bin/uvicorn src.server:app --port 8000"
 echo "  → open http://localhost:8000"
-echo "live synthesis (optional): MODEL_ENABLED=1 + .venv/bin/pip install -r requirements-model.txt"

@@ -26,6 +26,18 @@ def mirror_path(src_path: str, src_root: str, dest_root: str,
     return os.path.join(dest_root, os.path.splitext(rel)[0] + new_ext)
 
 
+def path_under(root: str, rel: str) -> str:
+    """``root/rel``, or ValueError if that resolves outside `root` (``..``, an
+    absolute `rel`, or a symlink out). The last check before writing a path
+    built from request input; callers validate the segments first.
+    """
+    real_root = os.path.realpath(root)
+    target = os.path.realpath(os.path.join(real_root, rel))
+    if os.path.commonpath([real_root, target]) != real_root:
+        raise ValueError(f"refusing to write {rel!r}: it resolves outside {root!r}")
+    return os.path.join(root, rel)
+
+
 def voice_from_path(file_path: str) -> Optional[str]:
     """Recover the `voice` a manifest row was generated with from its stored
     `file_path`, whose directory segment encodes `<backend>-<voice>`:

@@ -2,11 +2,11 @@
 
 A multilingual text-to-speech service built around a **pre-generated word bank**:
 audio for a large word list is generated once (cloud TTS), stored as compact
-OGG, and served as static files with sub-millisecond lookup. Optional live
-synthesis (OmniVoice) is available behind a flag for words not in the bank.
+OGG, and served as static files with sub-millisecond lookup. Anything not in the
+bank is generated on demand with Gemini (`/v1/speak`) and saved into it.
 
 The design trades upfront generation for a tiny, cheap, low-latency runtime: the
-serving image needs **no ML stack at all** unless live synthesis is enabled.
+serving image needs **no ML stack at all**.
 
 ---
 
@@ -16,8 +16,7 @@ serving image needs **no ML stack at all** unless live synthesis is enabled.
 1. Local dev      generate audio (Gemini Batch) + code changes
                   → WAV masters + manifest, then encode OGG copies
 2. Build + push   build the (code-only) image; push OGG + manifest to storage
-3. Deploy         container pulls OGG + manifest into a volume and serves;
-                  pulls model weights only when MODEL_ENABLED=1
+3. Deploy         container pulls OGG + manifest into a volume and serves
 ```
 
 ## Architecture
@@ -26,8 +25,8 @@ serving image needs **no ML stack at all** unless live synthesis is enabled.
 |------|------------|
 | **Generation** (`wordbank/`) | Batch pipeline: word list → Gemini Batch API → WAV masters + SQLite manifest. Resumable, quota-aware. |
 | **Encoding** (`scripts/encode_wavs.py`) | Mirrors WAV masters → OGG/Opus copy tree (16k VoIP, ~3 KB/word, ~20× smaller). WAV stays a local master; **OGG is what production serves**. |
-| **Serving** (`src/server.py`) | FastAPI. Bank lookup (indexed SQLite) + static file serving. Optional live OmniVoice synth behind `MODEL_ENABLED`. |
-| **Frontend** (`frontend/`) | Static UI: word-bank lookup (with autocomplete + WAV/OGG compare) and a synthesis form. Served by the API when `SERVE_FRONTEND=1`. |
+| **Serving** (`src/server.py`) | FastAPI. Bank lookup (indexed SQLite) + static file serving; `/v1/speak` fills misses via Gemini. |
+| **Frontend** (`frontend/`) | Static UI: bank lookup (autocomplete, WAV/OGG compare, Speak) and a Gemini voice preview. Served by the API when `SERVE_FRONTEND=1`. |
 
 ## The manifest (`wordbank.db`)
 
@@ -35,8 +34,8 @@ Two content tables are the source of truth (and the text→file index), stored
 **separately so words and phrases never overlap**:
 
 - **`words`** — the Gemini single-word bank, `UNIQUE(word, lang)`.
-- **`phrases`** — the local OmniVoice phrase bank, `UNIQUE(text, lang, voice)`
-  (a phrase can exist in several voices). Written by `wordbank generate`.
+- **`phrases`** — the phrase bank, `UNIQUE(text, lang, voice)` (a phrase can
+  exist in several voices). Written by `POST /v1/speak` on a miss.
 
 Both share the same columns:
 
@@ -47,11 +46,11 @@ Both share the same columns:
 | `voice` | the voice/reference label the clip was generated with (surfaced in lookups) |
 | `status` | `pending → submitted → done` (or `verified` / `failed` / `quarantined`) |
 | `file_path` | **relative to the bank root**, e.g. `en/gemini-Kore/1/1914_hello.wav` |
-| `seed`, `ref_audio`, `ref_text` | **provenance for local phrases** — the RNG seed and the clone reference used, so every generated clip is reproducible |
+| `seed`, `ref_audio`, `ref_text` | provenance of phrases made by the removed local OmniVoice pipeline; null for Gemini clips |
 | `attempts`, `batch_id`, `transcript`, `billed_chars`, `error`, `created_at`, `updated_at` | bookkeeping + metadata |
 
-A third table, **`voices`**, is a registry of reusable clone references
-(`name, lang, ref_audio, ref_text, …`) — generation-side only, never served.
+Banks created before the local pipeline was removed may also hold an unused
+`voices` table.
 
 Audio lives in two parallel trees; the server resolves `file_path` under the
 configured roots (so location is deployment config, not baked into the data):
@@ -68,15 +67,14 @@ the `UNIQUE` index; prefix autocomplete uses an index range scan.
 
 | Endpoint | Purpose |
 |----------|---------|
-| `GET /health` | status, bank path/word-count, model + Gemini flags |
-| `GET /v1/languages` | `wordbank` + `phrasebank` (data-driven langs + counts) **and** `generate` (curated, verified list the model can generate) |
+| `GET /health` | status, bank path/word-count, Gemini/upstream/store flags |
+| `GET /v1/languages` | `wordbank` + `phrasebank` (data-driven langs + counts) **and** `generate` (curated, listen-verified list) |
 | `GET /v1/search?prefix=he` | **merged** word+phrase autocomplete; each result carries a `type` flag (`word`\|`phrase`) and its `voice` (`kind=word\|phrase` restricts) |
 | `GET /v1/bank?prefix=he` | word-only autocomplete (index range scan) |
 | `GET /v1/bank/{word}` · `/info` | serve a word (OGG default; `wav` dev-only) · sizes+type+voice |
-| `GET /v1/phrase?text=…` · `/info` | serve a phrase (by text, optional `voice`) · sizes+type+voice+seed+reference |
-| `POST /v1/tts` | live synthesis — `ref_audio` upload, a saved `voice=<name>`, or `instruct` (requires `MODEL_ENABLED`; else `503`) |
+| `GET /v1/phrase?text=…` · `/info` | serve a phrase (by text, optional `voice`) · sizes+type+voice+provenance |
 | `POST /v1/speak` | get-or-generate — `text` (required), `lang` (default `en-us`), `voice` (optional Gemini prebuilt, case-insensitive; unknown → `400`), `instruct` (optional). Bank hit in that voice → stored OGG, `X-Source: bank`. Miss → Gemini synth in that voice, saved into the phrase bank (`voice=gemini-<Voice>`), served with `X-Source: gemini`; `X-Voice` names the voice served. Needs `GEMINI_API_KEY` only on a miss |
-| voice studio | `GET /v1/gemini/voices`, `POST /v1/gemini/tts`, `GET/POST /v1/voices`, `GET /v1/voices/{lang}/{name}/audio` — author + save clone references |
+| voice studio | `GET /v1/gemini/voices` (the voices `/v1/speak` accepts), `POST /v1/gemini/tts` (preview a voice, nothing saved) |
 
 ### Endpoint reference
 
@@ -93,9 +91,9 @@ isn't a single path segment.
 
 #### Read-only (bank + status)
 
-**`GET /health`** — no params. `{status, healthy, model, model_enabled, bank,
-bank_path, bank_words}` (+ `device`/`model_loaded` when the model is enabled).
-`200` if the service can serve *something* (bank or live model), else `503`.
+**`GET /health`** — no params. `{status, healthy, gemini, upstream, store, bank,
+bank_path, bank_words}`. `200` if the service can serve *something* (a bank, a
+Gemini key, or an upstream), else `503`.
 
 **`GET /v1/languages`** — no params. `{wordbank, phrasebank, generate}`:
 the first two are data-driven `{code, words}` counts from the bank; `generate`
@@ -117,15 +115,12 @@ bytes}, ogg: {...}}` for the compare UI.
 **`GET /v1/phrase`** — `text` (required) · `lang` · `voice` (optional — pin a
 specific voice; omitted = any) · `format`. The phrase's audio, or 404.
 **`GET /v1/phrase/info`** — same params, plus provenance in the response:
-`seed`, `ref_audio`, `ref_text`.
+`seed`, `ref_audio`, `ref_text` (set only on phrases from the removed local
+pipeline).
 
 **`GET /v1/gemini/voices`** — no params. The 30 prebuilt Gemini voices
 `{name, style, gender}`. Voices are style presets, **not** language-bound —
 Gemini auto-detects language from the text.
-
-**`GET /v1/voices`** — `lang` (optional filter). Saved clone references
-`{name, lang, ref_audio, ref_text, instruct, source}`.
-**`GET /v1/voices/{lang}/{name}/audio`** — the stored reference clip itself.
 
 #### Write / synthesis (JWT, multipart form fields)
 
@@ -139,36 +134,20 @@ of the bank key — a banked phrase wins over a new instruct variant. Errors:
 `400` empty/oversize text, `502` Gemini failure (detail names the `finish_reason` when it
 returned no audio), `503` encoding stack absent.
 
-**`POST /v1/tts`** — live OmniVoice synthesis (`MODEL_ENABLED` required, else
-`503`). `text` (required, ≤ `MAX_TEXT_LEN`) · `ref_audio` (clip upload, ≤
-`MAX_REF_BYTES` = 10 MB) · `ref_text` (transcript of the clip) · `voice` (a
-*saved* reference name — cloned from the stored clip) · `lang` · `instruct`
-(voice-design prompt) · `guidance_scale` (float) · `seed` (int, reproducible
-RNG). Modes: `ref_audio`[+`ref_text`] one-off cloning; `voice` saved-reference
-cloning; `instruct` voice design; none → auto voice. Returns OGG.
-
 **`POST /v1/gemini/tts`** — studio preview. `text` (required, ≤ `MAX_TEXT_LEN`)
 · `voice` (default `GEMINI_TTS_VOICE`) · `instruct` (style) · `model` (default
 `GEMINI_TTS_MODEL`). Synthesizes one phrase with Gemini and returns **WAV**
-(not banked — save keepers via `POST /v1/voices`). Needs `GEMINI_API_KEY`;
-`502` on upstream failure.
-
-**`POST /v1/voices`** — save a clone reference. `name` (required) · `ref_text`
-(required — transcript) · `audio` (required WAV upload, RIFF-checked, ≤ 10 MB)
-· `lang` (default `en-us`) · `instruct` · `source` (default `gemini`). Writes
-the clip under `VOICES_ROOT` and upserts the `voices` registry on
-`(name, lang)`; the saved name is then usable as `/v1/tts` `voice=` and appears
-in `GET /v1/voices`.
+(never banked). Needs `GEMINI_API_KEY`; `502` on upstream failure.
 
 ## Run
 
 ```bash
-# Dev (server + frontend, same origin; bank only, no model):
+# Dev (server + frontend, same origin):
 SERVE_FRONTEND=1 .venv/bin/uvicorn src.server:app --port 8000   # → http://localhost:8000
 
 # Docker (production path — plain docker build/run, no compose):
 bash scripts/pack.sh              # → library.json + tts-bank.tar.gz
-scripts/docker-build-fat.sh       # fat image: bank baked in, no torch
+scripts/docker-build-fat.sh       # fat image: bank baked in
 scripts/docker-run.sh fat
 
 # scripts/docker-build-thin.sh builds code-only (no baked bank; needs a
@@ -178,8 +157,7 @@ scripts/docker-run.sh fat
 scripts/docker-build-thin.sh && scripts/docker-run.sh thin   # DOCKER_DNS=8.8.8.8 if local DNS blocks Gemini
 
 # Docker compose — dev-only convenience, mounts library.json/tts-bank.tar.gz as a volume:
-docker compose --profile bank up --build   # lightweight bank-only (no torch)
-docker compose --profile full up --build   # + live synthesis (downloads weights to a cache volume)
+docker compose --profile bank up --build
 ```
 
 ## Edge cache
@@ -233,7 +211,7 @@ the two data artifacts that ride alongside it:
 
 ```bash
 bash scripts/pack.sh
-# → library.json     description: languages, voices, word/phrase counts, folders
+# → library.json     description: languages, word/phrase counts, folders
 # → tts-bank.tar.gz  library code + wordbank.db + served OGG (excludes WAV masters)
 ```
 
@@ -256,15 +234,15 @@ python -m wordbank verify --desc library.json                # dev checkout
 ```
 
 `--root` selects the flat deploy layout (`/data/wordbank.db` + `/data/words_ogg`).
-With no `--root`, `db`/`ogg_root`/`voices_root` fall back to the server's own env
-defaults (`BANK_DB`/`OGG_ROOT`/`VOICES_ROOT`) — so a bare `verify` checks exactly
-what the server would serve. Override any of them with `--db`/`--ogg-root`/`--voices-root`.
+With no `--root`, `db`/`ogg_root` fall back to the server's own env defaults
+(`BANK_DB`/`OGG_ROOT`) — so a bare `verify` checks exactly what the server would
+serve. Override either with `--db`/`--ogg-root`.
 
 **Bare-metal (no Docker)** — unpack the archive and run directly:
 
 ```bash
 mkdir tts-bank && tar xzf tts-bank.tar.gz -C tts-bank && cd tts-bank
-bash scripts/unpack.sh                     # .venv + serving deps (no ML stack), verifies the bank
+bash scripts/unpack.sh                     # .venv + serving deps, verifies the bank
 SERVE_FRONTEND=1 .venv/bin/uvicorn src.server:app --port 8000
 ```
 
@@ -275,9 +253,6 @@ SERVE_FRONTEND=1 .venv/bin/uvicorn src.server:app --port 8000
 | `BANK_DB` | `wordbank.db` | manifest path |
 | `OGG_ROOT` | `output/words_ogg` | served OGG tree |
 | `WAV_ROOT` | `output/words` | WAV masters (dev compare only) |
-| `VOICES_ROOT` | `output/voices` | clone-reference clips (voice studio) |
-| `MODEL_ENABLED` | off | enable live `/v1/tts` synthesis |
-| `PRELOAD_MODEL` | off | load weights at startup vs first request |
 | `SERVE_FRONTEND` | off | serve the static UI from the API |
 | `CORS_ORIGINS` | `*` (any) | comma-separated allowed origins. **Browser-enforced only — not authentication**; it does nothing against `curl` or any non-browser client |
 | `JWT_SECRET` | unset | enables bearer-token auth on write/synthesis routes (see [Auth](#auth)); unset = open/dev |
@@ -293,8 +268,8 @@ SERVE_FRONTEND=1 .venv/bin/uvicorn src.server:app --port 8000
 ## Auth
 
 The API is **open by default** (dev mode). Setting `JWT_SECRET` turns on
-bearer-token auth for the write/synthesis routes — `POST /v1/tts`,
-`POST /v1/gemini/tts`, `POST /v1/voices`, `POST /v1/speak` — via an HS256
+bearer-token auth for the synthesis routes — `POST /v1/speak` and
+`POST /v1/gemini/tts` — via an HS256
 `Authorization: Bearer <token>` check. Every `GET` endpoint and `/health` stay
 public either way. A
 missing/invalid/expired token gets a `401` with a `WWW-Authenticate: Bearer`
@@ -314,10 +289,6 @@ set -a; . ./.env; set +a
 python scripts/make_token.py --sub dev --ttl 3600
 ```
 
-```bash
-curl -H "Authorization: Bearer $TOKEN" -F text="hello" http://localhost:8000/v1/tts -o out.ogg
-```
-
 `POST /v1/speak` is get-or-generate: a bank hit serves the stored OGG
 (`X-Source: bank`); a miss synthesizes via Gemini, saves it into the phrase
 bank (so the same text is a bank hit next time), and serves that
@@ -333,8 +304,8 @@ curl -H "Authorization: Bearer $TOKEN" -F text="good morning" -F voice=Puck http
 ```
 
 **Health and startup.** `/health` returns **503** when the service can serve
-nothing — no bank, `MODEL_ENABLED` off, *and* no `GEMINI_API_KEY` — and 200
-otherwise (a model-only or Gemini-only deployment with no bank is legitimate and
+nothing — no bank, no `GEMINI_API_KEY`, *and* no `SPEAK_UPSTREAM_URL` — and 200
+otherwise (a Gemini-only or edge deployment with no bank is legitimate and
 stays healthy; the first `/v1/speak` miss creates the bank on the volume). `docker-entrypoint.sh`
 applies the same rule: it refuses to start (`exit 1`) rather than come up and
 404 every lookup, and the image's `HEALTHCHECK` is wired to `/health` with a
@@ -348,26 +319,20 @@ python scripts/fetch_wordlist.py --lang en --n 50000          # credible word li
 GEMINI_API_KEY=… python -m wordbank batch-run --words data/words_en.txt --voice Kore
 python scripts/encode_wavs.py output/words output/words_ogg   # OGG copies
 python -m wordbank status                                     # progress (words + phrases)
-
-# Phrase bank (local OmniVoice; accent via a Gemini clone reference):
-GEMINI_API_KEY=… python -m wordbank --lang en-gb gemini-voice --text "…" --name en-gb  # make+save a reference
-python -m wordbank --lang en-gb generate --words phrases.txt --voice en-gb  # seed + reference recorded per phrase
 ```
-Every locally-generated phrase records the RNG **seed** and the **reference clip**
-used, so it's reproducible. See [WORDBANK_PLAN.md](WORDBANK_PLAN.md) for rationale.
+The phrase bank fills itself: every `/v1/speak` miss is generated and saved.
 
 ## Tests
 
 ```bash
-pytest                                              # unit (no model/cloud)
-pytest --integration tests/test_integration.py      # loads OmniVoice (slow)
+pytest                                              # unit (no cloud)
+set -a; . ./.env; set +a
+pytest --integration tests/test_integration.py      # live Gemini (paid; one synthesis)
 ```
 
 ---
 
 ## TODO
 
-- [ ] **Validate voice-cloning quality** — the local phrase pipeline is wired (records seed + reference per clip) but the cloning *quality* hasn't been judged against a real accent reference. Generate an en-GB set and listen.
-- [ ] **Fill the phrase bank** — the `phrases` table, merged `/v1/search`, and the voice studio all work; what's left is authoring reference voices and generating phrase sets per accent. See AGENTS.md → *Runbook: accent bank via local OmniVoice + Gemini reference*.
-- [ ] **Add multi-language support** — same local-clone pattern per locale; serving + `/v1/languages` are already data-driven (language-scoped lookup + `(lang, word)` index), so it's mostly a generation + word-list task per language.
-- [x] **Add JWT auth** — bearer tokens (HS256, `JWT_SECRET`) protect `/v1/tts`, `/v1/gemini/tts`, and `POST /v1/voices`; read-only bank endpoints stay public. See [Auth](#auth) below.
+- [ ] **Add multi-language support** — serving + `/v1/languages` are already data-driven (language-scoped lookup + `(lang, word)` index), so it's a word list + a Gemini batch run + a verified listen per language.
+- [x] **Add JWT auth** — bearer tokens (HS256, `JWT_SECRET`) protect `/v1/speak` and `/v1/gemini/tts`; read-only bank endpoints stay public. See [Auth](#auth) above.

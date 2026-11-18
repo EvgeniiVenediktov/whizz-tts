@@ -6,23 +6,19 @@
 # restarts find the volume already provisioned and skip the unpack.
 #
 #   scripts/pack.sh                            # → library.json + tts-bank.tar.gz
-#   docker compose --profile bank up --build   # lightweight, OGG-only (no model)
-#   docker compose --profile full up --build   # adds live OmniVoice synthesis
+#   docker compose --profile bank up --build
 #
 # WAV masters are never served in production (OGG only).
 services:
   tts-bank:
     build:
       context: .
-      args: { WITH_MODEL: "0" }
     profiles: [bank]
     ports: ["8000:8000"]
     environment:
-      MODEL_ENABLED: "0"
       SERVE_FRONTEND: "1"
       BANK_DB: /data/wordbank.db
       OGG_ROOT: /data/words_ogg
-      VOICES_ROOT: /data/voices
       # LIBRARY_DESC: /data/library.json          # defaults; override if placed elsewhere
       # LIBRARY_ARCHIVE: /data/tts-bank.tar.gz
       # BANK_SYNC_CMD: "aws s3 sync s3://BUCKET/words_ogg /data/words_ogg && aws s3 cp s3://BUCKET/wordbank.db /data/wordbank.db"
@@ -49,38 +45,6 @@ services:
       # Local-dev alternative — bind-mount an already-unpacked bank instead of the package:
       # - ./output/words_ogg:/data/words_ogg:ro
       # - ./wordbank.db:/data/wordbank.db
-      # - ./output/voices:/data/voices:ro
-
-  tts-full:
-    build:
-      context: .
-      args: { WITH_MODEL: "1" }
-    profiles: [full]
-    ports: ["8000:8000"]
-    environment:
-      MODEL_ENABLED: "1"
-      PRELOAD_MODEL: "1"                  # pull/load weights at startup, not first request
-      SERVE_FRONTEND: "1"
-      BANK_DB: /data/wordbank.db
-      OGG_ROOT: /data/words_ogg
-      VOICES_ROOT: /data/voices
-      HF_HOME: /hf-cache                  # weights cached across restarts
-    # Longer start-period than tts-bank: PRELOAD_MODEL=1 loads OmniVoice weights
-    # at startup (first run also downloads them into hf-cache) on top of the
-    # same bank-unpack step, so first boot can legitimately take much longer.
-    healthcheck:
-      test: ["CMD", "python", "-c",
-             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 900s
-    volumes:
-      - bank-data:/data
-      - ./library.json:/data/library.json:ro
-      - ./tts-bank.tar.gz:/data/tts-bank.tar.gz:ro
-      - hf-cache:/hf-cache
 
 volumes:
-  hf-cache:
   bank-data:

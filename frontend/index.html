@@ -19,15 +19,9 @@
       gap: 20px;
       padding: 28px 16px;
     }
-    /* Wide screens: the tall TTS card gets its own column; the two shorter
-       cards stack in the other so the columns stay balanced (no skew). */
-    #card-bank   { grid-column: 1; grid-row: 1; }
-    #card-studio { grid-column: 1; grid-row: 2; }
-    #card-tts    { grid-column: 2; grid-row: 1 / span 2; }
     /* Narrow screens: one centered column, natural source order. */
     @media (max-width: 980px) {
       body { grid-template-columns: minmax(0, 620px); }
-      #card-bank, #card-studio, #card-tts { grid-column: 1; grid-row: auto; }
     }
 
     .card {
@@ -68,100 +62,6 @@
     textarea { resize: vertical; min-height: 100px; font-family: inherit; }
     textarea:focus, input[type="text"]:focus, select:focus { border-color: #5b6af0; }
     .hint { font-size: 0.82rem; color: #777; line-height: 1.4; }
-    .row { display: flex; gap: 12px; }
-    .row > * { flex: 1; }
-
-    /* Mode tabs */
-    .mode-tabs {
-      display: flex;
-      gap: 6px;
-    }
-    .tab {
-      background: #111116;
-      border: 1px solid #2e2e38;
-      border-radius: 6px;
-      color: #888;
-      cursor: pointer;
-      font-size: 0.82rem;
-      padding: 6px 14px;
-      transition: all 0.15s;
-    }
-    .tab:hover { border-color: #5b6af0; color: #ccc; }
-    .tab.active { background: #1e2050; border-color: #5b6af0; color: #a0aaff; font-weight: 600; }
-
-    .mode-panel { display: none; flex-direction: column; gap: 16px; }
-    .mode-panel.visible { display: flex; }
-
-    .section-box {
-      border: 1px dashed #2e2e38;
-      border-radius: 8px;
-      padding: 16px;
-      display: flex;
-      flex-direction: column;
-      gap: 16px;
-    }
-
-    /* File picker */
-    .file-row { display: flex; align-items: center; gap: 10px; }
-    .file-btn {
-      background: #22222a;
-      border: 1px solid #2e2e38;
-      border-radius: 6px;
-      color: #bbb;
-      cursor: pointer;
-      font-size: 0.85rem;
-      padding: 7px 14px;
-      white-space: nowrap;
-      transition: border-color 0.15s;
-      flex-shrink: 0;
-    }
-    .file-btn:hover { border-color: #5b6af0; color: #fff; }
-    #file-name { font-size: 0.85rem; color: #555; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    #ref-audio-input { display: none; }
-    .clear-btn {
-      background: none; border: none; color: #444; cursor: pointer;
-      font-size: 0.85rem; margin-left: auto; padding: 4px 6px; flex-shrink: 0;
-    }
-    .clear-btn:hover { color: #e06c75; }
-
-    /* Voice design chips */
-    .chips-group { display: flex; flex-direction: column; gap: 6px; }
-    .chips-group-label { font-size: 0.72rem; color: #555; text-transform: uppercase; letter-spacing: 0.05em; }
-    .chips { display: flex; flex-wrap: wrap; gap: 6px; }
-    .chip {
-      background: #111116;
-      border: 1px solid #2e2e38;
-      border-radius: 20px;
-      color: #888;
-      cursor: pointer;
-      font-size: 0.8rem;
-      padding: 4px 12px;
-      transition: all 0.12s;
-      user-select: none;
-    }
-    .chip:hover { border-color: #5b6af0; color: #ccc; }
-    .chip.selected { background: #1e2050; border-color: #5b6af0; color: #a0aaff; }
-
-    .instruct-preview {
-      background: #111116;
-      border: 1px solid #2e2e38;
-      border-radius: 6px;
-      color: #666;
-      font-size: 0.82rem;
-      min-height: 32px;
-      padding: 7px 12px;
-    }
-    .instruct-preview.has-value { color: #a0aaff; }
-
-    /* Warning */
-    .warn {
-      background: #1f1a10;
-      border: 1px solid #5c4a10;
-      border-radius: 8px;
-      color: #c9973a;
-      font-size: 0.85rem;
-      padding: 10px 14px;
-    }
 
     /* Submit row */
     .submit-row { display: flex; align-items: center; gap: 16px; }
@@ -239,148 +139,9 @@
   </div>
 </div>
 
-<div class="card" id="card-tts">
-  <h1>Text to Speech</h1>
-
-  <label class="field-label">
-    Text
-    <textarea id="text" placeholder="Enter text to synthesize…"></textarea>
-  </label>
-
-  <!-- Mode selector -->
-  <div class="field-label">
-    Voice mode
-    <div class="mode-tabs">
-      <button class="tab active" data-mode="clone">Voice cloning</button>
-      <button class="tab" data-mode="design">Voice design</button>
-    </div>
-  </div>
-
-  <!-- Voice cloning panel -->
-  <div class="mode-panel visible" id="panel-clone">
-    <div class="section-box">
-      <label class="field-label">
-        Saved reference
-        <span style="color:#444;text-transform:none;letter-spacing:0;font-size:0.75rem">pick one made in the Gemini voice studio below — or upload a file</span>
-        <select id="saved-voice"><option value="">— none —</option></select>
-      </label>
-      <label class="field-label">
-        Reference audio
-        <div class="file-row">
-          <button type="button" class="file-btn" onclick="document.getElementById('ref-audio-input').click()">Choose file</button>
-          <span id="file-name">No file chosen</span>
-          <button type="button" class="clear-btn" id="clear-file" title="Remove">✕</button>
-          <input type="file" id="ref-audio-input" accept="audio/*">
-        </div>
-      </label>
-      <label class="field-label">
-        Reference transcript
-        <span style="color:#444;text-transform:none;letter-spacing:0;font-size:0.75rem">leave blank to auto-transcribe via Whisper (slow)</span>
-        <input type="text" id="ref-text" placeholder="Words spoken in the reference audio…">
-      </label>
-    </div>
-  </div>
-
-  <!-- Voice design panel -->
-  <div class="mode-panel" id="panel-design">
-    <div class="section-box">
-
-      <div class="chips-group">
-        <span class="chips-group-label">Gender <span style="color:#e06c75">*</span></span>
-        <div class="chips" data-group="gender" data-required="true">
-          <span class="chip" data-value="male">Male</span>
-          <span class="chip selected" data-value="female">Female</span>
-        </div>
-      </div>
-
-      <div class="chips-group">
-        <span class="chips-group-label">Age</span>
-        <div class="chips" data-group="age">
-          <span class="chip" data-value="child">Child</span>
-          <span class="chip" data-value="teenager">Teenager</span>
-          <span class="chip selected" data-value="young adult">Young adult</span>
-          <span class="chip" data-value="middle-aged">Middle-aged</span>
-          <span class="chip" data-value="elderly">Elderly</span>
-        </div>
-      </div>
-
-      <div class="chips-group">
-        <span class="chips-group-label">Pitch</span>
-        <div class="chips" data-group="pitch">
-          <span class="chip" data-value="very low pitch">Very low</span>
-          <span class="chip" data-value="low pitch">Low</span>
-          <span class="chip selected" data-value="moderate pitch">Moderate</span>
-          <span class="chip" data-value="high pitch">High</span>
-          <span class="chip" data-value="very high pitch">Very high</span>
-        </div>
-      </div>
-
-      <div class="chips-group">
-        <span class="chips-group-label">Accent</span>
-        <div class="chips" data-group="accent">
-          <span class="chip selected" data-value="american accent">American</span>
-          <span class="chip" data-value="british accent">British</span>
-          <span class="chip" data-value="australian accent">Australian</span>
-          <span class="chip" data-value="indian accent">Indian</span>
-          <span class="chip" data-value="chinese accent">Chinese</span>
-          <span class="chip" data-value="canadian accent">Canadian</span>
-          <span class="chip" data-value="korean accent">Korean</span>
-          <span class="chip" data-value="russian accent">Russian</span>
-        </div>
-      </div>
-
-      <div class="chips-group">
-        <span class="chips-group-label">Style</span>
-        <div class="chips" data-group="style">
-          <span class="chip" data-value="whisper">Whisper</span>
-        </div>
-      </div>
-
-      <div class="field-label">
-        Instruct string sent to model
-        <div class="instruct-preview" id="instruct-preview"></div>
-      </div>
-
-      <div class="warn">
-        Attribute control (gender/accent) is unreliable on very short text.
-        Use a full sentence for dependable results.
-      </div>
-
-    </div>
-  </div>
-
-  <!-- Advanced tuning (applies to all modes) -->
-  <div class="section-box">
-    <span class="chips-group-label">Advanced</span>
-    <label class="field-label" style="text-transform:none;letter-spacing:0;color:#888">
-      Guidance scale — how strongly the voice settings are followed
-      <div style="display:flex;align-items:center;gap:12px">
-        <input type="range" id="guidance" min="1" max="7" step="0.5" value="2" style="flex:1;accent-color:#5b6af0">
-        <span id="guidance-val" style="color:#a0aaff;font-variant-numeric:tabular-nums;min-width:3ch">2.0</span>
-      </div>
-    </label>
-    <label class="field-label" style="text-transform:none;letter-spacing:0;color:#888">
-      Seed — fixed integer for reproducible output; blank = random each time
-      <input type="text" id="seed" inputmode="numeric" placeholder="e.g. 42 (blank = random)">
-    </label>
-  </div>
-
-  <div class="submit-row">
-    <button type="submit" id="submit-btn">Generate</button>
-    <span class="timer" id="timer">0.0s</span>
-  </div>
-
-  <div class="error" id="error"></div>
-
-  <div class="result" id="result">
-    <span class="result-label">Output</span>
-    <audio id="player" controls></audio>
-  </div>
-</div>
-
 <div class="card" id="card-studio">
   <h1>Gemini voice studio</h1>
-  <p class="hint">Generate a phrase with Gemini, listen, and save good ones as OmniVoice clone references. Saved references appear in the cloning picker above. <span style="color:#c9973a">Server needs <code>GEMINI_API_KEY</code>.</span></p>
+  <p class="hint">Preview a phrase in any Gemini prebuilt voice before using that voice with Speak. Nothing is saved. <span style="color:#c9973a">Server needs <code>GEMINI_API_KEY</code>.</span></p>
 
   <label class="field-label">
     API token <span style="color:#444;text-transform:none;letter-spacing:0;font-size:0.75rem">only needed if the server has JWT auth enabled (<code>JWT_SECRET</code> set) — mint one with <code>scripts/make_token.py</code>; stored in this browser only</span>
@@ -392,35 +153,10 @@
     <textarea id="g-text">this was such a unique experience</textarea>
   </label>
 
-  <div class="row">
-    <label class="field-label">Voice
-      <select id="g-voice"><option value="Kore">Kore — Firm</option></select>
-    </label>
-    <label class="field-label">Language
-      <select id="g-lang">
-        <option value="en-us">🇺🇸 English (US)</option>
-        <option value="en-gb">🇬🇧 English (UK)</option>
-        <option value="en-au">🇦🇺 English (AU)</option>
-        <option value="en-in">🇮🇳 English (India)</option>
-        <option value="es-es">🇪🇸 Spanish (Spain)</option>
-        <option value="es-mx">🇲🇽 Spanish (Mexico)</option>
-        <option value="fr-fr">🇫🇷 French</option>
-        <option value="de-de">🇩🇪 German</option>
-        <option value="it-it">🇮🇹 Italian</option>
-        <option value="pt-br">🇧🇷 Portuguese (Brazil)</option>
-        <option value="nl-nl">🇳🇱 Dutch</option>
-        <option value="pl-pl">🇵🇱 Polish</option>
-        <option value="ru-ru">🇷🇺 Russian</option>
-        <option value="hi-in">🇮🇳 Hindi</option>
-        <option value="ja-jp">🇯🇵 Japanese</option>
-        <option value="ko-kr">🇰🇷 Korean</option>
-        <option value="zh-cn">🇨🇳 Chinese (Mandarin)</option>
-        <option value="ar-xa">🇸🇦 Arabic</option>
-        <option value="tr-tr">🇹🇷 Turkish</option>
-      </select>
-    </label>
-  </div>
-  <p class="hint" style="margin-top:-8px">A voice is a <em>style</em> preset and speaks any language — Gemini auto-detects language from your phrase. Language here is just how the reference is filed for OmniVoice, so write the phrase in that language.</p>
+  <label class="field-label">Voice
+    <select id="g-voice"><option value="Kore">Kore — Firm</option></select>
+  </label>
+  <p class="hint" style="margin-top:-8px">A voice is a <em>style</em> preset and speaks any language — Gemini auto-detects language from your phrase.</p>
 
   <label class="field-label">
     Instruct <span style="color:#444;text-transform:none;letter-spacing:0;font-size:0.75rem">optional accent/style, e.g. “British accent” (not spoken)</span>
@@ -437,13 +173,6 @@
   <div class="result" id="g-result">
     <span class="result-label">Preview</span>
     <audio id="g-player" controls></audio>
-    <div class="row" style="align-items:flex-end;margin-top:4px">
-      <label class="field-label" style="flex:2">Reference name
-        <input type="text" id="g-name" placeholder="e.g. kore-warm">
-      </label>
-      <button type="submit" id="g-save" style="flex:1">Save as reference</button>
-    </div>
-    <span id="g-save-status" class="hint"></span>
   </div>
 </div>
 
@@ -451,17 +180,14 @@
   // Same-origin relative URLs: works when the frontend is served by the API
   // server (SERVE_FRONTEND=1). Override window.API_BASE to point elsewhere.
   const API_BASE = window.API_BASE || '';
-  const API = `${API_BASE}/v1/tts`;
   const BANK = `${API_BASE}/v1/bank`;
-  const VOICES = `${API_BASE}/v1/voices`;
   const GEMINI = `${API_BASE}/v1/gemini/tts`;
   const SEARCH = `${API_BASE}/v1/search`;
   const PHRASE = `${API_BASE}/v1/phrase`;
   const SPEAK = `${API_BASE}/v1/speak`;
 
   // ---- API token (JWT) ----
-  // Only the three write/synthesis routes (/v1/tts, /v1/gemini/tts, /v1/voices
-  // POST) need this — the server is env-gated (JWT_SECRET unset = open/dev).
+  // Only the synthesis routes (/v1/speak, /v1/gemini/tts) need this — the server is env-gated (JWT_SECRET unset = open/dev).
   // Stored in localStorage so it survives reloads; never sent to any other origin.
   const apiTokenEl = document.getElementById('api-token');
   apiTokenEl.value = localStorage.getItem('jwt_token') || '';
@@ -615,163 +341,7 @@
   }
   bankSpeakBtn.addEventListener('click', speakBank);
 
-  // Mode tabs
-  let activeMode = 'clone';
-  document.querySelectorAll('.tab').forEach(tab => {
-    tab.addEventListener('click', () => {
-      activeMode = tab.dataset.mode;
-      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-      document.querySelectorAll('.mode-panel').forEach(p => p.classList.remove('visible'));
-      tab.classList.add('active');
-      document.getElementById(`panel-${activeMode}`).classList.add('visible');
-    });
-  });
-
-  // File picker
-  const fileInput  = document.getElementById('ref-audio-input');
-  const fileNameEl = document.getElementById('file-name');
-  fileInput.addEventListener('change', () => {
-    fileNameEl.textContent = fileInput.files[0]?.name ?? 'No file chosen';
-  });
-  document.getElementById('clear-file').addEventListener('click', () => {
-    fileInput.value = '';
-    fileNameEl.textContent = 'No file chosen';
-  });
-
-  // Chips — mutually exclusive within each group
-  const selectedByGroup = {};
-  document.querySelectorAll('.chips').forEach(group => {
-    const g = group.dataset.group;
-    // Init from pre-selected chips
-    const pre = group.querySelector('.chip.selected');
-    selectedByGroup[g] = pre ? pre.dataset.value : null;
-
-    const required = group.dataset.required === 'true';
-    group.querySelectorAll('.chip').forEach(chip => {
-      chip.addEventListener('click', () => {
-        if (selectedByGroup[g] === chip.dataset.value) {
-          if (!required) {
-            chip.classList.remove('selected');
-            selectedByGroup[g] = null;
-          }
-          // required group: keep selection, do nothing
-        } else {
-          group.querySelectorAll('.chip').forEach(c => c.classList.remove('selected'));
-          chip.classList.add('selected');
-          selectedByGroup[g] = chip.dataset.value;
-        }
-        updateInstructPreview();
-      });
-    });
-  });
-
-  function buildInstruct() {
-    return Object.values(selectedByGroup).filter(Boolean).join(', ');
-  }
-
-  function updateInstructPreview() {
-    const el = document.getElementById('instruct-preview');
-    const v = buildInstruct();
-    el.textContent = v || '(nothing selected)';
-    el.className = 'instruct-preview' + (v ? ' has-value' : '');
-  }
-  updateInstructPreview();
-
-  // Guidance slider live value
-  const guidanceEl = document.getElementById('guidance');
-  const guidanceValEl = document.getElementById('guidance-val');
-  guidanceEl.addEventListener('input', () => {
-    guidanceValEl.textContent = parseFloat(guidanceEl.value).toFixed(1);
-  });
-
-  // Timer
-  function startTimer() {
-    const timerEl = document.getElementById('timer');
-    const start = performance.now();
-    timerEl.className = 'timer running';
-    timerEl.textContent = '0.0s';
-    const iv = setInterval(() => {
-      timerEl.textContent = `${((performance.now() - start) / 1000).toFixed(1)}s`;
-    }, 100);
-    return () => {
-      clearInterval(iv);
-      timerEl.className = 'timer done';
-      timerEl.textContent = `${((performance.now() - start) / 1000).toFixed(1)}s`;
-    };
-  }
-
-  // Submit
-  document.getElementById('submit-btn').addEventListener('click', async () => {
-    const text = document.getElementById('text').value.trim();
-    if (!text) { document.getElementById('text').focus(); return; }
-
-    document.getElementById('error').className = 'error';
-    document.getElementById('result').className = 'result';
-    document.getElementById('submit-btn').disabled = true;
-
-    const stop = startTimer();
-
-    try {
-      const form = new FormData();
-      form.append('text', text);
-
-      if (activeMode === 'clone') {
-        const file = fileInput.files[0];
-        const rt = document.getElementById('ref-text').value.trim();
-        if (file) {                                   // uploaded file wins
-          form.append('ref_audio', file);
-          if (rt) form.append('ref_text', rt);
-        } else if (savedVoice.value) {                // else a saved reference
-          form.append('voice', savedVoice.value);
-          form.append('lang', savedVoice.selectedOptions[0].dataset.lang || 'en-us');
-          if (rt) form.append('ref_text', rt);        // override stored transcript
-        }
-      } else {
-        const instruct = buildInstruct();
-        if (instruct) form.append('instruct', instruct);
-      }
-
-      // Advanced tuning (all modes)
-      form.append('guidance_scale', guidanceEl.value);
-      const seed = document.getElementById('seed').value.trim();
-      if (seed !== '') form.append('seed', seed);
-
-      const res = await fetch(API, { method: 'POST', headers: authHeaders(), body: form });
-      if (!res.ok) throw new Error(await readError(res));
-
-      const blob = await res.blob();
-      const player = document.getElementById('player');
-      player.src = URL.createObjectURL(blob);
-      document.getElementById('result').className = 'result visible';
-      player.play();
-    } catch (e) {
-      const el = document.getElementById('error');
-      el.textContent = e.message;
-      el.className = 'error visible';
-    } finally {
-      stop();
-      document.getElementById('submit-btn').disabled = false;
-    }
-  });
-
-  document.getElementById('text').addEventListener('keydown', e => {
-    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) document.getElementById('submit-btn').click();
-  });
-
-  // ---- Saved voice references + Gemini voice studio ----
-  const savedVoice = document.getElementById('saved-voice');
-
-  async function loadVoices(selectName) {
-    try {
-      const res = await fetch(VOICES);
-      const { voices } = await res.json();
-      savedVoice.innerHTML = '<option value="">— none —</option>' + voices.map(v =>
-        `<option value="${v.name}" data-lang="${v.lang}">${v.name} (${v.lang})</option>`).join('');
-      if (selectName) savedVoice.value = selectName;
-    } catch { /* leave the picker empty on error */ }
-  }
-  loadVoices();
-
+  // ---- Gemini voice studio ----  // ---- Saved voice references + Gemini voice studio ----
   // Populate the Gemini voice dropdowns (studio + Speak) — 30 style presets,
   // not language-bound. Grouped Female / Male (community-perceived gender).
   async function loadGeminiVoices() {
@@ -793,12 +363,7 @@
   }
   loadGeminiVoices();
 
-  // Picking a saved reference clears any chosen file (they're mutually exclusive).
-  savedVoice.addEventListener('change', () => {
-    if (savedVoice.value) { fileInput.value = ''; fileNameEl.textContent = 'No file chosen'; }
-  });
-
-  // Timer bound to a given element id (mirrors startTimer for the studio).
+  // Timer bound to a given element id.
   function runTimer(id) {
     const el = document.getElementById(id);
     const start = performance.now();
@@ -813,8 +378,6 @@
       el.textContent = `${((performance.now() - start) / 1000).toFixed(1)}s`;
     };
   }
-
-  let lastGeminiWav = null;   // Blob from the most recent Gemini generate
 
   document.getElementById('g-generate').addEventListener('click', async () => {
     const text = document.getElementById('g-text').value.trim();
@@ -831,11 +394,9 @@
       if (ins) form.append('instruct', ins);
       const res = await fetch(GEMINI, { method: 'POST', headers: authHeaders(), body: form });
       if (!res.ok) throw new Error(await readError(res));
-      lastGeminiWav = await res.blob();
       const player = document.getElementById('g-player');
-      player.src = URL.createObjectURL(lastGeminiWav);
+      player.src = URL.createObjectURL(await res.blob());
       document.getElementById('g-result').className = 'result visible';
-      document.getElementById('g-save-status').textContent = '';
       player.play();
     } catch (e) {
       gErr.textContent = e.message; gErr.className = 'error visible';
@@ -845,30 +406,6 @@
     }
   });
 
-  document.getElementById('g-save').addEventListener('click', async () => {
-    const status = document.getElementById('g-save-status');
-    if (!lastGeminiWav) { status.textContent = 'generate a phrase first'; return; }
-    const name = document.getElementById('g-name').value.trim();
-    if (!name) { document.getElementById('g-name').focus(); return; }
-    const lang = document.getElementById('g-lang').value.trim() || 'en-us';
-    status.textContent = 'saving…';
-    try {
-      const form = new FormData();
-      form.append('name', name);
-      form.append('lang', lang);
-      form.append('ref_text', document.getElementById('g-text').value.trim());
-      const ins = document.getElementById('g-instruct').value.trim();
-      if (ins) form.append('instruct', ins);
-      form.append('source', 'gemini');
-      form.append('audio', lastGeminiWav, `${name}.wav`);
-      const res = await fetch(VOICES, { method: 'POST', headers: authHeaders(), body: form });
-      if (!res.ok) throw new Error(await readError(res));
-      status.textContent = `saved “${name}” (${lang}) — now in the cloning picker above`;
-      await loadVoices(name);
-    } catch (e) {
-      status.textContent = `error: ${e.message}`;
-    }
-  });
 </script>
 </body>
 </html>

@@ -1,7 +1,7 @@
 export const meta = {
   name: 'feature',
   description: 'Opus plans + specifies tests, Sonnet subagents implement, Opus reviews, Sonnet fixes',
-  whenToUse: 'Any non-trivial change to this repo. Pass the task as args, e.g. Workflow({name:"feature", args:"add JWT auth to /v1/tts"}).',
+  whenToUse: 'Any non-trivial change to this repo. Pass the task as args, e.g. Workflow({name:"feature", args:"add rate limiting to /v1/speak"}).',
   phases: [
     { title: 'Plan',      detail: 'Opus reads the code, partitions work, specifies the tests', model: 'opus' },
     { title: 'Implement', detail: 'up to 3 Sonnet agents on disjoint file sets',               model: 'sonnet' },
@@ -13,12 +13,12 @@ export const meta = {
 // Must be a string. JSON.stringify(undefined ?? '') would yield '""' — truthy, so a
 // missing task would sail past the guard and the planner would plan nothing.
 const TASK = typeof args === 'string' ? args.trim() : ''
-if (!TASK) throw new Error('feature: pass the task as args, e.g. args: "add JWT auth to /v1/tts"')
+if (!TASK) throw new Error('feature: pass the task as args, e.g. args: "add rate limiting to /v1/speak"')
 
 // Every agent needs these. The invariants in CLAUDE.md each cost real debugging,
 // and the bare `.venv/bin/pytest` in AGENTS.md fails 7 tests without .venv/bin on PATH.
 const CONTEXT = `
-Repo: /home/evv/projects/whizz-tts (Python TTS word-bank service, FastAPI + SQLite + OmniVoice).
+Repo: /home/evv/projects/whizz-tts (Python TTS word-bank service, FastAPI + SQLite + Gemini TTS).
 
 BEFORE ANY OTHER WORK, read CLAUDE.md (a symlink to AGENTS.md). Its "Invariants" section
 lists regressions that each cost real debugging — treat every one as a hard constraint,

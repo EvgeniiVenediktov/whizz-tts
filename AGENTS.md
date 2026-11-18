@@ -1,51 +1,50 @@
 # Agent guide
 
-Orientation, dev setup, invariants, and runbooks. Full detail in `README.md`
-and `WORDBANK_PLAN.md`.
+Orientation, dev setup, invariants, and runbooks. Full detail in `README.md`.
 
 ## Project at a glance
-- **Generate** → WAV masters in `output/words/` + manifest `wordbank.db`, via either the **Gemini Batch** path (`gemini_batch.py` → the `words` table) or the **local OmniVoice** path (`wordbank generate` → the **separate `phrases` table**, cloning a Gemini reference). Words and phrases are stored in distinct tables so they never overlap. Each local phrase records the **RNG seed + clone reference** used (`seed`/`ref_audio`/`ref_text`) → reproducible.
+- **Generate** → WAV masters in `output/words/` + manifest `wordbank.db` via the **Gemini Batch** path (`gemini_batch.py` → the `words` table). Phrases go into the **separate `phrases` table**, filled by `/v1/speak` misses. Words and phrases are stored in distinct tables so they never overlap. (Local OmniVoice generation, voice cloning and the clone-reference registry were removed; `phrases.seed`/`ref_audio`/`ref_text` remain only as legacy provenance columns.)
 - **Encode** (`scripts/encode_wavs.py`) → OGG copies in `output/words_ogg/` (16k VoIP, ~3 KB/word).
-- **Serve** (`src/server.py`, FastAPI) → indexed bank lookup over the manifest + static OGG; live OmniVoice synth optional behind `MODEL_ENABLED`. `GET /v1/search` is the merged word+phrase lookup — each result carries a `type` flag (`word`|`phrase`) and the `voice` it was made with; phrases serve from `/v1/phrase`. `POST /v1/speak` is **get-or-generate**: a bank hit (word or phrase table) serves the stored OGG (`X-Source: bank`); a miss synthesizes via Gemini, saves it into the phrase bank, and serves that (`X-Source: gemini`) — so the same text is a bank hit next time. `voice` (Gemini prebuilt, case-insensitive, unknown → 400) **pins** the recording: only that voice is served or generated (words match the bare name, falling back to the voice in `file_path` for un-backfilled rows; phrases match `gemini-<Voice>`). No `voice` → any banked recording, the default voice's first; a miss uses the default. `instruct` makes it a one-off (no lookup, no save — the bank has no style key). `X-Voice` reports the voice label served. Saved clips use the bank OGG profile (`BANK_OGG_*` in `wordbank/constants.py`) under `<lang>/gemini-<Voice>/phrases/`. Also hosts the **voice studio**: `GET /v1/gemini/voices` (the 30 prebuilt Gemini voices), `POST /v1/gemini/tts` (preview a Gemini phrase), `POST/GET /v1/voices` (save + list clone references), and `/v1/tts` accepts `voice=<saved name>` to clone from a stored clip. Gemini voices are **style presets, not language-bound** — language is auto-detected from the text — so the studio's flag dropdown is the (filing-only) bank language, not the voice.
+- **Serve** (`src/server.py`, FastAPI) → indexed bank lookup over the manifest + static OGG. `GET /v1/search` is the merged word+phrase lookup — each result carries a `type` flag (`word`|`phrase`) and the `voice` it was made with; phrases serve from `/v1/phrase`. `POST /v1/speak` is **get-or-generate**: a bank hit (word or phrase table) serves the stored OGG (`X-Source: bank`); a miss synthesizes via Gemini, saves it into the phrase bank, and serves that (`X-Source: gemini`) — so the same text is a bank hit next time. `voice` (Gemini prebuilt, case-insensitive, unknown → 400) **pins** the recording: only that voice is served or generated (words match the bare name, falling back to the voice in `file_path` for un-backfilled rows; phrases match `gemini-<Voice>`). No `voice` → any banked recording, the default voice's first; a miss uses the default. `instruct` makes it a one-off (no lookup, no save — the bank has no style key). `X-Voice` reports the voice label served. Saved clips use the bank OGG profile (`BANK_OGG_*` in `wordbank/constants.py`) under `<lang>/gemini-<Voice>/phrases/`. Also hosts the **voice studio**: `GET /v1/gemini/voices` (the 30 prebuilt Gemini voices `/v1/speak` accepts — downstream clients read the list from here) and `POST /v1/gemini/tts` (preview a phrase in a voice, nothing saved). Gemini voices are **style presets, not language-bound** — language is auto-detected from the text.
 - **Edge mode** (`SPEAK_UPSTREAM_URL` + `SPEAK_UPSTREAM_TOKEN`, `src/upstream.py`): the same image deployed next to a client as a cache: its own bank on `/data`, `/v1/speak` misses fetched from the upstream server's `/v1/speak` (stdlib urllib) and saved (`X-Source: upstream`), no Gemini key. `scripts/make_edge_env.py` writes `.env.edge`; `ENV_FILE=.env.edge scripts/docker-run.sh edge` runs it. `/v1/speak` misses are single-flight per (text, lang, voice) in both modes. The upstream can run **stateless** with `SPEAK_STORE=0`: it never writes the bank, so clips live only on edges.
-- Two halves are decoupled: serving needs **no ML stack** unless live synth is on.
+- Two halves are decoupled: serving needs **no ML stack** (base requirements + ffmpeg).
 
 ## Dev setup & commands
 - Python venv at **`.venv`** (Python 3.14). Always invoke via `.venv/bin/python`, `.venv/bin/pytest`, `.venv/bin/uvicorn`.
 - **Building the venv from scratch** (a fresh clone has none, and these each cost time to rediscover):
   - Use **`uv venv .venv --python 3.14`** — stock `python3 -m venv` fails on Debian/Ubuntu without `python3.14-venv` (no `ensurepip`).
-  - Install **`torch` and `torchaudio` from the same index**: `uv pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu`. Mixing the CPU index with default PyPI gives an ABI mismatch that surfaces as `OSError: Could not load .../_torchaudio.abi3.so`.
   - `src/audio.py` shells out to **ffmpeg**; `apt install ffmpeg`, or for a venv-local fallback `pip install imageio-ffmpeg` and symlink its binary into `.venv/bin/ffmpeg`.
-  - Serving + the fast test suite need only: `fastapi uvicorn[standard] python-multipart pytest numpy soundfile httpx librosa`. `torch`/`omnivoice` are needed only for model tests and live synth.
-- **Tests:** `PATH="$PWD/.venv/bin:$PATH" .venv/bin/pytest` (unit — fast, no model/cloud).
+  - Serving + the test suite need only `requirements.txt` (`uv pip install -r requirements.txt`).
+- **Tests:** `PATH="$PWD/.venv/bin:$PATH" .venv/bin/pytest` (unit — fast, no cloud).
   The `PATH` prefix is **required**, not optional: `src/audio.py` shells out to `ffmpeg`,
   which here is only a symlink inside `.venv/bin` (see the ffmpeg note below). Without it
   7 tests fail with `FileNotFoundError: 'ffmpeg'` — a broken environment that looks like
-  broken code. Clean baseline with only the serving deps below is **151 passed, 11 skipped**
-  in ~12s; with torch + omnivoice installed, **153 passed, 10 skipped** (the model-lock
-  tests run instead of skipping).
-  `.venv/bin/pytest --integration tests/test_integration.py` loads OmniVoice (slow, needs the model).
-- **Run server + UI (bank only):** `PATH="$PWD/.venv/bin:$PATH" SERVE_FRONTEND=1 .venv/bin/uvicorn src.server:app --port 8000` → http://localhost:8000. The PATH prefix matters for the same ffmpeg reason as the tests: `/v1/speak` misses encode OGG server-side, and without it they 503 with `ffmpeg not installed`.
-- **Creds:** `GEMINI_API_KEY` for word-bank generation/cleanup **and the voice-studio endpoints** (`/v1/gemini/tts`, `gemini-voice`); bank serving needs none. `JWT_SECRET` (optional) — when set, `/v1/tts`, `/v1/speak`, `/v1/gemini/tts`, and `POST /v1/voices` require a bearer token (unset = open, dev mode); generate it with `scripts/make_jwt_secret.py` (writes `.env`, never prints it; `--rotate` to replace). Secrets live in `.env` (gitignored, `0600`) — never print or cat it.
+  broken code. Clean baseline: **217 passed, 2 skipped** in ~13s (the skips are the
+  real-bank check without a local bank, and the live test below).
+  `.venv/bin/pytest --integration tests/test_integration.py` runs `/v1/speak` against
+  **real Gemini** (paid, one synthesis): source `.env` first; it needs DNS for
+  `generativelanguage.googleapis.com` (blocked on this machine — run in docker with
+  `--dns 8.8.8.8`). Without a key it skips; with unresolvable DNS it fails saying so.
+- **Run server + UI:** `PATH="$PWD/.venv/bin:$PATH" SERVE_FRONTEND=1 .venv/bin/uvicorn src.server:app --port 8000` → http://localhost:8000. The PATH prefix matters for the same ffmpeg reason as the tests: `/v1/speak` misses encode OGG server-side, and without it they 503 with `ffmpeg not installed`.
+- **Creds:** `GEMINI_API_KEY` for word-bank generation/cleanup, `/v1/speak` misses, and `/v1/gemini/tts`; serving bank hits needs none. `JWT_SECRET` (optional) — when set, `/v1/speak` and `/v1/gemini/tts` require a bearer token (unset = open, dev mode); generate it with `scripts/make_jwt_secret.py` (writes `.env`, never prints it; `--rotate` to replace). Secrets live in `.env` (gitignored, `0600`) — never print or cat it.
 - **After editing `src/server.py` or `wordbank/lookup.py`, run `.venv/bin/pytest`** — it includes `tests/test_serves_real_bank.py`, which serves a real word from the local bank. Synthetic unit tests alone have repeatedly missed "server returns no audio" regressions (path resolution, WAL read visibility, env defaults). That test skips if no local bank, so also sanity-check by hand against the real data when you have it.
 
 ## Data & state (important)
-`wordbank.db`, `output/`, `data/`, `dist/` are **gitignored** → a fresh clone has **no bank**. Either regenerate (`fetch_wordlist` → `batch-run` → `encode_wavs`) or pull the bank from storage. The server serves whatever `BANK_DB` / `OGG_ROOT` (and dev-only `WAV_ROOT`) point at. `wordbank.db` holds three tables: `words` (Gemini single-word bank, UNIQUE(word,lang)), `phrases` (local OmniVoice + `/v1/speak` phrase bank, UNIQUE(text,lang,voice) — separate so words/phrases never overlap; `Manifest` rebuilds a pre-voice `phrases` table, whose key was UNIQUE(text,lang), once on open), and `voices` (clone references — generation-side only, never served). Both `words` and `phrases` carry a `voice` column (surfaced in lookups); `phrases` also carry `seed`/`ref_audio`/`ref_text` (provenance — the local pipeline records them so every clip is reproducible). Reference clips live under `VOICES_ROOT` (default `output/voices`, gitignored). `Manifest(table=, text_col=)` targets one content table. Backfill `voice` on an old bank with `scripts/backfill_voice.py`.
+`wordbank.db`, `output/`, `data/`, `dist/` are **gitignored** → a fresh clone has **no bank**. Either regenerate (`fetch_wordlist` → `batch-run` → `encode_wavs`) or pull the bank from storage. The server serves whatever `BANK_DB` / `OGG_ROOT` (and dev-only `WAV_ROOT`) point at. `wordbank.db` holds two tables: `words` (Gemini single-word bank, UNIQUE(word,lang)) and `phrases` (`/v1/speak` phrase bank, UNIQUE(text,lang,voice) — separate so words/phrases never overlap; `Manifest` rebuilds a pre-voice `phrases` table, whose key was UNIQUE(text,lang), once on open). Older banks may also hold an unused `voices` table (the removed clone-reference registry). Both `words` and `phrases` carry a `voice` column (surfaced in lookups); `phrases` also carry legacy `seed`/`ref_audio`/`ref_text` provenance from the removed local pipeline. `Manifest(table=, text_col=)` targets one content table. Backfill `voice` on an old bank with `scripts/backfill_voice.py`.
 
 ## Invariants — don't regress these (each cost real debugging)
 - **Bank lookup uses a normal SQLite connection + `PRAGMA query_only`, NEVER `mode=ro`.** A read-only URI connection on a WAL DB uses a private in-memory `-shm` and won't see another process's commits → stale/empty results. (`wordbank/lookup.py`)
-- **`src/server.py` imports `src.model` / `src.audio` lazily, inside handlers — not at top level.** That's what lets the bank-only image ship without torch/omnivoice. Don't hoist them.
+- **`src/server.py` imports google-genai and `src.audio` lazily, inside handlers — not at top level**, and the image ships `requirements-base.txt` only (no numpy/soundfile). Don't hoist them. Guarded by `tests/test_lazy_imports.py`.
 - **Manifest `file_path` is relative to the bank root** (`en/…/<id>_<word>.wav`), resolved at serve time under `WAV_ROOT`/`OGG_ROOT`. Never store absolute paths; changing the layout requires a migration (`scripts/migrate_manifest_paths.py`).
 - **Frontend uses same-origin relative URLs** → it must be served by the API (`SERVE_FRONTEND=1`), not a standalone `http.server`.
 - **OGG (16k VoIP) is the served format; WAV is a local master only** — never shipped, imaged, or committed.
 - **`lang` is the serving code (`en-us`)**; lookups are language-scoped, backed by the `(lang, word)` index. (The on-disk dir is historically `en`; `file_path` is opaque to the server beyond root-joining — fine.)
-- **The server is read-only w.r.t. the bank**, with exactly two sanctioned writers: `POST /v1/voices` (`voices` table) and `POST /v1/speak` (`phrases` table, get-or-generate on a miss; disabled by `SPEAK_STORE=0`, the stateless upstream — misses are then coalesced in flight instead of single-flighted via the bank) — both via `Manifest` + `bank.close()` for read visibility. Everything else, including `wordbank` generation tools, stays read-only from the server's perspective.
-- **Tests fake the model by installing a stand-in `src.model` in `sys.modules`** (`fake_model` fixture): the handlers' lazy `from .model import ...` binds to it, so server tests need no torch/omnivoice. Gemini is faked by patching `wordbank.gemini_tts.synthesize_pcm` (`fake_gemini`). `bank_env` points `BANK_DB`/`OGG_ROOT`/`WAV_ROOT`/`VOICES_ROOT` at a tmp bank — never let a test touch the real one. The `client` fixture combines all three with `MODEL_ENABLED=1`. Only `tests/test_model_concurrency.py` needs the real `src.model` (it skips without torch/omnivoice).
-- **All access to the OmniVoice model goes through `_MODEL_LOCK` (`src/model.py`).** The model isn't thread-safe and `/v1/tts` offloads synthesis to a multi-threaded executor. The lock covers **seeding *and* generation as one unit** — `_seed_everything` sets torch's *global* RNG, so splitting them lets one request silently generate with another's seed, breaking the reproducibility guarantee the phrase bank records seeds for. It's an `RLock` because `ensure_loaded` → `load_model` nests. Guarded by `tests/test_model_concurrency.py`.
+- **The server is read-only w.r.t. the bank**, with exactly one sanctioned writer: `POST /v1/speak` (`phrases` table, get-or-generate on a miss; disabled by `SPEAK_STORE=0`, the stateless upstream — misses are then coalesced in flight instead of single-flighted via the bank) — via `Manifest` + `bank.close()` for read visibility. Everything else, including `wordbank` generation tools, stays read-only from the server's perspective.
+- **Tests fake Gemini by patching `wordbank.gemini_tts.synthesize_pcm`** (`fake_gemini` fixture; the handlers import it lazily, so the patch takes effect). `bank_env` points `BANK_DB`/`OGG_ROOT`/`WAV_ROOT` at a tmp bank — never let a test touch the real one. The `client` fixture combines both and sets a dummy `GEMINI_API_KEY` (a Gemini deployment, so `/health` is green).
 - **Every google-genai client comes from `gemini_tts.new_client()`, pinned to `v1beta`.** TTS (`speechConfig`), batches and file uploads are v1beta-only; google-genai 3.x defaults to `v1`, where every synth 400s with `Unknown name "speechConfig"`. Never construct `genai.Client()` directly. Guarded by `tests/test_gemini_tts.py`.
-- **`lang` is validated before it touches anything.** Every route taking `lang` runs `_lang()` (`wordbank.languages.normalize_lang`: trimmed, lowercased, `[a-z]{2,3}(-[a-z0-9]{2,8})*`, ≤35 chars, ASCII only) and 400s otherwise, before any lookup, synthesis, upstream fetch or write; the CLI `--lang` uses the same function. It is the first directory of every saved clip — a raw `lang` once wrote outside `OGG_ROOT`/`VOICES_ROOT` (`../../x`, absolute paths). The writers (`_save_phrase`, `voices.save_voice_clip`) also check containment with `voices.path_under` (realpath) before creating a row or file. Guarded by `tests/test_lang_validation.py`.
+- **`lang` is validated before it touches anything.** Every route taking `lang` runs `_lang()` (`wordbank.languages.normalize_lang`: trimmed, lowercased, `[a-z]{2,3}(-[a-z0-9]{2,8})*`, ≤35 chars, ASCII only) and 400s otherwise, before any lookup, synthesis, upstream fetch or write; the CLI `--lang` uses the same function. It is the first directory of every saved clip — a raw `lang` once wrote outside the bank roots (`../../x`, absolute paths). The writer (`_save_phrase`) also checks containment with `paths.path_under` (realpath) before creating a row or file. Guarded by `tests/test_lang_validation.py`.
 - **Gemini audio payloads always go through `gemini_tts.pcm_from_payload`.** `gemini-3.8-flash-lite-tts` returns a full WAV (`fmt ` + `data` + a ~7.6 KB `C2PA` provenance chunk), not raw PCM like 3.1; read as PCM, that is a click plus ~0.15 s of loud noise on every clip. Anything other than 24 kHz / 16-bit / mono raises `GeminiAudioFormatError` (502 from the server) — never resampled. Any new code that reads `inline_data.data` must use it. Guarded by `tests/test_gemini_payload.py`.
-- **`wordbank verify` resolves `db` / `ogg_root` / `voices_root` independently.** With `--root` it derives the flat deploy layout (`/data/wordbank.db` + `/data/words_ogg`); with no `--root` it falls back to the server's own env defaults, so a bare `python -m wordbank verify --desc library.json` checks exactly what the server would serve. Don't collapse these back to a single root — the dev layout (db at repo root, audio under `output/`) can't be expressed by one.
+- **`wordbank verify` resolves `db` / `ogg_root` independently.** With `--root` it derives the flat deploy layout (`/data/wordbank.db` + `/data/words_ogg`); with no `--root` it falls back to the server's own env defaults, so a bare `python -m wordbank verify --desc library.json` checks exactly what the server would serve. Don't collapse these back to a single root — the dev layout (db at repo root, audio under `output/`) can't be expressed by one.
 
 ## Gemini batch notes (generation)
 - Enqueued-token quota counts **active (non-terminal)** jobs; it frees on completion. Use **`batch-run`** (quota-aware waves) for big runs; auto-delete of jobs is **off** (cleanup is on-request).
@@ -59,12 +58,11 @@ and `WORDBANK_PLAN.md`.
 - Adding a language to `/v1/languages`' `generate` list (`wordbank/languages.py`) is a **manual, verified gate** — only after listening to samples.
 
 ## Key files
-- `src/server.py` API · `src/model.py` OmniVoice (lazy) · `src/audio.py` PCM→OGG
-- `wordbank/`: `manifest.py` (SQLite — `words` + `phrases` content tables (generic over `table`/`text_col`) + `voices` registry) · `gemini_batch.py` (Gemini batch → words) · `gemini_tts.py` (sync Gemini TTS for studio/refs/`/v1/speak`; `new_client`, `pcm_from_payload`) · `voices.py` (clip storage + path resolution) · `library.py` (deploy `describe`/`verify`) · `pipeline.py` + `backends/local.py` (local OmniVoice sync gen → phrases) · `lookup.py` (read-only merged search + voice/type) · `languages.py` · `config.py` · `__main__.py` (CLI: `generate` (phrases) / `gemini-voice` / `add-voice` / `voices` / `describe` / `verify` / `batch*` / `status` / `export`)
-- `scripts/`: `fetch_wordlist` · `make_accent_reference` · `encode_wavs` · `package_bank` · `pack.sh`/`unpack.sh` (one-tarball bundle: code+db+OGG) · `backfill_voice` · `gemini_batch_cleanup` · `gemini_batch_smoke` · `list_models` · `migrate_manifest_paths`
-- `frontend/index.html` also has the **Gemini voice studio** (author refs) + a saved-reference picker in the cloning panel.
-- `frontend/index.html` · `Dockerfile` (`--build-arg WITH_MODEL`) · `docker-compose.yml` (profiles `bank` / `full`)
-- Open work is the **TODO** at the bottom of `README.md` (verify voice cloning, en-GB bank, multi-language, JWT auth).
+- `src/server.py` API · `src/audio.py` PCM→OGG · `src/upstream.py` edge client · `src/auth.py` JWT
+- `wordbank/`: `manifest.py` (SQLite — `words` + `phrases` content tables, generic over `table`/`text_col`) · `gemini_batch.py` (Gemini batch → words) · `gemini_tts.py` (sync Gemini TTS for studio/`/v1/speak`; `new_client`, `pcm_from_payload`) · `library.py` (deploy `describe`/`verify`) · `lookup.py` (read-only merged search + voice/type) · `paths.py` (slugs, `path_under`) · `languages.py` · `wordlist.py` · `config.py` · `__main__.py` (CLI: `describe` / `verify` / `batch*` / `status` / `export`)
+- `scripts/`: `fetch_wordlist` · `encode_wavs` · `package_bank` · `pack.sh`/`unpack.sh` (one-tarball bundle: code+db+OGG) · `backfill_voice` · `gemini_batch_cleanup` · `gemini_batch_smoke` · `list_models` · `migrate_manifest_paths`
+- `frontend/index.html` (bank lookup + Speak, Gemini voice preview) · `Dockerfile` · `docker-compose.yml` (profile `bank`)
+- Open work is the **TODO** at the bottom of `README.md`.
 
 ---
 
@@ -75,34 +73,23 @@ and `WORDBANK_PLAN.md`.
 
 ### Outstanding product goals (in rough priority order)
 
-1. **Validate voice-cloning quality** — the en-GB phrase pipeline is wired but
-   the output hasn't been listened to. Generate a small set (`--lang en-gb
-   generate`) and present samples for review before expanding.
-2. **Fill the phrase bank** — author reference voices per accent (Gemini voice
-   studio → `add-voice`), then generate phrase sets per locale. Serving and
-   merged search (`/v1/search`) are already ready.
-3. **Multi-language support** — generation is data-driven; what's needed is a
-   word list + a reference voice per language, then a verified listen before
+1. **Multi-language support** — generation is data-driven; what's needed is a
+   word list + a Gemini batch run per language, then a verified listen before
    adding the locale to `wordbank/languages.py`.
-4. **JWT auth** — **done.** Chosen over API-key (the review's suggestion and
+2. **JWT auth** — **done.** Chosen over API-key (the review's suggestion and
    this TODO were the same layer — one decision covers both). HS256 via
-   `JWT_SECRET`, checked by a FastAPI dependency on `/v1/tts`, `/v1/gemini/tts`,
-   and `POST /v1/voices`; read-only bank endpoints stay public. Env-gated:
+   `JWT_SECRET`, checked by a FastAPI dependency on `/v1/speak` and
+   `/v1/gemini/tts`; read-only bank endpoints stay public. Env-gated:
    `JWT_SECRET` unset = open/dev, set = required. Optional `JWT_AUDIENCE`/
    `JWT_ISSUER` add claim checks. Generate the secret into `.env` with
    `scripts/make_jwt_secret.py`; mint tokens with `scripts/make_token.py
    --sub <name> --ttl 3600`.
 
-### Code-quality backlog (from `review-report.json`)
+### Code-quality backlog
 
 The review's dead-code, bloat, and test-quality items are **done** (see git log:
 dead code removal → naming/constants → verify fix → thread-safety → tests →
-deployment hardening → JWT auth). What remains:
-
-**Still open:**
-- `src/device.py` has no fast-suite coverage. `tests/test_device.py` was deleted
-  (all 6 tests asserted only that `unittest.mock` returns what it was told). A
-  real check belongs in the `--integration` suite, against actual hardware.
+deployment hardening → JWT auth → removal of local OmniVoice synthesis).
 
 **Deliberately NOT done (decided against, don't "fix" these):**
 - **Shortening `VOICE_INSTRUCTION`** (`wordbank/gemini_batch.py`) to save ~$1.80
@@ -120,51 +107,6 @@ deployment hardening → JWT auth). What remains:
   the escape hatch stays for rclone/gsutil/multi-step pulls.
 
 ---
-
-## Runbook: accent bank via local OmniVoice + Gemini reference
-
-The local OmniVoice model generates the **phrases**. Accent comes from a one-off
-**voice-clone reference** — a phrase generated by Gemini in the target accent,
-which OmniVoice clones for the whole bank. No Chirp.
-
-**Reference clip format:** any file `soundfile`/`librosa` can decode — WAV/FLAC/OGG
-natively (no ffmpeg), MP3/M4A via ffmpeg. OmniVoice auto-downmixes to mono,
-resamples to **24 kHz**, loudness-normalizes (boosts quiet clips), and trims
-silence — so you don't pre-process. Keep it **3–10 s**; >20 s warns and degrades
-cloning quality (and is auto-trimmed only when `ref_text` is omitted, so a long
-clip *with* a transcript stays long — avoid it). `make_accent_reference.py`
-already emits the ideal 24 kHz mono WAV.
-
-**Easiest path** (synth + register in one step): the UI **Gemini voice studio**, or
-`python -m wordbank --lang <lang> gemini-voice --text "…" --name <name> [--instruct "…"]`.
-Then skip to step 3 with `--voice <name>`. Steps 1–2 below are the manual,
-file-based equivalent (useful when you already have a clip).
-
-1. **Make the accent reference** (Gemini, one phrase → `ref.wav` + `ref.txt`):
-   ```bash
-   GEMINI_API_KEY=… python scripts/make_accent_reference.py \
-     --text "The quick brown fox jumps over the lazy dog." \
-     --instruct "Speak in a British (RP) accent" --voice Kore --out refs/en-gb
-   ```
-2. **Register the voice** in the `voices` table (so generation can reuse it):
-   ```bash
-   python -m wordbank --lang en-gb add-voice --ref-audio refs/en-gb/ref.wav \
-     --ref-text-file refs/en-gb/ref.txt --source gemini
-   ```
-3. **Generate locally** — `generate --voice en-gb` pulls the registered reference
-   (pass `--ref-audio`/`--ref-text` to override). Verification is off by default
-   (Whisper per phrase is slow); add `--verify` to spot-check:
-   ```bash
-   python -m wordbank --lang en-gb generate --words PHRASES.txt --voice en-gb
-   ```
-   Sequential (the model isn't thread-safe). Writes WAV masters to
-   `output/words/<lang>/local-<voice>/…`; manifest `lang=<lang>`, relative paths.
-4. **Encode + package** (`scripts/encode_wavs.py`, `scripts/package_bank.py`).
-5. **Listen**, then add the locale to `wordbank/languages.py` `SUPPORTED_LANGUAGES`
-   (presence = verified) → it appears in `/v1/languages`.
-
-Serving is already language-scoped (`/v1/bank?lang=en-gb`, `(lang, word)` index) —
-no serving change. The Gemini batch path + its en-us word bank are untouched.
 
 ## Runbook: package the bank for upload
 
@@ -189,9 +131,9 @@ is: the Docker image + `library.json` (description) + `tts-bank.tar.gz` (archive
 ```bash
 bash scripts/pack.sh          # → library.json + tts-bank.tar.gz (both gitignored)
 ```
-- `library.json` (`wordbank describe`): languages, voices, word/phrase counts, ogg
+- `library.json` (`wordbank describe`): languages, word/phrase counts, ogg
   count, and the `folders` a provisioned volume must have. Also bundled inside the archive.
-- `tts-bank.tar.gz`: code + `wordbank.db` + served OGG (`output/words_ogg` + `output/voices`).
+- `tts-bank.tar.gz`: code + `wordbank.db` + served OGG (`output/words_ogg`).
   Excludes the multi-GB WAV masters (`output/words`).
 
 **Docker deploy — two `--target`s, no compose in production** (compose stays
@@ -206,20 +148,18 @@ dev-only convenience: `docker compose --profile bank up --build`):
   `library.json`/`tts-bank.tar.gz` present at build time (`scripts/pack.sh`).
 
 `scripts/docker-build-thin.sh` / `scripts/docker-build-fat.sh` wrap the plain
-`docker build --target runtime` / `--target runtime-fat` (`--with-model` on
-either for `WITH_MODEL=1`, i.e. torch). `scripts/docker-run.sh thin|fat`
+`docker build --target runtime` / `--target runtime-fat`. `scripts/docker-run.sh thin|fat`
 wraps `docker run`: `/data` is a named volume (`whizz-tts-<mode>-data`,
-`DATA_VOLUME` overrides) so `/v1/speak` phrases survive restarts;
-`--with-model` sets `MODEL_ENABLED=1`/`PRELOAD_MODEL=1`; `thin` bind-mounts
+`DATA_VOLUME` overrides) so `/v1/speak` phrases survive restarts; `thin` bind-mounts
 local `library.json`/`tts-bank.tar.gz` onto `/data` when both exist, else runs
-bank-less (needs `GEMINI_API_KEY` or `--with-model`); `edge` runs the thin
+bank-less (needs `GEMINI_API_KEY`); `edge` runs the thin
 image as an edge cache (`SPEAK_UPSTREAM_*` + `JWT_SECRET`, never the Gemini
 key; bank files mounted like `thin`). `GEMINI_API_KEY`/`GOOGLE_API_KEY`/
 `JWT_SECRET` pass through by name (`ENV_FILE`, default `./.env`, loaded first;
 `HOST_PORT` sets the published port);
 `DOCKER_DNS=8.8.8.8` sets the container resolver, for a local DNS that won't
 resolve `generativelanguage.googleapis.com`. Tags: `whizz-tts:thin`,
-`whizz-tts:fat`, `-model` suffix with `--with-model`.
+`whizz-tts:fat`.
 
 Put `library.json` + `tts-bank.tar.gz` on the (persistent)
 `/data` volume; `docker-entrypoint.sh` on boot:
@@ -233,8 +173,10 @@ Put `library.json` + `tts-bank.tar.gz` on the (persistent)
    (`/v1/speak` grows both on the live volume; exact matching made every restart
    after a speak write re-unpack the archive over the grown `wordbank.db`).
 2. If invalid, unpacks `$LIBRARY_ARCHIVE` (`/data/tts-bank.tar.gz`) into `/data`
-   (`output/words_ogg`→`/data/words_ogg`, `output/voices`→`/data/voices`,
-   `wordbank.db`→`/data/wordbank.db`, `library.json`), then re-verifies. An
+   (`output/words_ogg`→`/data/words_ogg`, `wordbank.db`→`/data/wordbank.db`,
+   `library.json`; also `output/voices`→`/data/voices` from archives packed
+   before clone references were removed, whose description lists that folder),
+   then re-verifies. An
    existing `wordbank.db` (+ `-wal`/`-shm`), e.g. phrases `/v1/speak` saved
    before the archive was added, is first moved to
    `wordbank.db.pre-unpack-<timestamp>` — never overwritten. A volume with a
@@ -242,11 +184,10 @@ Put `library.json` + `tts-bank.tar.gz` on the (persistent)
    available (logged as such, not as "no bank").
 3. **Refuses to start (`exit 1`) if there is still no usable bank** — rather than
    coming up "healthy" and 404-ing every lookup. Exceptions, both valid bank-less
-   deployments that degrade to a warning instead: `MODEL_ENABLED=1` (live
-   OmniVoice), `GEMINI_API_KEY`/`GOOGLE_API_KEY` set, or `SPEAK_UPSTREAM_URL`
-   set (edge) — `/v1/speak` then generates or fetches misses and builds the
+   deployments that degrade to a warning instead: `GEMINI_API_KEY`/
+   `GOOGLE_API_KEY` set, or `SPEAK_UPSTREAM_URL` set (edge) — `/v1/speak` then generates or fetches misses and builds the
    phrase bank on the volume. `/health` applies the
-   identical rule (503 only when no bank, model, or Gemini key can serve), and
+   identical rule (503 only when no bank, Gemini key, or upstream can serve), and
    the image `HEALTHCHECK` is wired to it.
 4. Starts the server. Later restarts find the volume provisioned → no unpack.
 

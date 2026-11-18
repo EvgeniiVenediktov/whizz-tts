@@ -1,8 +1,5 @@
-# Two flavors via --build-arg WITH_MODEL, and two --target stages for how the
-# bank gets onto the container:
-#   WITH_MODEL=0 (default) → lightweight bank server, no torch: serves the bank
-#                            and fills misses via Gemini (/v1/speak)
-#   WITH_MODEL=1           → adds live OmniVoice synthesis (multi-GB, CPU torch)
+# Lightweight bank server: serves the bank and fills misses via Gemini
+# (/v1/speak). Two --target stages for how the bank gets onto the container:
 #
 #   --target runtime (default) → CODE ONLY, never stores the bank. The bank
 #     lives on a mounted volume; on start the entrypoint verifies the volume
@@ -24,26 +21,13 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-ARG WITH_MODEL=0
-
 # Base server deps (always). src/audio.py calls `ffmpeg` from PATH, so expose
 # imageio-ffmpeg's static binary there (/v1/speak encodes Gemini output to OGG).
-COPY requirements-base.txt requirements-model.txt ./
+COPY requirements-base.txt ./
 RUN pip install -r requirements-base.txt && \
     ln -s "$(python -c 'import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())')" \
         /usr/local/bin/ffmpeg && \
     ffmpeg -hide_banner -encoders | grep -q libopus
-
-# Optional ML stack, only for the model build. (Its apt ffmpeg predates the
-# base layer's static one; kept so the model build's audio decoding is
-# unchanged.) CPU torch from the dedicated wheel index keeps it as small as
-# possible (no CUDA).
-RUN if [ "$WITH_MODEL" = "1" ]; then \
-        apt-get update && apt-get install -y --no-install-recommends ffmpeg && \
-        rm -rf /var/lib/apt/lists/* && \
-        pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu && \
-        pip install -r requirements-model.txt ; \
-    fi
 
 COPY src/ ./src/
 COPY wordbank/ ./wordbank/
@@ -51,18 +35,15 @@ COPY frontend/ ./frontend/
 COPY docker-entrypoint.sh ./
 RUN chmod +x docker-entrypoint.sh
 
-ENV MODEL_ENABLED=0 \
-    SERVE_FRONTEND=1 \
+ENV SERVE_FRONTEND=1 \
     BANK_DB=/data/wordbank.db \
-    OGG_ROOT=/data/words_ogg \
-    VOICES_ROOT=/data/voices
+    OGG_ROOT=/data/words_ogg
 
 EXPOSE 8000
 
 # Wired to GET /health, which returns 503 when the service can serve nothing
-# (bank unavailable AND live synthesis disabled) and 200 otherwise. No curl/wget
-# in this base image (python:3.12-slim) and the bank-only build has no ML stack,
-# so use a stdlib-only check: urllib raises on any non-2xx status (including the
+# (no bank, no Gemini key, no upstream) and 200 otherwise. No curl/wget in this
+# base image (python:3.12-slim), so use a stdlib-only check: urllib raises on any non-2xx status (including the
 # 503 above), which makes `python -c` exit non-zero — no explicit status parsing
 # needed.
 #   --start-period=300s: first boot may need to unpack a ~129 MB archive of

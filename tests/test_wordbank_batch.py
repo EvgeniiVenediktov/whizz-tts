@@ -12,8 +12,7 @@ import pytest
 
 from tests.test_gemini_payload import gemini_lite_wav
 from wordbank.gemini_batch import (
-    VOICE_INSTRUCTION, GeminiBatch, audio_from_line, build_jsonl,
-    build_request_body, collect_active, run_batch, run_in_waves, submit_pending,
+    VOICE_INSTRUCTION, GeminiBatch, audio_from_line, build_request_body, collect_active, run_batch, run_in_waves, submit_pending,
     write_wav_from_pcm_bytes,
 )
 from wordbank.manifest import DONE, FAILED, PENDING, Manifest, SUBMITTED
@@ -84,12 +83,6 @@ def test_build_request_body_bare_word():
     assert r["contents"][0]["parts"][0]["text"] == "cat"
 
 
-def test_build_jsonl_keys_and_lines():
-    rows = [{"id": 1, "word": "cat"}, {"id": 2, "word": "dog"}]
-    lines = build_jsonl(rows, "Kore").decode().strip().splitlines()
-    assert [json.loads(l)["key"] for l in lines] == ["1", "2"]
-
-
 def test_audio_from_line_decodes_base64():
     b64 = base64.b64encode(b"\x01\x02\x03\x04").decode()
     line = {"key": "1", "response": {"candidates": [{"content": {"parts": [
@@ -117,19 +110,6 @@ def test_write_wav_is_valid(tmp_path):
 
 # --- end-to-end (keyed, WAV) ----------------------------------------------
 
-def test_run_batch_writes_wavs_and_marks_done(tmp_path):
-    m = Manifest(str(tmp_path / "wb.db"))
-    m.add_words([f"word{i}" for i in range(5)], "en")
-    fake = FakeBatch()
-    counts = run_batch(m, fake, str(tmp_path / "out"),
-                       lang="en", voice="Kore", sleep=lambda *_: None)
-    assert counts.get(DONE) == 5
-    wavs = list((tmp_path / "out").rglob("*.wav"))
-    assert len(wavs) == 5
-    assert all(w.read_bytes()[:4] == b"RIFF" for w in wavs)
-    assert not fake.deleted           # no auto-delete by default (cleanup is on request)
-
-
 def test_collect_deletes_only_when_opted_in(tmp_path):
     m = Manifest(str(tmp_path / "wb.db"))
     m.add_words(["alpha", "beta"], "en")
@@ -144,8 +124,11 @@ def test_keyed_one_to_one_correspondence(tmp_path):
     """Each word's file must hold ITS audio even though results came reversed."""
     m = Manifest(str(tmp_path / "wb.db"))
     m.add_words(["alpha", "beta", "gamma", "delta"], "en")
-    run_batch(m, FakeBatch(), str(tmp_path / "out"),
-              lang="en", voice="Kore", sleep=lambda *_: None)
+    fake = FakeBatch()
+    counts = run_batch(m, fake, str(tmp_path / "out"),
+                       lang="en", voice="Kore", sleep=lambda *_: None)
+    assert counts.get(DONE) == 4
+    assert not fake.deleted           # no auto-delete by default (cleanup is on request)
     out = tmp_path / "out"
     for r in m.iter_rows():
         assert r["status"] == DONE

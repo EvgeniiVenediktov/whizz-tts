@@ -2,10 +2,11 @@
 
 Two content tables with identical shape:
   - `words`   — the Gemini single-word bank   (UNIQUE(word, lang))
-  - `phrases` — the local OmniVoice phrase bank (UNIQUE(text, lang, voice))
+  - `phrases` — the /v1/speak phrase bank      (UNIQUE(text, lang, voice))
 They are stored separately so words and phrases never overlap. One `Manifest`
-instance targets one table (pass `table=`/`text_col=`); both tables (and the
-shared `voices` reference registry) are always created.
+instance targets one table (pass `table=`/`text_col=`); both tables are always
+created. Banks made before clone references were removed may also hold an
+unused `voices` table.
 
 Thread-safe: a single connection (check_same_thread=False) guarded by a lock.
 DB writes are tiny; the real bottleneck is the TTS call, so lock contention is
@@ -47,7 +48,7 @@ CREATE TABLE IF NOT EXISTS words (
 -- seek straight into one language; also serves `GROUP BY lang` for /v1/languages.
 CREATE INDEX IF NOT EXISTS idx_words_lang_word ON words(lang, word);
 
--- Phrases: the local OmniVoice phrase bank. Separate from `words` so the two
+-- Phrases: the /v1/speak phrase bank. Separate from `words` so the two
 -- never collide. A phrase may exist in several voices, hence voice is in the key.
 CREATE TABLE IF NOT EXISTS phrases (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -69,24 +70,6 @@ CREATE TABLE IF NOT EXISTS phrases (
     UNIQUE(text, lang, voice)
 );
 CREATE INDEX IF NOT EXISTS idx_phrases_lang_text ON phrases(lang, text);
-
--- Voice-clone references: one row per reusable reference clip. The local
--- OmniVoice path clones `ref_audio` (+ `ref_text`) to speak a whole bank in
--- that voice/accent. ref_audio is a file path (e.g. refs/en-gb/ref.wav).
-CREATE TABLE IF NOT EXISTS voices (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    name         TEXT NOT NULL,
-    lang         TEXT NOT NULL,
-    ref_audio    TEXT NOT NULL,
-    ref_text     TEXT,
-    instruct     TEXT,
-    source       TEXT,
-    sample_rate  INTEGER,
-    created_at   REAL,
-    updated_at   REAL,
-    UNIQUE(name, lang)
-);
-CREATE INDEX IF NOT EXISTS idx_voices_lang ON voices(lang);
 """
 
 
@@ -261,43 +244,3 @@ class Manifest:
             params.append(voice)
         with self._lock:
             return self._conn.execute(sql, params).fetchone()
-
-    # ---- voices (clone references) ----
-
-    def add_voice(self, name: str, lang: str, ref_audio: str, *,
-                  ref_text: Optional[str] = None, instruct: Optional[str] = None,
-                  source: Optional[str] = None,
-                  sample_rate: Optional[int] = None) -> None:
-        """Register (or update) a voice-clone reference. Upsert on (name, lang)."""
-        now = time.time()
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO voices (name, lang, ref_audio, ref_text, instruct, "
-                "source, sample_rate, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(name, lang) DO UPDATE SET "
-                "ref_audio=excluded.ref_audio, ref_text=excluded.ref_text, "
-                "instruct=excluded.instruct, source=excluded.source, "
-                "sample_rate=excluded.sample_rate, updated_at=excluded.updated_at",
-                (name, lang, ref_audio, ref_text, instruct, source, sample_rate,
-                 now, now),
-            )
-            self._conn.commit()
-
-    def get_voice(self, name: str, lang: Optional[str] = None):
-        """Fetch one registered voice by name (optionally scoped to lang). None if absent."""
-        with self._lock:
-            if lang is not None:
-                return self._conn.execute(
-                    "SELECT * FROM voices WHERE name = ? AND lang = ?", (name, lang)
-                ).fetchone()
-            return self._conn.execute(
-                "SELECT * FROM voices WHERE name = ? ORDER BY id LIMIT 1", (name,)
-            ).fetchone()
-
-    def voices(self):
-        """All registered voices, ordered by (lang, name)."""
-        with self._lock:
-            return self._conn.execute(
-                "SELECT * FROM voices ORDER BY lang, name"
-            ).fetchall()

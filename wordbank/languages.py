@@ -3,7 +3,7 @@ every language code must have.
 
 This is a MANUAL gate, not derived from data. **Presence in this list means
 verified** — add a language ONLY after generating sample audio for it AND
-checking quality (incl. voice cloning) by listening. See the README TODO.
+checking quality by listening. See the README TODO.
 
 Codes are BCP-47 style and must match the bank's `lang` field, e.g. "en-us",
 "en-gb", "fr".

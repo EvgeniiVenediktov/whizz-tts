@@ -2,7 +2,7 @@
 # Deploy-time bank provisioning, then start the server.
 #
 #   1. Read the library description on the volume (LIBRARY_DESC, default
-#      /data/library.json) — languages, voices, word/phrase counts, folders.
+#      /data/library.json) — languages, word/phrase counts, folders.
 #   2. Verify the volume against it (described folders exist + counts match).
 #   3. If the volume isn't provisioned, unpack the library archive if present
 #      (LIBRARY_ARCHIVE, default /data/tts-bank.tar.gz), then re-verify.
@@ -14,9 +14,8 @@
 #
 # A container that ends up with NO usable bank AND no synthesis path can serve
 # nothing, so it refuses to start (exit 1) rather than come up "healthy" and
-# 404 every lookup. Exceptions, all valid bank-less deployments: MODEL_ENABLED=1
-# (live OmniVoice), GEMINI_API_KEY/GOOGLE_API_KEY set, or SPEAK_UPSTREAM_URL set
-# (edge mode) — /v1/speak then generates misses and builds the phrase bank on
+# 404 every lookup. Exceptions, both valid bank-less deployments:
+# GEMINI_API_KEY/GOOGLE_API_KEY set, or SPEAK_UPSTREAM_URL set (edge mode) — /v1/speak then generates misses and builds the phrase bank on
 # the volume. /health applies the same
 # rule (200, not 503), so the entrypoint mirrors it instead of hard-blocking.
 #
@@ -41,25 +40,16 @@ DATA_DIR="$(dirname "$BANK_DB")"
 LIBRARY_DESC="${LIBRARY_DESC:-$DATA_DIR/library.json}"
 LIBRARY_ARCHIVE="${LIBRARY_ARCHIVE:-$DATA_DIR/tts-bank.tar.gz}"
 
-# Mirrors src/server.py's _truthy(): "" / 0 / false / no / off (case-insensitive)
-# are falsy, anything else (including unset-but-defaulted "1") is truthy.
-model_enabled() {
-    case "$(printf '%s' "${MODEL_ENABLED:-}" | tr '[:upper:]' '[:lower:]')" in
-        ''|0|false|no|off) return 1 ;;
-        *) return 0 ;;
-    esac
-}
-
 # Mirrors src/server.py's /health rule: any synthesis path can serve with no bank
-# (live OmniVoice, Gemini, or an upstream server in edge mode).
+# (Gemini, or an upstream server in edge mode).
 can_synthesize() {
-    model_enabled || [ -n "${GEMINI_API_KEY:-}${GOOGLE_API_KEY:-}${SPEAK_UPSTREAM_URL:-}" ]
+    [ -n "${GEMINI_API_KEY:-}${GOOGLE_API_KEY:-}${SPEAK_UPSTREAM_URL:-}" ]
 }
 
 # Shared explanation for "nothing usable" failures.
 serving_nothing_msg() {
     cat <<EOF
-[entrypoint] ERROR: no usable bank and no synthesis (MODEL_ENABLED=${MODEL_ENABLED:-0}, no GEMINI_API_KEY, no SPEAK_UPSTREAM_URL) — this container can serve nothing, refusing to start.
+[entrypoint] ERROR: no usable bank and no synthesis (no GEMINI_API_KEY, no SPEAK_UPSTREAM_URL) — this container can serve nothing, refusing to start.
 [entrypoint]   Looked for a description at: $LIBRARY_DESC
 [entrypoint]   Looked for an archive at:     $LIBRARY_ARCHIVE
 [entrypoint]   Fix one of:
@@ -69,7 +59,7 @@ serving_nothing_msg() {
 [entrypoint]     - Point LIBRARY_DESC / LIBRARY_ARCHIVE at wherever you did place them.
 [entrypoint]     - Set SYNC_BUCKET/SYNC_PREFIX (or BANK_SYNC_CMD) to pull the bank from
 [entrypoint]       storage before boot.
-[entrypoint]     - Set MODEL_ENABLED=1, GEMINI_API_KEY, or SPEAK_UPSTREAM_URL for a synthesis-only deployment (no bank).
+[entrypoint]     - Set GEMINI_API_KEY or SPEAK_UPSTREAM_URL for a synthesis-only deployment (no bank).
 EOF
 }
 
@@ -113,16 +103,18 @@ elif [ -f "$LIBRARY_ARCHIVE" ]; then
     fi
     tar xzf "$LIBRARY_ARCHIVE" -C "$DATA_DIR" --strip-components=1 output/words_ogg
     tar xzf "$LIBRARY_ARCHIVE" -C "$DATA_DIR" wordbank.db
+    # Archives packed before clone references were removed carry output/voices
+    # and list it in their description; without it they'd re-unpack every boot.
     tar xzf "$LIBRARY_ARCHIVE" -C "$DATA_DIR" --strip-components=1 output/voices 2>/dev/null || true
     tar xzf "$LIBRARY_ARCHIVE" -C "$DATA_DIR" library.json 2>/dev/null || true
     if python -m wordbank verify --desc "$LIBRARY_DESC" --root "$DATA_DIR"; then
         echo "[entrypoint] library verified after unpack — starting"
     elif can_synthesize; then
-        echo "[entrypoint] WARNING: still invalid after unpacking $LIBRARY_ARCHIVE (see verification problems above) — synthesis is available (MODEL_ENABLED / GEMINI_API_KEY / SPEAK_UPSTREAM_URL), continuing in synthesis-only mode (bank unavailable)"
+        echo "[entrypoint] WARNING: still invalid after unpacking $LIBRARY_ARCHIVE (see verification problems above) — synthesis is available (GEMINI_API_KEY / SPEAK_UPSTREAM_URL), continuing in synthesis-only mode (bank unavailable)"
     else
         echo "[entrypoint] ERROR: still invalid after unpacking $LIBRARY_ARCHIVE (see verification problems above)." >&2
         echo "[entrypoint]   The archive at $LIBRARY_ARCHIVE doesn't match $LIBRARY_DESC (corrupt archive, stale description, or a failed extraction)." >&2
-        echo "[entrypoint]   Fix: regenerate both with 'bash scripts/pack.sh' and re-place library.json + tts-bank.tar.gz on the volume, or set MODEL_ENABLED=1 / GEMINI_API_KEY to run synthesis-only." >&2
+        echo "[entrypoint]   Fix: regenerate both with 'bash scripts/pack.sh' and re-place library.json + tts-bank.tar.gz on the volume, or set GEMINI_API_KEY to run synthesis-only." >&2
         exit 1
     fi
 elif [ ! -f "$LIBRARY_DESC" ] && [ -f "$BANK_DB" ] && can_synthesize; then
@@ -132,7 +124,7 @@ elif [ ! -f "$LIBRARY_DESC" ] && [ -f "$BANK_DB" ] && can_synthesize; then
 else
     echo "[entrypoint] volume not provisioned and no archive at $LIBRARY_ARCHIVE"
     if can_synthesize; then
-        echo "[entrypoint] WARNING: no bank and no archive — synthesis is available (MODEL_ENABLED / GEMINI_API_KEY / SPEAK_UPSTREAM_URL), continuing in synthesis-only mode (bank unavailable)"
+        echo "[entrypoint] WARNING: no bank and no archive — synthesis is available (GEMINI_API_KEY / SPEAK_UPSTREAM_URL), continuing in synthesis-only mode (bank unavailable)"
     else
         serving_nothing_msg >&2
         exit 1

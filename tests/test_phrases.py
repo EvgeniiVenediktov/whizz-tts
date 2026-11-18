@@ -159,32 +159,3 @@ def test_word_info_endpoint_includes_type_and_voice(search_client):
 
 def test_languages_includes_phrase_langs(search_client):
     assert {"code": "en-us", "words": 1} in search_client.get("/v1/languages").json()["phrasebank"]
-
-
-# ---- pipeline records provenance (seed + reference) ----
-
-def test_pipeline_records_seed_and_reference(tmp_path):
-    import numpy as np
-    from wordbank.backends.local import LocalOmniVoiceBackend
-    from wordbank.pipeline import WordBankPipeline
-
-    def gen(text, ref_audio=None, ref_text=None, seed=None):
-        t = np.linspace(0, 0.3, 7200, endpoint=False)
-        return (0.3 * np.sin(2 * np.pi * 180 * t)).astype(np.float32)
-
-    db = str(tmp_path / "wb.db")
-    m = _phrase_manifest(db)
-    m.add_words(["hello world"], "en-us", voice="en-gb")
-    backend = LocalOmniVoiceBackend(ref_audio="refs/en-gb/ref.wav",
-                                    ref_text="the quick brown fox", voice="en-gb",
-                                    seed=99, generate_fn=gen)
-    pipe = WordBankPipeline(m, backend, None, str(tmp_path / "out"),
-                            lang="en-us", voice="en-gb")
-    assert pipe.run()[VERIFIED] == 1
-
-    row = m.iter_rows()[0]
-    assert row["status"] == VERIFIED
-    assert row["seed"] == 99                       # seed recorded
-    assert row["ref_audio"] == "refs/en-gb/ref.wav"  # reference recorded
-    assert row["ref_text"] == "the quick brown fox"
-    m.close()

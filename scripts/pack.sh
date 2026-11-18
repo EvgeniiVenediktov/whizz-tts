@@ -4,9 +4,9 @@
 #   scripts/pack.sh [ARCHIVE.tar.gz]       # default: tts-bank.tar.gz
 #
 # Produces:
-#   library.json      — description (languages, voices, word/phrase counts, folders)
-#   tts-bank.tar.gz    — library code + wordbank.db + served OGG (output/words_ogg
-#                       + output/voices). EXCLUDES the multi-GB WAV masters.
+#   library.json      — description (languages, word/phrase counts, folders)
+#   tts-bank.tar.gz    — library code + wordbank.db + served OGG (output/words_ogg).
+#                       EXCLUDES the multi-GB WAV masters.
 #
 # Deployment package = the Docker image + library.json + tts-bank.tar.gz. Put the
 # latter two on the (persistent) volume for the first deploy; the container
@@ -24,10 +24,9 @@ PY="$([ -x .venv/bin/python ] && echo .venv/bin/python || echo python3)"
 
 # 2. Bundle code + db + served audio + the description.
 paths=(wordbank src frontend scripts
-       requirements.txt requirements-base.txt requirements-model.txt
+       requirements.txt requirements-base.txt
        README.md AGENTS.md pytest.ini Dockerfile docker-compose.yml docker-entrypoint.sh
        library.json wordbank.db output/words_ogg)
-if [ -d output/voices ]; then paths+=(output/voices); fi
 
 n=$(find output/words_ogg -name '*.ogg' | wc -l | tr -d ' ')
 echo "packing library + wordbank.db + ${n} OGG clips → ${OUT}"

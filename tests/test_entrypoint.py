@@ -37,10 +37,9 @@ def _add_phrase(db, ogg_root, text, voice, pid):
 
 def _package(tmp_path):
     """A packaged library as scripts/pack.sh lays it out: library.json +
-    tts-bank.tar.gz holding wordbank.db, output/words_ogg, output/voices."""
+    tts-bank.tar.gz holding wordbank.db and output/words_ogg."""
     src = tmp_path / "src"
-    (src / "output" / "voices" / "en-us").mkdir(parents=True)
-    (src / "output" / "voices" / "en-us" / "kore.wav").write_bytes(b"RIFF")
+    src.mkdir()
     m = Manifest(str(src / "wordbank.db"))
     m.add_words(["cat", "dog"], "en-us", voice="Kore")
     for r in m.iter_rows():
@@ -50,14 +49,13 @@ def _package(tmp_path):
         ogg.parent.mkdir(parents=True, exist_ok=True)
         ogg.write_bytes(b"OggS")
     m.close()
-    desc = describe(str(src / "wordbank.db"), str(src / "output" / "words_ogg"),
-                    str(src / "output" / "voices"))
+    desc = describe(str(src / "wordbank.db"), str(src / "output" / "words_ogg"))
     (src / "library.json").write_text(json.dumps(desc))
     pkg = tmp_path / "pkg"
     pkg.mkdir()
     (pkg / "library.json").write_text(json.dumps(desc))
     with tarfile.open(pkg / "tts-bank.tar.gz", "w:gz") as tar:
-        for name in ("library.json", "wordbank.db", "output/words_ogg", "output/voices"):
+        for name in ("library.json", "wordbank.db", "output/words_ogg"):
             tar.add(src / name, arcname=name)
     return pkg
 
@@ -100,7 +98,6 @@ def test_archive_is_unpacked_once_and_a_grown_bank_still_verifies(tmp_path):
     code, out = _entrypoint(data)
     assert code == 0 and "library verified after unpack" in out
     assert (data / "words_ogg" / "en-us" / "gemini-Kore" / "0").is_dir()
-    assert (data / "voices" / "en-us" / "kore.wav").exists()
 
     # /v1/speak adds a phrase on the live volume; the restart must not re-unpack.
     _add_phrase(data / "wordbank.db", data / "words_ogg", "good morning", "gemini-Puck", 1)

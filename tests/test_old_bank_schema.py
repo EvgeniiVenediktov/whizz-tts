@@ -94,7 +94,6 @@ def test_manifest_migrates_old_phrase_key_so_a_second_voice_fits(tmp_path):
     assert set(rows) == {None, "gemini-Puck"}
     assert rows[None]["status"] == "done"                 # original row kept intact
     assert rows[None]["file_path"] == "en/local/1/1_good_morning.wav"
-    assert m.voices() == []                               # voices table created too
     m.close()
 
 

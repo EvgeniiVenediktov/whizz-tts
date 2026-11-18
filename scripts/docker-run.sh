@@ -2,8 +2,6 @@
 # Run an image built by docker-build-thin.sh / docker-build-fat.sh.
 #   scripts/docker-run.sh thin               # whizz-tts:thin
 #   scripts/docker-run.sh fat                # whizz-tts:fat (default)
-#   scripts/docker-run.sh fat --with-model   # whizz-tts:fat-model
-#                                            # (MODEL_ENABLED=1, PRELOAD_MODEL=1)
 #   ENV_FILE=.env.edge scripts/docker-run.sh edge
 #                                            # whizz-tts:thin as an edge cache: its
 #                                            # own bank, misses fetched from
@@ -15,7 +13,7 @@
 #
 # thin / edge: bind-mount local library.json + tts-bank.tar.gz onto /data when
 # both exist (unpacked into the volume on first boot). Without them thin runs
-# bank-less (needs GEMINI_API_KEY or --with-model) and edge starts empty.
+# bank-less (needs GEMINI_API_KEY) and edge starts empty.
 #
 # Settings come from ENV_FILE (default ./.env, loaded if present) and the
 # environment, and pass into the container by name, so values never appear on
@@ -30,20 +28,12 @@ cd "$(dirname "$0")/.."
 MODE="${1:-fat}"
 case "$MODE" in
     thin|fat|edge) ;;
-    *) echo "usage: $0 [thin|fat|edge] [--with-model]" >&2; exit 1 ;;
+    *) echo "usage: $0 [thin|fat|edge]" >&2; exit 1 ;;
 esac
-
-WITH_MODEL=0
-[ "${2:-}" = "--with-model" ] && WITH_MODEL=1
-if [ "$MODE" = "edge" ] && [ "$WITH_MODEL" = "1" ]; then
-    echo "error: edge fetches misses from its upstream; --with-model doesn't apply" >&2
-    exit 1
-fi
 
 IMAGE_MODE="$MODE"
 [ "$MODE" = "edge" ] && IMAGE_MODE=thin
 TAG="whizz-tts:$IMAGE_MODE"
-[ "$WITH_MODEL" = "1" ] && TAG="$TAG-model"
 
 ENV_FILE="${ENV_FILE:-.env}"
 if [ -f "$ENV_FILE" ]; then
@@ -66,7 +56,6 @@ if [ "$MODE" = "edge" ]; then
 fi
 
 ENV_ARGS=()
-[ "$WITH_MODEL" = "1" ] && ENV_ARGS+=(-e MODEL_ENABLED=1 -e PRELOAD_MODEL=1)
 for var in "${PASS_VARS[@]}"; do
     if [ -n "${!var:-}" ]; then
         export "${var?}"
@@ -79,10 +68,9 @@ if [ "$MODE" != "fat" ]; then
     if [ -f library.json ] && [ -f tts-bank.tar.gz ]; then
         MOUNT_ARGS+=(-v "$PWD/library.json:/data/library.json:ro"
                      -v "$PWD/tts-bank.tar.gz:/data/tts-bank.tar.gz:ro")
-    elif [ "$MODE" = "thin" ] && [ "$WITH_MODEL" = "0" ] \
-            && [ -z "${GEMINI_API_KEY:-}${GOOGLE_API_KEY:-}" ]; then
+    elif [ "$MODE" = "thin" ] && [ -z "${GEMINI_API_KEY:-}${GOOGLE_API_KEY:-}" ]; then
         echo "error: no library.json + tts-bank.tar.gz (run scripts/pack.sh), and no" >&2
-        echo "       GEMINI_API_KEY or --with-model to run bank-less" >&2
+        echo "       GEMINI_API_KEY to run bank-less" >&2
         exit 1
     fi
 fi

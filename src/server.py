@@ -2,13 +2,12 @@ import asyncio
 import logging
 import os
 import subprocess
-import tempfile
 import time
 from contextlib import asynccontextmanager
 from typing import Annotated, Optional
 
 import jwt
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 
@@ -20,13 +19,10 @@ from wordbank.languages import normalize_lang
 from wordbank.lookup import BankLookup
 from wordbank.paths import voice_from_path
 
-# NOTE: src.model (torch, omnivoice) and src.audio (ffmpeg) are imported LAZILY
-# inside the synthesis handlers — so a bank-only build with MODEL_ENABLED off
-# needs none of the ML stack installed.
+# NOTE: src.audio (ffmpeg) and google-genai are imported LAZILY inside the
+# handlers, so the serving image needs neither at import time.
 
-MODEL_ID = os.getenv("MODEL_ID", "k2-fsa/OmniVoice")
 MAX_TEXT_LEN = int(os.getenv("MAX_TEXT_LEN", "2000"))
-MAX_REF_BYTES = int(os.getenv("MAX_REF_BYTES", str(10 * 1024 * 1024)))  # 10 MB
 FRONTEND_DIR = os.getenv("FRONTEND_DIR", "frontend")
 DEFAULT_LANG = os.getenv("DEFAULT_LANG", "en-us")
 GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", GEMINI_TTS_DEFAULT_MODEL)
@@ -115,16 +111,11 @@ async def lifespan(app: FastAPI):
     app.state.bank = BankLookup(os.getenv("BANK_DB", "wordbank.db"))
     app.state.wav_root = os.getenv("WAV_ROOT", "output/words")
     app.state.ogg_root = os.getenv("OGG_ROOT", "output/words_ogg")
-    app.state.voices_root = os.getenv("VOICES_ROOT", "output/voices")
-    app.state.model_enabled = _truthy(os.getenv("MODEL_ENABLED"))
-    if app.state.model_enabled and _truthy(os.getenv("PRELOAD_MODEL")):
-        from .model import load_model
-        load_model(MODEL_ID)
     # Auth is env-gated (JWT_SECRET) so dev setups and existing deploys keep
     # working unauthenticated unless a secret is explicitly configured.
     log = logging.getLogger("uvicorn.error")
     if not os.getenv("JWT_SECRET"):
-        log.warning("JWT_SECRET not set: /v1/tts, /v1/speak, /v1/gemini/tts, /v1/voices are unauthenticated")
+        log.warning("JWT_SECRET not set: /v1/speak, /v1/gemini/tts are unauthenticated")
     _warn_about_upstream_token(log)
     yield
     app.state.bank.close()
@@ -150,18 +141,15 @@ app.add_middleware(
 @app.get("/health")
 def health():
     bank = app.state.bank
-    # Healthy iff the service can serve SOMETHING: the pre-generated bank, live
-    # synthesis (MODEL_ENABLED), or /v1/speak get-or-generate (Gemini, or an
-    # upstream server in edge mode). A deploy with no bank but any synth path
-    # is legitimate; only "none" is unhealthy.
+    # Healthy iff the service can serve SOMETHING: the pre-generated bank or
+    # /v1/speak get-or-generate (Gemini, or an upstream server in edge mode). A
+    # deploy with no bank but a synth path is legitimate; only "none" is unhealthy.
     gemini = _gemini_configured()
     upstream = _upstream_url() is not None
-    healthy = bank.available or app.state.model_enabled or gemini or upstream
+    healthy = bank.available or gemini or upstream
     info = {
         "status": "ok",
         "healthy": healthy,
-        "model": MODEL_ID,
-        "model_enabled": app.state.model_enabled,
         "gemini": gemini,
         "upstream": upstream,
         "store": _speak_store(),
@@ -169,18 +157,7 @@ def health():
         "bank_path": bank.path,
         "bank_words": bank.count(),
     }
-    if app.state.model_enabled:
-        try:
-            from .model import get_device, is_loaded
-            info["device"] = get_device()
-            info["model_loaded"] = is_loaded()
-        except Exception:
-            info["model_loaded"] = False
     return JSONResponse(content=info, status_code=200 if healthy else 503)
-
-
-def _media_type(path: str) -> str:
-    return "audio/ogg" if path.endswith(".ogg") else "audio/wav"
 
 
 def _wav_abs(rel: str) -> str:
@@ -203,7 +180,7 @@ def languages():
     """Language lists:
 
     - wordbank / phrasebank: data-driven — languages currently in each bank.
-    - generate: manually-curated, verified list the model can generate
+    - generate: manually-curated, verified list of languages to generate
       (wordbank/languages.py).
     """
     from wordbank.languages import SUPPORTED_LANGUAGES
@@ -286,7 +263,7 @@ def phrase_get(text: str, lang: str = DEFAULT_LANG, voice: Optional[str] = None,
 
 def _bank_voice_headers(source: str, voice: Optional[str]) -> dict:
     """X-Source plus X-Voice (the voice label as /v1/search reports it). Labels
-    of local voices are user-chosen; a non-ASCII one is omitted, since headers
+    of older local-voice clips are user-chosen; a non-ASCII one is omitted, since headers
     are latin-1 and a failed encode would 500 an otherwise good bank hit."""
     return {"X-Source": source, **({"X-Voice": voice} if voice and voice.isascii() else {})}
 
@@ -394,13 +371,12 @@ async def _upstream_clip(url: str, text: str, lang: str, voice: Optional[str],
 
 def _save_phrase(text: str, lang: str, bank_voice: str, ogg: bytes,
                  pcm: Optional[bytes] = None, billed_chars: Optional[int] = None) -> None:
-    """Persist a /v1/speak clip into the phrase bank (mirrors the save_voice
-    writer below). Phrases get their own `phrases/` subtree: phrase and word ids
+    """Persist a /v1/speak clip into the phrase bank. Phrases get their own `phrases/` subtree: phrase and word ids
     are separate sequences, so `<lang>/<voice>/<n>/<id>_<slug>` alone could
     collide with a word clip of the same id, voice, and slug."""
     from wordbank.manifest import DONE, Manifest
     from wordbank.paths import safe_filename
-    from wordbank.voices import path_under
+    from wordbank.paths import path_under
     clip_dir = os.path.join(lang, bank_voice, "phrases")
     try:
         # lang and the voice label are checked on the way in; this is the last
@@ -445,8 +421,8 @@ async def speak(
 ):
     """Get-or-generate: serve `text` from the bank (word or phrase) if it's
     already there, otherwise generate it and persist it into the phrase bank so
-    subsequent requests are served from disk. Along with `/v1/voices`, this is
-    the only other route that writes the bank.
+    subsequent requests are served from disk. This is the only route that
+    writes the bank.
 
     A miss is synthesized with Gemini, or — in edge mode (SPEAK_UPSTREAM_URL
     set) — fetched from the upstream server's /v1/speak, so an edge needs no
@@ -509,77 +485,7 @@ async def speak(
                     headers=_bank_voice_headers(source, label))
 
 
-@app.post("/v1/tts", dependencies=[Depends(require_auth)])
-async def tts(
-    text: str = Form(...),
-    ref_text: Annotated[Optional[str], Form()] = None,
-    ref_audio: Annotated[Optional[UploadFile], File()] = None,
-    voice: Annotated[Optional[str], Form()] = None,
-    lang: Annotated[str, Form()] = DEFAULT_LANG,
-    instruct: Annotated[Optional[str], Form()] = None,
-    guidance_scale: Annotated[Optional[float], Form()] = None,
-    seed: Annotated[Optional[int], Form()] = None,
-):
-    """Live synthesis (requires MODEL_ENABLED + the model build).
-
-    Modes: ref_audio upload[+ref_text] → cloning; `voice` (a saved reference
-    name) → clone from the stored clip; instruct → voice design; none → auto.
-    """
-    if not app.state.model_enabled:
-        raise HTTPException(
-            503, "live synthesis disabled (MODEL_ENABLED off); this build serves the bank only"
-        )
-
-    if not ref_text:
-        ref_text = None
-    if not instruct:
-        instruct = None
-    if len(text) > MAX_TEXT_LEN:
-        raise HTTPException(400, f"text exceeds {MAX_TEXT_LEN} characters")
-    lang = _lang(lang)
-
-    ref_path: Optional[str] = None
-    cleanup_ref = False
-    if ref_audio is not None:                       # uploaded clip (one-off)
-        raw = await ref_audio.read(MAX_REF_BYTES + 1)
-        if len(raw) > MAX_REF_BYTES:
-            raise HTTPException(413, "ref_audio exceeds size limit")
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as ref_file:
-            ref_path = ref_file.name
-            ref_file.write(raw)
-        cleanup_ref = True
-    elif voice:                                     # saved reference by name
-        from wordbank.voices import resolve_voice_path
-        row = app.state.bank.get_voice(voice, lang)
-        if row is None:
-            raise HTTPException(404, f"no saved voice {voice!r} for lang {lang!r}")
-        ref_path = resolve_voice_path(app.state.voices_root, row["ref_audio"])
-        if not os.path.exists(ref_path):
-            raise HTTPException(404, f"reference clip missing on disk: {row['ref_audio']}")
-        if ref_text is None:
-            ref_text = row["ref_text"]
-
-    def _synthesize():
-        from .model import ensure_loaded, generate  # lazy: needs torch/omnivoice
-        ensure_loaded(MODEL_ID)
-        return generate(text, ref_path, ref_text, instruct, guidance_scale, seed)
-
-    try:
-        loop = asyncio.get_running_loop()
-        audio = await loop.run_in_executor(None, _synthesize)
-    except (ImportError, ModuleNotFoundError) as exc:
-        raise HTTPException(503, f"synthesis model not available in this build: {exc}") from exc
-    except Exception as exc:
-        raise HTTPException(500, str(exc)) from exc
-    finally:
-        if cleanup_ref and ref_path is not None:
-            os.unlink(ref_path)
-
-    from .audio import pcm_to_ogg  # lazy: shells out to ffmpeg
-    return Response(content=pcm_to_ogg(audio), media_type="audio/ogg")
-
-
-# --- Voice studio: author Gemini references, save + reuse them for cloning ---
+# --- Voice studio: preview Gemini prebuilt voices ---
 
 @app.post("/v1/gemini/tts", dependencies=[Depends(require_auth)])
 async def gemini_tts(
@@ -588,8 +494,8 @@ async def gemini_tts(
     instruct: Annotated[Optional[str], Form()] = None,
     model: Annotated[str, Form()] = GEMINI_TTS_MODEL,
 ):
-    """Generate a phrase with Gemini (a prebuilt voice) → WAV, for previewing
-    before saving as a clone reference. Needs GEMINI_API_KEY on the server."""
+    """Generate a phrase with Gemini (a prebuilt voice) → WAV, to preview a
+    voice. Nothing is saved. Needs GEMINI_API_KEY on the server."""
     if len(text) > MAX_TEXT_LEN:
         raise HTTPException(400, f"text exceeds {MAX_TEXT_LEN} characters")
     voice = _gemini_voice(voice) or GEMINI_TTS_VOICE
@@ -611,62 +517,10 @@ async def gemini_tts(
 
 @app.get("/v1/gemini/voices")
 def gemini_voices():
-    """The prebuilt Gemini TTS voices (static list, name + style) for the studio
-    dropdown. Voices aren't language-bound — Gemini auto-detects language."""
+    """The prebuilt Gemini TTS voices (static list, name + style) that
+    /v1/speak and /v1/gemini/tts accept. Voices aren't language-bound — Gemini auto-detects language."""
     from wordbank.gemini_tts import VOICES
     return {"voices": [{"name": n, "style": s, "gender": g} for n, s, g in VOICES]}
-
-
-@app.get("/v1/voices")
-def list_voices(lang: Optional[str] = None):
-    """Saved clone references (optionally one language) — for the picker UI."""
-    return {"voices": app.state.bank.voices(None if lang is None else _lang(lang))}
-
-
-@app.get("/v1/voices/{lang}/{name}/audio")
-def voice_audio(lang: str, name: str):
-    """Serve a saved reference clip so the UI can replay it."""
-    row = app.state.bank.get_voice(name, _lang(lang))
-    if row is None:
-        raise HTTPException(404, "no such voice")
-    from wordbank.voices import resolve_voice_path
-    path = resolve_voice_path(app.state.voices_root, row["ref_audio"])
-    if not os.path.exists(path):
-        raise HTTPException(404, "reference clip missing on disk")
-    return FileResponse(path, media_type=_media_type(path))
-
-
-@app.post("/v1/voices", dependencies=[Depends(require_auth)])
-async def save_voice(
-    name: str = Form(...),
-    ref_text: str = Form(...),
-    audio: UploadFile = File(...),
-    lang: Annotated[str, Form()] = DEFAULT_LANG,
-    instruct: Annotated[Optional[str], Form()] = None,
-    source: Annotated[str, Form()] = "gemini",
-):
-    """Save an audio clip as a reusable OmniVoice clone reference (writes the WAV
-    under VOICES_ROOT and registers it in the manifest's `voices` table)."""
-    lang = _lang(lang)
-    raw = await audio.read(MAX_REF_BYTES + 1)
-    if len(raw) > MAX_REF_BYTES:
-        raise HTTPException(413, "audio exceeds size limit")
-    if raw[:4] != b"RIFF":
-        raise HTTPException(400, "audio must be a WAV file")
-
-    from wordbank.manifest import Manifest
-    from wordbank.voices import save_voice_clip
-    m = Manifest(os.getenv("BANK_DB", "wordbank.db"))
-    try:
-        rel = save_voice_clip(m, app.state.voices_root, name, lang, raw,
-                              ref_text, instruct=(instruct or None), source=source)
-    except ValueError as exc:   # path outside VOICES_ROOT (lang is checked above)
-        raise HTTPException(500, str(exc)) from exc
-    finally:
-        m.close()
-    app.state.bank.close()   # drop the memoized read conn so the new row is visible
-    return {"name": name, "lang": lang, "ref_audio": rel, "ref_text": ref_text,
-            "instruct": instruct or None, "source": source}
 
 
 # Optionally serve the static frontend from this server (same origin → relative

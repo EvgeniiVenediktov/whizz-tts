@@ -1,4 +1,4 @@
-"""Project-wide TTS sample rate: Gemini TTS and OmniVoice both emit 24 kHz / 16-bit mono PCM."""
+"""Project-wide TTS sample rate: Gemini TTS emits 24 kHz / 16-bit mono PCM."""
 SAMPLE_RATE = 24_000
 
 # Served bank format (libopus). scripts/encode_wavs.py encodes the batch bank

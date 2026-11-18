@@ -1,12 +1,8 @@
 """Word-bank CLI:  python -m wordbank <command> ...
 
-Commands: generate (local OmniVoice) · add-voice / voices (clone references) ·
-batch / batch-submit / batch-collect / batch-run (Gemini async) · describe / verify
-(deployment library description) · status · export.
+Commands: batch / batch-submit / batch-collect / batch-run (Gemini async) ·
+describe / verify (deployment library description) · status · export.
 
-  python -m wordbank --lang en-gb add-voice --ref-audio refs/en-gb/ref.wav \
-      --ref-text-file refs/en-gb/ref.txt --source gemini
-  python -m wordbank --lang en-gb generate --words phrases.txt --voice en-gb
   python -m wordbank batch-run --words words.txt --voice Kore
   python -m wordbank status
 """
@@ -55,88 +51,6 @@ def _add_gemini_args(p, *, words=True, instruction=True, chunk=True, poll=True):
         p.add_argument("--chunk", type=int, default=2000, help="words per batch job")
     if poll:
         p.add_argument("--poll-interval", type=int, default=60, dest="poll_interval")
-
-
-def cmd_generate(args, cfg: Config) -> None:
-    """Generate phrases locally with OmniVoice → the phrase bank (stored separately
-    from words); accent via a clone reference."""
-    from .backends.local import LocalOmniVoiceBackend
-    from .pipeline import WordBankPipeline
-
-    m = Manifest(cfg.db, table="phrases", text_col="text")
-
-    ref_audio, ref_text = args.ref_audio, args.ref_text
-    if ref_text is None and args.ref_text_file:
-        ref_text = pathlib.Path(args.ref_text_file).read_text(encoding="utf-8").strip()
-    if ref_audio is None:                       # fall back to a registered voice
-        v = m.get_voice(args.voice, cfg.lang)
-        if v:
-            from .voices import resolve_voice_path
-            ref_audio = resolve_voice_path(cfg.voices_root, v["ref_audio"])
-            ref_text = ref_text or v["ref_text"]
-            print(f"using registered voice {args.voice!r} ({cfg.lang}): {ref_audio}")
-
-    phrases = _load_words(args.words)
-    added = m.add_words(phrases, cfg.lang, voice=args.voice)
-    print(f"{len(phrases)} phrases in file; {added} newly added to the phrase bank "
-          f"(lang={cfg.lang}, voice={args.voice})")
-
-    backend = LocalOmniVoiceBackend(ref_audio=ref_audio, ref_text=ref_text,
-                                    voice=args.voice, seed=args.seed)
-    verifier = None
-    if args.verify:
-        from .verify import Verifier
-        verifier = Verifier()
-
-    pipe = WordBankPipeline(m, backend, verifier, cfg.out_dir,
-                            lang=cfg.lang, voice=args.voice)
-    result = pipe.run(limit=args.limit)   # sequential — the model isn't thread-safe
-    print(f"this run: {result}")
-    print(f"phrase totals: {m.counts()}")
-    m.close()
-
-
-def cmd_add_voice(args, cfg: Config) -> None:
-    """Register a voice-clone reference so `generate --voice <name>` can reuse it."""
-    ref_text = args.ref_text
-    if ref_text is None and args.ref_text_file:
-        ref_text = pathlib.Path(args.ref_text_file).read_text(encoding="utf-8").strip()
-    name = args.name or cfg.lang
-    m = Manifest(cfg.db)
-    m.add_voice(name, cfg.lang, args.ref_audio, ref_text=ref_text,
-                instruct=args.instruct, source=args.source,
-                sample_rate=args.sample_rate)
-    print(f"registered voice {name!r} (lang={cfg.lang}) → {args.ref_audio}")
-    m.close()
-
-
-def cmd_voices(args, cfg: Config) -> None:
-    """List registered voice-clone references."""
-    m = Manifest(cfg.db)
-    rows = m.voices()
-    if not rows:
-        print("no voices registered")
-    for r in rows:
-        print(f"{r['name']}\t{r['lang']}\t{r['ref_audio']}\t{r['ref_text'] or ''}")
-    m.close()
-
-
-def cmd_gemini_voice(args, cfg: Config) -> None:
-    """Synthesize a phrase with Gemini and save it as a clone reference (file + DB)."""
-    from .gemini_tts import pcm_to_wav_bytes, synthesize_pcm
-    from .voices import save_voice_clip
-
-    kwargs = {"model": args.model} if args.model else {}
-    pcm = synthesize_pcm(args.text, voice=args.voice, instruct=args.instruct or "",
-                         **kwargs)
-    name = args.name or cfg.lang
-    m = Manifest(cfg.db)
-    rel = save_voice_clip(m, cfg.voices_root, name, cfg.lang, pcm_to_wav_bytes(pcm),
-                          args.text, instruct=args.instruct, source="gemini")
-    m.close()
-    print(f"saved reference {name!r} (lang={cfg.lang}) → {cfg.voices_root}/{rel}")
-    print(f"generate with it:  python -m wordbank --lang {cfg.lang} generate "
-          f"--words PHRASES.txt --voice {name}")
 
 
 def _make_batch(args):
@@ -199,16 +113,16 @@ def cmd_batch_run(args, cfg: Config) -> None:
 
 
 def cmd_describe(args, cfg: Config) -> None:
-    """Emit a library description (languages/voices/counts/folders) as JSON."""
+    """Emit a library description (languages/counts/folders) as JSON."""
     import json
     from .library import describe
 
-    desc = describe(cfg.db, args.ogg_root, args.voices_dir)
+    desc = describe(cfg.db, args.ogg_root)
     text = json.dumps(desc, indent=2)
     if args.output:
         pathlib.Path(args.output).write_text(text + "\n", encoding="utf-8")
         print(f"wrote {args.output}: {desc['words']} words, {desc['phrases']} phrases, "
-              f"{desc['ogg_files']} ogg, {len(desc['voices'])} voices")
+              f"{desc['ogg_files']} ogg")
     else:
         print(text)
 
@@ -218,7 +132,7 @@ def cmd_verify(args, cfg: Config) -> None:
     from .library import verify
 
     problems = verify(args.desc, args.root, db=args.db_override,
-                      ogg_root=args.ogg_root, voices_root=args.voices_root_override)
+                      ogg_root=args.ogg_root)
     if problems:
         print("library INVALID:")
         for p in problems:
@@ -259,25 +173,7 @@ def main(argv=None) -> None:
     p.add_argument("--db", default=cfg.db)
     p.add_argument("--out", default=cfg.out_dir, dest="out_dir")
     p.add_argument("--lang", default=cfg.lang, type=normalize_lang)  # a path segment of every clip
-    p.add_argument("--voices-root", default=cfg.voices_root, dest="voices_root")
     sub = p.add_subparsers(dest="cmd", required=True)
-
-    gen = sub.add_parser("generate",
-                         help="generate phrases locally with OmniVoice (accent via clone reference)")
-    gen.add_argument("--words", required=True, help="text file, one phrase/word per line")
-    gen.add_argument("--voice", default="local", help="label for the output dir, e.g. en-gb")
-    gen.add_argument("--ref-audio", default=None, dest="ref_audio",
-                     help="voice-clone reference clip (the accent), e.g. a Gemini phrase")
-    gen.add_argument("--ref-text", default=None, dest="ref_text",
-                     help="transcript of --ref-audio")
-    gen.add_argument("--ref-text-file", default=None, dest="ref_text_file",
-                     help="file holding the transcript of --ref-audio")
-    gen.add_argument("--limit", type=int, default=None, help="cap phrases this run")
-    gen.add_argument("--seed", type=int, default=None,
-                     help="fixed RNG seed (default: a fresh random seed per phrase, recorded)")
-    gen.add_argument("--verify", action="store_true",
-                     help="STT-verify each clip with local Whisper (slow)")
-    gen.set_defaults(func=cmd_generate)
 
     g = sub.add_parser("batch", help="generate via Gemini Batch API (async, ~half cost)")
     _add_gemini_args(g)
@@ -298,39 +194,9 @@ def main(argv=None) -> None:
     _add_gemini_args(br)
     br.set_defaults(func=cmd_batch_run)
 
-    av = sub.add_parser("add-voice",
-                        help="register a voice-clone reference (reused by `generate --voice`)")
-    av.add_argument("--name", default=None,
-                    help="voice label (default: --lang), e.g. en-gb")
-    av.add_argument("--ref-audio", required=True, dest="ref_audio",
-                    help="reference clip path, e.g. refs/en-gb/ref.wav")
-    av.add_argument("--ref-text", default=None, dest="ref_text",
-                    help="transcript of --ref-audio")
-    av.add_argument("--ref-text-file", default=None, dest="ref_text_file",
-                    help="file holding the transcript of --ref-audio")
-    av.add_argument("--instruct", default=None,
-                    help="accent/style direction used to make the reference")
-    av.add_argument("--source", default=None, help="provenance, e.g. gemini")
-    av.add_argument("--sample-rate", type=int, default=None, dest="sample_rate",
-                    help="reference sample rate (informational)")
-    av.set_defaults(func=cmd_add_voice)
-
-    vl = sub.add_parser("voices", help="list registered voice-clone references")
-    vl.set_defaults(func=cmd_voices)
-
-    gv = sub.add_parser("gemini-voice",
-                        help="synth a phrase with Gemini and save it as a clone reference")
-    gv.add_argument("--text", required=True, help="phrase to speak")
-    gv.add_argument("--name", default=None, help="reference name (default: --lang)")
-    gv.add_argument("--voice", default="Kore", help="Gemini prebuilt voice")
-    gv.add_argument("--instruct", default=None, help="accent/style direction (not spoken)")
-    gv.add_argument("--model", default=None, help="Gemini TTS model (default: gemini_tts.DEFAULT_MODEL)")
-    gv.set_defaults(func=cmd_gemini_voice)
-
     de = sub.add_parser("describe",
-                        help="write a library description (langs/voices/counts) as JSON")
+                        help="write a library description (langs/counts) as JSON")
     de.add_argument("--ogg-root", default="output/words_ogg", dest="ogg_root")
-    de.add_argument("--voices-dir", default="output/voices", dest="voices_dir")
     de.add_argument("--output", default=None, help="path to write (default: stdout)")
     de.set_defaults(func=cmd_describe)
 
@@ -338,15 +204,13 @@ def main(argv=None) -> None:
                         help="verify a volume against a library description (exit 1 if invalid)")
     ve.add_argument("--desc", required=True, help="library description JSON")
     ve.add_argument("--root", default=None,
-                    help="flat deploy layout data dir (db + words_ogg/ + voices/ all under "
-                         "here, as docker-entrypoint.sh lays it out). Omit to check the "
-                         "dev/server default layout ($BANK_DB, $OGG_ROOT, $VOICES_ROOT).")
+                    help="flat deploy layout data dir (db + words_ogg/ under here, as "
+                         "docker-entrypoint.sh lays it out). Omit to check the "
+                         "dev/server default layout ($BANK_DB, $OGG_ROOT).")
     ve.add_argument("--db", default=None, dest="db_override",
                     help="override the db path (wins over --root and $BANK_DB)")
     ve.add_argument("--ogg-root", default=None, dest="ogg_root",
                     help="override the OGG tree (wins over --root and $OGG_ROOT)")
-    ve.add_argument("--voices-root", default=None, dest="voices_root_override",
-                    help="override the voices dir (wins over --root and $VOICES_ROOT)")
     ve.set_defaults(func=cmd_verify)
 
     s = sub.add_parser("status", help="show counts by status")
@@ -357,8 +221,7 @@ def main(argv=None) -> None:
     e.set_defaults(func=cmd_export)
 
     args = p.parse_args(argv)
-    cfg = Config(db=args.db, out_dir=args.out_dir, lang=args.lang,
-                 voices_root=args.voices_root)
+    cfg = Config(db=args.db, out_dir=args.out_dir, lang=args.lang)
     args.func(args, cfg)
 
 

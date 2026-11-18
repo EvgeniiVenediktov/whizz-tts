@@ -2,8 +2,8 @@
 (`<lang>/<voice>/…`), so it is validated before anything else happens: a bad
 code is a 400 with no lookup, synthesis, upstream fetch, file, or row. The
 writers also refuse any path that resolves outside their root (defence in
-depth, tested directly). All roots are under tmp_path (bank_env); Gemini, the
-model and upstream are faked."""
+depth, tested directly). All roots are under tmp_path (bank_env); Gemini and
+upstream are faked."""
 import os
 import sqlite3
 from contextlib import contextmanager
@@ -12,11 +12,10 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-from tests.conftest import make_wav_bytes
 from tests.test_edge import FakeUpstream
 from wordbank.languages import is_lang_code, normalize_lang
 from wordbank.manifest import Manifest
-from wordbank.voices import path_under, save_voice_clip, voice_rel_path
+from wordbank.paths import path_under
 
 # "{out}" is filled with a directory outside the tmp bank but inside pytest's
 # basetemp (which _files watches), so a regression can't write to the real /tmp.
@@ -26,8 +25,6 @@ BAD_LANGS = [
     "ру-ру",            # non-ASCII
     "KK",     # Kelvin signs: lowercase to ASCII "kk", refused before folding
 ]
-# What a path segment can carry (the voice-audio route's {lang}).
-SEGMENT_BAD_LANGS = [l for l in BAD_LANGS if "/" not in l]
 VALID_LANGS = ["en-us", "en-gb", "ru-ru"]
 
 
@@ -61,11 +58,6 @@ def _nothing_written(tmp_path, db):
     yield
     assert _files(tmp_path, db) == files, "a file was written"
     assert _rows(db) == rows, "a bank row was written"
-
-
-def _save_voice(client, name, lang, wav):
-    return client.post("/v1/voices", data={"name": name, "lang": lang, "ref_text": "hi there"},
-                       files={"audio": (f"{name}.wav", wav, "audio/wav")})
 
 
 @pytest.fixture(scope="module")
@@ -126,44 +118,6 @@ def test_edge_refuses_an_upstream_voice_label_that_is_not_one_segment(edge, tmp_
     assert r.status_code == 502 and "unusable voice label" in r.json()["detail"]
 
 
-@pytest.mark.parametrize("lang", BAD_LANGS)
-def test_save_voice_rejects_bad_lang(client, tmp_path, lang):
-    with _nothing_written(tmp_path, client.paths.db):
-        r = _save_voice(client, "kore", _bad(lang, tmp_path), make_wav_bytes(0.2))
-    assert r.status_code == 400 and "invalid lang" in r.json()["detail"]
-
-
-@pytest.mark.parametrize("lang", BAD_LANGS)
-@pytest.mark.parametrize("voice", [None, "kore"])
-def test_tts_rejects_bad_lang_before_synthesis(client, tmp_path, lang, voice):
-    assert _save_voice(client, "kore", "en-us", make_wav_bytes(0.2)).status_code == 200
-    data = {"text": "hello", "lang": _bad(lang, tmp_path), **({"voice": voice} if voice else {})}
-    with _nothing_written(tmp_path, client.paths.db):
-        r = client.post("/v1/tts", data=data)
-    assert r.status_code == 400 and "invalid lang" in r.json()["detail"]
-    assert client.model.calls == []
-
-
-@pytest.mark.parametrize("lang", SEGMENT_BAD_LANGS)
-def test_voice_audio_rejects_bad_lang(client, lang):
-    assert _save_voice(client, "kore", "en-us", make_wav_bytes(0.2)).status_code == 200
-    seg = "".join(f"%{b:02X}" for b in lang.encode())   # every byte, so '..' isn't collapsed client-side
-    r = client.get(f"/v1/voices/{seg}/kore/audio")
-    assert r.status_code == 400 and "invalid lang" in r.json()["detail"]
-
-
-@pytest.mark.parametrize("lang", ["", "../x", "ру-ру"])
-@pytest.mark.parametrize("path,params", [
-    ("/v1/search", {"prefix": "he"}), ("/v1/bank", {"prefix": "he"}),
-    ("/v1/bank/hello", {}), ("/v1/bank/hello/info", {}),
-    ("/v1/phrase", {"text": "hello there"}), ("/v1/phrase/info", {"text": "hello there"}),
-    ("/v1/voices", {}),
-])
-def test_read_routes_reject_bad_lang(client, path, params, lang):
-    r = client.get(path, params={**params, "lang": lang})
-    assert r.status_code == 400 and "invalid lang" in r.json()["detail"]
-
-
 # ---- valid langs still work end to end ----
 
 @pytest.mark.parametrize("lang", VALID_LANGS)
@@ -181,20 +135,6 @@ def test_valid_lang_speak_saves_under_it_and_then_serves_from_bank(client, lang)
     assert len(client.gemini.calls) == 1
 
 
-@pytest.mark.parametrize("lang", VALID_LANGS)
-def test_valid_lang_voice_saves_serves_and_clones(client, lang):
-    wav = make_wav_bytes(0.2)
-    r = _save_voice(client, "narrator", lang, wav)
-    assert r.status_code == 200 and r.json()["ref_audio"] == f"{lang}/narrator.wav"
-    assert (client.paths.voices / lang / "narrator.wav").read_bytes() == wav
-    assert client.get(f"/v1/voices/{lang}/narrator/audio").content == wav
-    assert [v["lang"] for v in client.get("/v1/voices", params={"lang": lang}).json()["voices"]] == [lang]
-
-    r = client.post("/v1/tts", data={"text": "hello", "voice": "narrator", "lang": lang})
-    assert r.status_code == 200
-    assert client.model.calls[0]["ref_bytes"] == wav
-
-
 def test_lang_is_case_and_space_insensitive_and_filed_lowercase(client):
     """Normalized, not rejected: "EN-US" finds the existing "en-us" rows."""
     first = client.post("/v1/speak", data={"text": "hello there", "lang": "EN-US"})
@@ -206,11 +146,6 @@ def test_lang_is_case_and_space_insensitive_and_filed_lowercase(client):
     m = Manifest(str(client.paths.db), table="phrases", text_col="text")
     assert [x["lang"] for x in m.iter_rows()] == ["en-us"]
     m.close()
-
-    wav = make_wav_bytes(0.2)
-    r = _save_voice(client, "narrator", "RU-RU", wav)
-    assert r.json()["lang"] == "ru-ru" and r.json()["ref_audio"] == "ru-ru/narrator.wav"
-    assert client.get("/v1/voices/RU-RU/narrator/audio").content == wav
 
 
 def test_empty_form_lang_means_the_default(client):
@@ -249,29 +184,7 @@ def test_is_lang_code_wants_the_canonical_form():
     assert not any(is_lang_code(c) for c in ("EN-US", " en-us", "en-us\n", "", None))
 
 
-# ---- defence in depth: wordbank.voices and the /v1/speak writer ----
-
-@pytest.mark.parametrize("lang", BAD_LANGS + ["EN-US", "/tmp/x"])
-def test_voice_rel_path_refuses_bad_lang(lang):
-    """No sanitizing here: a non-canonical code is refused (callers normalize)."""
-    with pytest.raises(ValueError, match="invalid lang"):
-        voice_rel_path(lang, "kore")
-
-
-@pytest.mark.parametrize("lang", ["../../escaped", "{out}/abs-escape", "en/../.."])
-def test_save_voice_clip_refuses_bad_lang_and_writes_nothing(tmp_path, lang):
-    """The CLI (`add-voice` / `gemini-voice`) reaches this without the server."""
-    db = tmp_path / "wb.db"
-    m = Manifest(str(db))
-    try:
-        with _nothing_written(tmp_path, db):
-            with pytest.raises(ValueError):
-                save_voice_clip(m, str(tmp_path / "bank" / "voices"), "kore",
-                                _bad(lang, tmp_path), b"RIFF", "hi")
-        assert m.voices() == []
-    finally:
-        m.close()
-
+# ---- defence in depth: the /v1/speak writer ----
 
 def test_path_under(tmp_path):
     root = tmp_path / "root"
@@ -284,21 +197,6 @@ def test_path_under(tmp_path):
             path_under(str(root), rel)
     (tmp_path / "linked-root").symlink_to(root)          # a symlinked root itself is fine
     assert path_under(str(tmp_path / "linked-root"), "en-us/x.wav")
-
-
-def test_save_voice_clip_refuses_a_lang_dir_symlinked_out_of_the_root(tmp_path):
-    """A valid lang can still resolve elsewhere; the containment check catches it."""
-    root, outside = tmp_path / "voices", tmp_path / "outside"
-    root.mkdir()
-    outside.mkdir()
-    (root / "en-us").symlink_to(outside)
-    m = Manifest(str(tmp_path / "wb.db"))
-    try:
-        with pytest.raises(ValueError, match="outside"):
-            save_voice_clip(m, str(root), "kore", "en-us", b"RIFF", "hi")
-        assert list(outside.iterdir()) == [] and m.voices() == []
-    finally:
-        m.close()
 
 
 @pytest.mark.parametrize("lang,voice", [("../../escaped", "gemini-Kore"),

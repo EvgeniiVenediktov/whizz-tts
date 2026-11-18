@@ -1,7 +1,7 @@
 """Library description + verification for deployment.
 
 A **description file** (JSON) records what a provisioned bank should contain —
-languages, voices, word/phrase counts, OGG file count, and the folders that must
+languages, word/phrase counts, OGG file count, and the folders that must
 exist. At deploy time the container verifies the mounted volume against it and
 unpacks the library archive only if verification fails. Uses read-only
 `BankLookup` (never creates/mutates the DB) + the stdlib, so it runs in the
@@ -15,31 +15,26 @@ from typing import List, Optional
 from .lookup import BankLookup
 
 
-def describe(db: str, ogg_root: str, voices_dir: Optional[str] = None) -> dict:
+def describe(db: str, ogg_root: str) -> dict:
     """Introspect a bank into a description dict (what a valid volume must hold)."""
     bl = BankLookup(db)
     wb = bl.languages()
     pb = bl.phrase_languages()
-    voices = [{"name": v["name"], "lang": v["lang"]} for v in bl.voices()]
     bl.close()
 
-    folders = ["words_ogg"]
-    if voices_dir and os.path.isdir(voices_dir):
-        folders.append("voices")
     ogg = pathlib.Path(ogg_root)
     return {
         "db": os.path.basename(db),
-        "folders": folders,
+        "folders": ["words_ogg"],
         "words": sum(l["words"] for l in wb),
         "phrases": sum(l["words"] for l in pb),
         "ogg_files": sum(1 for _ in ogg.rglob("*.ogg")) if ogg.is_dir() else 0,
         "languages": {"wordbank": wb, "phrasebank": pb},
-        "voices": voices,
     }
 
 
 def verify(desc_path: str, root: Optional[str] = None, *, db: Optional[str] = None,
-           ogg_root: Optional[str] = None, voices_root: Optional[str] = None) -> List[str]:
+           ogg_root: Optional[str] = None) -> List[str]:
     """Check a bank against the description. Returns a list of problems (empty = OK).
 
     The word count must match exactly. Phrase and OGG counts are minimums: the
@@ -48,13 +43,14 @@ def verify(desc_path: str, root: Optional[str] = None, *, db: Optional[str] = No
     matching there made every restart after a /v1/speak write fail verification
     and re-unpack the archive over the grown wordbank.db.
 
-    Layout resolution (each of db/ogg_root/voices_root resolves independently):
-      - explicit `db=`/`ogg_root=`/`voices_root=` kwargs always win.
+    Layout resolution (db and ogg_root resolve independently):
+      - explicit `db=`/`ogg_root=` kwargs always win.
       - else if `root` is given: the flat deploy layout — `root/desc["db"]`,
-        `root/"words_ogg"`, `root/"voices"` (matches docker-entrypoint.sh).
+        `root/"words_ogg"` (matches docker-entrypoint.sh).
       - else: the same defaults the server uses — $BANK_DB (default
-        "wordbank.db"), $OGG_ROOT (default "output/words_ogg"), $VOICES_ROOT
-        (default "output/voices").
+        "wordbank.db"), $OGG_ROOT (default "output/words_ogg").
+    Other listed folders (e.g. "voices" in descriptions written before clone
+    references were removed) resolve under `root`.
     """
     dp = pathlib.Path(desc_path)
     if not dp.exists():
@@ -68,11 +64,8 @@ def verify(desc_path: str, root: Optional[str] = None, *, db: Optional[str] = No
     if ogg_root is None:
         ogg_root = str(root_path / "words_ogg") if root_path is not None \
             else os.getenv("OGG_ROOT", "output/words_ogg")
-    if voices_root is None:
-        voices_root = str(root_path / "voices") if root_path is not None \
-            else os.getenv("VOICES_ROOT", "output/voices")
 
-    resolved = {"words_ogg": pathlib.Path(ogg_root), "voices": pathlib.Path(voices_root)}
+    resolved = {"words_ogg": pathlib.Path(ogg_root)}
 
     problems: List[str] = []
     for folder in desc.get("folders", []):

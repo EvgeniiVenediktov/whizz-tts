@@ -176,7 +176,7 @@ docker-compose.yml, docker-entrypoint.sh, scripts/pack.sh, src/server.py.
 Find architectural problems, missing reliability patterns, security gaps. Specifically:
 1. HEALTHCHECK — is there a HEALTHCHECK instruction in Dockerfile? A healthcheck
    key in docker-compose.yml? The /health endpoint exists — is it wired?
-2. CORS — what are allow_origins/methods/headers? Any auth? Who can POST /v1/voices
+2. CORS — what are allow_origins/methods/headers? Any auth? Who can POST /v1/speak
    (writes WAV to disk) with no credentials?
 3. BANK_SYNC_CMD in docker-entrypoint.sh — how invoked? Sanitized? Injection risk?
 4. asyncio.get_event_loop() inside async def (deprecated Python 3.10+; should be
