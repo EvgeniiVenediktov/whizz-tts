@@ -1,6 +1,7 @@
 """synthesize_pcm against a fake google-genai client: Gemini's transient
 empty responses (finish_reason OTHER, no content) are retried, blocks are not,
-and a final failure names the reason instead of an AttributeError."""
+and a final failure names the reason instead of an AttributeError. A WAV
+payload (gemini-3.8-flash-lite-tts) comes back as its data chunk only."""
 import types as pytypes
 
 import pytest
@@ -8,15 +9,16 @@ import pytest
 genai_types = pytest.importorskip("google.genai.types")
 
 import wordbank.gemini_tts as gemini_tts  # noqa: E402
+from tests.test_gemini_payload import fmt_chunk, gemini_lite_wav, wav_payload  # noqa: E402
 
 PCM = b"\x00\x10" * 2400
 
 
-def audio_resp():
+def audio_resp(data=PCM, mime_type="audio/L16;rate=24000"):
     return genai_types.GenerateContentResponse(candidates=[genai_types.Candidate(
         finish_reason="STOP",
         content=genai_types.Content(parts=[genai_types.Part(
-            inline_data=genai_types.Blob(data=PCM, mime_type="audio/L16;rate=24000"))]))])
+            inline_data=genai_types.Blob(data=data, mime_type=mime_type))]))])
 
 
 def empty_resp(finish_reason="OTHER", finish_message=None):
@@ -98,6 +100,41 @@ def test_prompt_block_reason_is_not_retried(fake_client):
     with pytest.raises(gemini_tts.GeminiNoAudioError, match="block_reason=PROHIBITED_CONTENT"):
         gemini_tts.synthesize_pcm("hello")
     assert fake_client.calls == 1
+
+
+def test_wav_payload_returns_only_its_data_chunk(fake_client):
+    """gemini-3.8-flash-lite-tts answers with a WAV + C2PA chunk; the header
+    and the C2PA bytes must not reach the caller as audio."""
+    fake_client.responses = [audio_resp(gemini_lite_wav(PCM), mime_type="audio/wav")]
+    assert gemini_tts.synthesize_pcm("hello") == PCM
+    assert fake_client.calls == 1
+
+
+def test_audio_in_another_format_raises_without_retry(fake_client):
+    fake_client.responses = [audio_resp(gemini_lite_wav(PCM, channels=2)), audio_resp()]
+    with pytest.raises(gemini_tts.GeminiAudioFormatError, match="2 ch"):
+        gemini_tts.synthesize_pcm("hello")
+    assert fake_client.calls == 1
+
+
+def test_wav_with_empty_data_chunk_is_no_audio(fake_client):
+    fake_client.responses = [audio_resp(wav_payload(fmt_chunk(), (b"data", b"")))]
+    with pytest.raises(gemini_tts.GeminiNoAudioError, match="finish_reason=STOP"):
+        gemini_tts.synthesize_pcm("hello")
+
+
+def test_clients_pin_the_v1beta_api(monkeypatch):
+    """google-genai 3.x defaults to v1, where speechConfig is an unknown field
+    (every synth 400s); the TTS and batch clients must both ask for v1beta."""
+    import google.genai
+    from wordbank.gemini_batch import GeminiBatch
+
+    seen = []
+    monkeypatch.setattr(google.genai, "Client", lambda **kw: seen.append(kw) or object())
+    monkeypatch.setattr(gemini_tts, "_client", None)
+    gemini_tts._get_client()
+    GeminiBatch()._get_client()
+    assert [kw["http_options"]["api_version"] for kw in seen] == ["v1beta", "v1beta"]
 
 
 def test_speak_answers_502_with_the_reason_and_saves_nothing(bank_env, fake_client):

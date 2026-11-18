@@ -323,7 +323,7 @@ def main(argv=None) -> None:
     gv.add_argument("--name", default=None, help="reference name (default: --lang)")
     gv.add_argument("--voice", default="Kore", help="Gemini prebuilt voice")
     gv.add_argument("--instruct", default=None, help="accent/style direction (not spoken)")
-    gv.add_argument("--model", default=None, help="Gemini TTS model (default: 2.5-flash-preview-tts)")
+    gv.add_argument("--model", default=None, help="Gemini TTS model (default: gemini_tts.DEFAULT_MODEL)")
     gv.set_defaults(func=cmd_gemini_voice)
 
     de = sub.add_parser("describe",

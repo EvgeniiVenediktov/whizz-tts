@@ -2,7 +2,8 @@
 
 File-based JSONL with an explicit per-request KEY = manifest id, so every result
 maps **1:1** to its requested word regardless of response order or omissions —
-not positional. At receive time the returned PCM (24 kHz / 16-bit / mono) is
+not positional. At receive time the returned PCM (24 kHz / 16-bit / mono; a WAV
+payload is first unwrapped to its data chunk by gemini_tts.pcm_from_payload) is
 written straight to **WAV** via the stdlib `wave` module: no ffmpeg, no trimming,
 no normalization. Any OGG/Opus encoding or trimming is a separate later pass over
 the WAVs on disk (see scripts/encode_wavs.py).
@@ -27,6 +28,7 @@ import wave
 from typing import Callable, Iterable, List, Optional
 
 from .constants import SAMPLE_RATE
+from .gemini_tts import GeminiAudioFormatError, new_client, pcm_from_payload
 from .manifest import DONE, FAILED, SUBMITTED, Manifest
 from .paths import safe_filename
 
@@ -34,6 +36,11 @@ from .paths import safe_filename
 # gemini-3.1-flash-tts-preview and gemini-2.5-pro-preview-tts do; the older
 # gemini-2.5-flash-preview-tts does NOT. Run scripts/list_models.py to recheck.
 BATCH_DEFAULT_MODEL = "gemini-3.1-flash-tts-preview"
+
+# google.genai.types.JobState names a batch ends in: JOB_STATE_SUCCEEDED or
+# JOB_STATE_PARTIALLY_SUCCEEDED (results file; per-line errors are per row), or
+# JOB_STATE_FAILED / _CANCELLED / _EXPIRED (no results; jobs expire after 48h).
+# Matched by suffix, so the API's raw BATCH_STATE_* spellings work too.
 _TERMINAL = ("SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED")
 
 # Style direction prepended to each word. Gemini TTS treats a leading "Say …:"
@@ -68,7 +75,8 @@ def build_jsonl(rows, voice: str, instruction: str = VOICE_INSTRUCTION) -> bytes
 
 
 def audio_from_line(line: dict) -> Optional[bytes]:
-    """Decode base64 PCM from one output JSONL line; None if absent."""
+    """Decode one output JSONL line's base64 audio to raw PCM; None if absent.
+    Raises GeminiAudioFormatError for audio that isn't 24 kHz/16-bit/mono."""
     resp = line.get("response")
     if not resp:
         return None
@@ -79,7 +87,8 @@ def audio_from_line(line: dict) -> Optional[bytes]:
     for p in parts:
         blob = p.get("inlineData") or p.get("inline_data")
         if blob and blob.get("data"):
-            return base64.b64decode(blob["data"])
+            return pcm_from_payload(base64.b64decode(blob["data"]),
+                                    blob.get("mimeType") or blob.get("mime_type"))
     return None
 
 
@@ -104,8 +113,7 @@ class GeminiBatch:
 
     def _get_client(self):
         if self._client is None:
-            from google import genai
-            self._client = genai.Client()
+            self._client = new_client()
         return self._client
 
     def _wait_file_active(self, file, timeout: float = 180, interval: float = 2):
@@ -153,10 +161,24 @@ class GeminiBatch:
     def poll(self, job_name: str):
         return self._get_client().batches.get(name=job_name)
 
-    def is_done(self, job) -> bool:
+    @staticmethod
+    def _state_name(job) -> str:
         state = getattr(job, "state", "")
-        name = getattr(state, "name", None) or str(state)
-        return name.endswith(_TERMINAL)
+        return getattr(state, "name", None) or str(state)
+
+    def is_done(self, job) -> bool:
+        return self._state_name(job).endswith(_TERMINAL)
+
+    def no_results_reason(self, job) -> Optional[str]:
+        """Why a finished job has no results to collect (naming its state), or
+        None when it has. Only (PARTIALLY_)SUCCEEDED jobs carry a results file."""
+        state = self._state_name(job)
+        if not state.endswith("SUCCEEDED"):
+            msg = getattr(getattr(job, "error", None), "message", None)
+            return f"batch job {state}" + (f": {msg}" if msg else "")
+        if not getattr(getattr(job, "dest", None), "file_name", None):
+            return f"batch job {state} has no results file"
+        return None
 
     def result_lines(self, job) -> Iterable[dict]:
         content = self._get_client().files.download(file=job.dest.file_name)
@@ -197,6 +219,18 @@ def _collect(manifest: Manifest, batch: GeminiBatch, job_name: str,
         sleep(poll_interval)
 
     rows_by_key = {str(r["id"]): r for r in manifest.get_by_batch(job_name)}
+    why = batch.no_results_reason(job)
+    if why:
+        # A FAILED/CANCELLED/EXPIRED job has nothing to download. Fail its words
+        # (the submission already spent one attempt) so pending() retries them
+        # within max_attempts, rather than leaving them SUBMITTED for every
+        # later collect to trip over again.
+        stuck = [r for r in rows_by_key.values() if r["status"] == SUBMITTED]
+        for row in stuck:
+            manifest.set_status(row["id"], FAILED, error=why[:500])
+        log(f"{job_name}: {why} — {len(stuck)} word(s) marked failed")
+        return
+
     seen = set()
     for line in batch.result_lines(job):
         key = str(line.get("key"))
@@ -208,7 +242,11 @@ def _collect(manifest: Manifest, batch: GeminiBatch, job_name: str,
         if line.get("error"):
             manifest.set_status(row["id"], FAILED, error=str(line["error"])[:500])
             continue
-        pcm = audio_from_line(line)
+        try:
+            pcm = audio_from_line(line)
+        except GeminiAudioFormatError as e:
+            manifest.set_status(row["id"], FAILED, error=str(e)[:500])
+            continue
         if not pcm:
             manifest.set_status(row["id"], FAILED, error="no audio in batch result")
             continue

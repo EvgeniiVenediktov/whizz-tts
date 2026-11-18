@@ -17,6 +17,7 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 
 from wordbank.gemini_batch import write_wav_from_pcm_bytes  # raw PCM → WAV
+from wordbank.gemini_tts import DEFAULT_MODEL
 
 
 def main() -> None:
@@ -25,7 +26,7 @@ def main() -> None:
     p.add_argument("--instruct", default="",
                    help="accent/style direction, e.g. 'Speak in a British accent' (not spoken)")
     p.add_argument("--voice", default="Kore", help="Gemini prebuilt voice")
-    p.add_argument("--model", default="gemini-2.5-flash-preview-tts")
+    p.add_argument("--model", default=DEFAULT_MODEL)
     p.add_argument("--out", default="refs/ref", help="output dir for ref.wav + ref.txt")
     args = p.parse_args()
 

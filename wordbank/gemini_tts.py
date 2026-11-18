@@ -7,12 +7,24 @@ Lazily imports google-genai; needs GEMINI_API_KEY in the environment.
 import io
 import logging
 import os
+import struct
 import time
 import wave
 from typing import Optional
 
 from .constants import SAMPLE_RATE  # Gemini TTS emits 24 kHz / 16-bit mono PCM
-DEFAULT_MODEL = "gemini-2.5-flash-preview-tts"
+# Chosen for cost. A 3.x model because the 2.5 TTS models answer imperative
+# text ("Read this one slowly please.") with 400 "Model tried to generate text"
+# and drop audio far more often on digit runs. 3.8 Lite returns a whole WAV file
+# (with a C2PA provenance chunk), not bare PCM — pcm_from_payload unwraps it.
+# NOT the word bank's model (gemini_batch.BATCH_DEFAULT_MODEL), so /v1/speak
+# phrases can sound slightly different from the banked words.
+DEFAULT_MODEL = "gemini-3.8-flash-lite-tts"
+
+# TTS (speechConfig), batches and file uploads are v1beta-only. google-genai 3.x
+# defaults to v1, which rejects speechConfig with 400 INVALID_ARGUMENT, so every
+# client pins the version explicitly (via new_client) instead of trusting the SDK.
+GEMINI_API_VERSION = "v1beta"
 
 log = logging.getLogger(__name__)
 
@@ -27,6 +39,10 @@ _RETRY_BACKOFF_S = 0.5   # sleep before retry n is n * this
 
 class GeminiNoAudioError(RuntimeError):
     """Gemini answered without an audio part."""
+
+
+class GeminiAudioFormatError(ValueError):
+    """Gemini's audio isn't 16-bit mono PCM at SAMPLE_RATE (never resampled)."""
 
 # Prebuilt Gemini TTS voices: (name, style descriptor, gender). Voices are NOT
 # language-specific — the model auto-detects language from the input text, so
@@ -66,14 +82,20 @@ def canonical_voice(name: str) -> Optional[str]:
 _client = None
 
 
+def new_client():
+    """A google-genai client pinned to GEMINI_API_VERSION. Every Gemini client
+    in the project (TTS, batch, scripts) is built here."""
+    from google import genai
+    return genai.Client(http_options={"api_version": GEMINI_API_VERSION})
+
+
 def _get_client():
     """Lazily construct and cache the google-genai client (one per process,
     like GeminiBatch._get_client) — synthesize_pcm is called per voice-studio
     HTTP request, so avoid reconnecting every time."""
     global _client
     if _client is None:
-        from google import genai
-        _client = genai.Client()
+        _client = new_client()
     return _client
 
 
@@ -81,14 +103,81 @@ def _enum_name(value) -> Optional[str]:
     return getattr(value, "name", value) if value is not None else None
 
 
+def _mime_rate(mime_type: Optional[str]) -> Optional[int]:
+    """The rate= parameter of a mime type ("audio/L16;codec=pcm;rate=24000")."""
+    for param in (mime_type or "").split(";")[1:]:
+        key, _, value = param.partition("=")
+        if key.strip().lower() == "rate":
+            try:
+                return int(value.strip())
+            except ValueError:
+                raise GeminiAudioFormatError(
+                    f"unreadable rate in Gemini audio mime type {mime_type!r}") from None
+    return None
+
+
+def _wav_data_chunk(wav: bytes) -> bytes:
+    """The `data` chunk of a RIFF/WAVE payload, once its `fmt ` checks out as
+    16-bit mono PCM at SAMPLE_RATE. Chunks are walked by their own sizes — the
+    RIFF size field isn't trusted, a size running past the payload (streamed
+    WAVs write 0xFFFFFFFF) is clamped to it, unknown chunks (C2PA, LIST) are
+    skipped."""
+    if wav[8:12] != b"WAVE":
+        raise GeminiAudioFormatError(f"Gemini audio is a RIFF {wav[8:12]!r} file, not WAVE")
+    fmt = data = None
+    pos = 12
+    while pos + 8 <= len(wav):
+        cid = wav[pos:pos + 4]
+        size, = struct.unpack_from("<I", wav, pos + 4)
+        body = wav[pos + 8:pos + 8 + size]
+        if cid == b"fmt " and fmt is None:
+            fmt = body
+        elif cid == b"data" and data is None:
+            data = body
+        pos += 8 + size + (size & 1)        # odd-sized chunks carry a pad byte
+    if fmt is None or len(fmt) < 16 or data is None:
+        raise GeminiAudioFormatError(
+            f"Gemini WAV audio ({len(wav)} bytes) has no complete fmt + data chunk")
+    tag, channels, rate, _, _, bits = struct.unpack_from("<HHIIHH", fmt)
+    if (tag, channels, rate, bits) != (1, 1, SAMPLE_RATE, 16):
+        raise GeminiAudioFormatError(
+            f"Gemini WAV audio is format {tag}, {channels} ch, {rate} Hz, {bits}-bit; "
+            f"expected PCM (1), mono, {SAMPLE_RATE} Hz, 16-bit")
+    return data
+
+
+def pcm_from_payload(payload: bytes, mime_type: Optional[str] = None) -> bytes:
+    """A Gemini audio payload (inline_data.data + its mime_type) -> raw 16-bit
+    mono PCM at SAMPLE_RATE, the format every caller writes or encodes.
+
+    Models differ: gemini-3.1-flash-tts-preview sends bare PCM
+    ("audio/L16;codec=pcm;rate=24000"), passed through unchanged;
+    gemini-3.8-flash-lite-tts sends a whole RIFF/WAVE file (fmt, data, then a
+    ~7.6 KB C2PA provenance chunk). Played as PCM, its header is a click and
+    the C2PA chunk ~0.15 s of noise, so only the data chunk is kept. Any other
+    rate / width / channel count raises GeminiAudioFormatError naming what
+    arrived — it is never resampled.
+    """
+    rate = _mime_rate(mime_type)
+    if rate is not None and rate != SAMPLE_RATE:
+        raise GeminiAudioFormatError(
+            f"Gemini audio is {mime_type!r}; expected rate={SAMPLE_RATE}")
+    if payload[:4] == b"RIFF":
+        return _wav_data_chunk(payload)
+    return payload
+
+
 def _audio_or_reason(resp):
     """-> (pcm, None) when the response carries audio, else (None, why): a dict
-    of finish_reason / finish_message / block_reason, whichever are present."""
+    of finish_reason / finish_message / block_reason, whichever are present.
+    Raises GeminiAudioFormatError for audio pcm_from_payload can't convert."""
     cand = (resp.candidates or [None])[0]
     parts = (cand.content.parts or []) if cand and cand.content else []
     for part in parts:
         if part.inline_data and part.inline_data.data:
-            return part.inline_data.data, None
+            pcm = pcm_from_payload(part.inline_data.data, part.inline_data.mime_type)
+            if pcm:                         # a WAV with an empty data chunk is no audio
+                return pcm, None
     feedback = getattr(resp, "prompt_feedback", None)
     why = {
         "finish_reason": _enum_name(cand.finish_reason) if cand else None,
@@ -104,12 +193,14 @@ def _empty_retries() -> int:
 
 def synthesize_pcm(text: str, voice: str = "Kore", instruct: str = "",
                    model: str = DEFAULT_MODEL) -> bytes:
-    """Speak `text` with a Gemini prebuilt voice; return raw 24 kHz PCM bytes.
+    """Speak `text` with a Gemini prebuilt voice; return raw 24 kHz PCM bytes
+    (a WAV payload is unwrapped — see pcm_from_payload).
 
     `instruct` is style/accent direction (e.g. "British accent") — prepended,
     not spoken. A response with no audio and a transient finish_reason (OTHER,
     unset) is retried up to GEMINI_TTS_EMPTY_RETRIES times (default 2); a block
-    is not. Raises GeminiNoAudioError, naming the reason, if no audio comes back.
+    is not. Raises GeminiNoAudioError, naming the reason, if no audio comes back,
+    and GeminiAudioFormatError (not retried) for audio in another format.
     """
     from google.genai import types
 

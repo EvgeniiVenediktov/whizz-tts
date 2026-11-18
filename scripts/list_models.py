@@ -9,11 +9,11 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 
-from google import genai
+from wordbank.gemini_tts import new_client
 
 
 def main() -> None:
-    client = genai.Client()
+    client = new_client()
     models = list(client.models.list())
 
     print("=== TTS models ===")

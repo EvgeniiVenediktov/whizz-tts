@@ -12,14 +12,11 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 
-from google import genai
 from google.genai import types
 
 from wordbank.gemini_batch import VOICE_INSTRUCTION, write_wav_from_pcm_bytes
+from wordbank.gemini_tts import DEFAULT_MODEL as DEFAULT_SYNC_MODEL, new_client, pcm_from_payload
 from wordbank.paths import safe_filename
-
-# generateContent-capable TTS model (not all support batch; this one is fine for sync)
-DEFAULT_SYNC_MODEL = "gemini-2.5-flash-preview-tts"
 
 
 def main() -> None:
@@ -35,7 +32,7 @@ def main() -> None:
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
-    client = genai.Client()
+    client = new_client()
     cfg = types.GenerateContentConfig(
         response_modalities=["AUDIO"],
         speech_config=types.SpeechConfig(voice_config=types.VoiceConfig(
@@ -50,7 +47,8 @@ def main() -> None:
                 contents=f"{VOICE_INSTRUCTION} {word}",
                 config=cfg,
             )
-            data = resp.candidates[0].content.parts[0].inline_data.data
+            blob = resp.candidates[0].content.parts[0].inline_data
+            data = pcm_from_payload(blob.data, blob.mime_type)
         except Exception as e:
             print(f"  {word!r}: ERROR {type(e).__name__}: {str(e)[:160]}")
             continue

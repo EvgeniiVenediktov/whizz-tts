@@ -12,8 +12,12 @@ Requires GEMINI_API_KEY (the SAME key used to create the jobs).
   python scripts/gemini_batch_cleanup.py --delete --all  # ignore the wordbank- prefix filter
 """
 import argparse
+import pathlib
+import sys
 
-from google import genai
+sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+
+from wordbank.gemini_tts import new_client
 
 _TERMINAL = ("SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED")
 
@@ -33,7 +37,7 @@ def main() -> None:
     p.add_argument("--prefix", default="wordbank-", help="display_name prefix filter")
     args = p.parse_args()
 
-    client = genai.Client()
+    client = new_client()
     jobs = list(client.batches.list(config={"page_size": 100}))
     if not jobs:
         print("no batch jobs found")
