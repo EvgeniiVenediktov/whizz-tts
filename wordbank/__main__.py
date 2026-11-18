@@ -17,6 +17,7 @@ import sys
 from typing import List
 
 from .config import Config
+from .languages import normalize_lang
 from .manifest import Manifest
 
 
@@ -257,7 +258,7 @@ def main(argv=None) -> None:
     p = argparse.ArgumentParser(prog="wordbank")
     p.add_argument("--db", default=cfg.db)
     p.add_argument("--out", default=cfg.out_dir, dest="out_dir")
-    p.add_argument("--lang", default=cfg.lang)
+    p.add_argument("--lang", default=cfg.lang, type=normalize_lang)  # a path segment of every clip
     p.add_argument("--voices-root", default=cfg.voices_root, dest="voices_root")
     sub = p.add_subparsers(dest="cmd", required=True)
 

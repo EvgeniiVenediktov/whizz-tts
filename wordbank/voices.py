@@ -10,13 +10,33 @@ No heavy deps (no torch/genai) so the server can import this in the bank-only bu
 import os
 import pathlib
 
+from .languages import is_lang_code
 from .manifest import Manifest
 from .paths import safe_filename
 
 
 def voice_rel_path(lang: str, name: str) -> str:
-    """Path of a reference clip relative to VOICES_ROOT: ``<lang>/<safe-name>.wav``."""
+    """Path of a reference clip relative to VOICES_ROOT: ``<lang>/<safe-name>.wav``.
+
+    `name` is slugged; `lang` is a directory, so it must already be a canonical
+    code (`languages.normalize_lang`) — anything else is a ValueError, not
+    sanitized into some other directory.
+    """
+    if not is_lang_code(lang):
+        raise ValueError(f"invalid lang {lang!r}: expected a language code like 'en-us'")
     return os.path.join(lang, f"{safe_filename(name)}.wav")
+
+
+def path_under(root: str, rel: str) -> str:
+    """``root/rel``, or ValueError if that resolves outside `root` (``..``, an
+    absolute `rel`, or a symlink out). The last check before writing a path
+    built from request input; callers validate the segments first.
+    """
+    real_root = os.path.realpath(root)
+    target = os.path.realpath(os.path.join(real_root, rel))
+    if os.path.commonpath([real_root, target]) != real_root:
+        raise ValueError(f"refusing to write {rel!r}: it resolves outside {root!r}")
+    return os.path.join(root, rel)
 
 
 def resolve_voice_path(voices_root: str, ref_audio: str) -> str:
@@ -35,10 +55,12 @@ def save_voice_clip(manifest: Manifest, voices_root: str, name: str, lang: str,
                     source: str = "gemini", sample_rate: int = None) -> str:
     """Write a reference WAV under VOICES_ROOT and register it in the manifest.
 
-    Returns the path stored in the table (relative to VOICES_ROOT).
+    Returns the path stored in the table (relative to VOICES_ROOT). A bad
+    `lang`, or a path resolving outside VOICES_ROOT, is a ValueError raised
+    before anything is written or registered.
     """
     rel = voice_rel_path(lang, name)
-    path = pathlib.Path(voices_root) / rel
+    path = pathlib.Path(path_under(voices_root, rel))
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(wav_bytes)
     manifest.add_voice(name, lang, rel, ref_text=ref_text, instruct=instruct,

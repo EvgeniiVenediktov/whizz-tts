@@ -16,6 +16,7 @@ from .auth import require_auth
 from .upstream import UpstreamError, fetch_speech
 from wordbank.constants import BANK_OGG_APPLICATION, BANK_OGG_BITRATE
 from wordbank.gemini_tts import DEFAULT_MODEL as GEMINI_TTS_DEFAULT_MODEL, canonical_voice
+from wordbank.languages import normalize_lang
 from wordbank.lookup import BankLookup
 from wordbank.paths import voice_from_path
 
@@ -87,6 +88,17 @@ def _gemini_voice(voice: Optional[str]) -> Optional[str]:
     if canon is None:
         raise HTTPException(400, f"unknown Gemini voice {voice!r} (see /v1/gemini/voices)")
     return canon
+
+
+def _lang(lang: str) -> str:
+    """Canonical bank language code for a request field (trimmed, lowercased),
+    or a 400. `lang` is the first directory of every saved clip, so every route
+    taking it runs this before any lookup, synthesis, upstream fetch, or write:
+    "../x" or an absolute path never gets near the filesystem."""
+    try:
+        return normalize_lang(lang)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 def _cors_origins() -> list:
@@ -206,13 +218,13 @@ def search(prefix: str, lang: str = DEFAULT_LANG, limit: int = 10,
     """Merged prefix search over the word + phrase banks. Each result carries a
     `type` flag ('word'|'phrase') and the `voice` it was generated with.
     `kind=word|phrase` restricts to one bank."""
-    return {"results": app.state.bank.search(prefix, lang, min(limit, 50), kind)}
+    return {"results": app.state.bank.search(prefix, _lang(lang), min(limit, 50), kind)}
 
 
 @app.get("/v1/bank")
 def bank_suggest(prefix: str, lang: str = DEFAULT_LANG, limit: int = 10):
     """Prefix autocomplete over the word bank only (index-backed range scan)."""
-    return {"words": app.state.bank.suggest(prefix, lang, min(limit, 50))}
+    return {"words": app.state.bank.suggest(prefix, _lang(lang), min(limit, 50))}
 
 
 def _serve_audio(rel: str, format: str, headers: Optional[dict] = None):
@@ -232,7 +244,7 @@ def _serve_audio(rel: str, format: str, headers: Optional[dict] = None):
 @app.get("/v1/bank/{word}/info")
 def bank_info(word: str, lang: str = DEFAULT_LANG):
     """Sizes/availability of the WAV master and OGG copy — for the compare UI."""
-    row = app.state.bank.get(word, lang)
+    row = app.state.bank.get(word, _lang(lang))
     if row is None:
         raise HTTPException(404, "not in bank")
     rel = row["file_path"]
@@ -243,7 +255,7 @@ def bank_info(word: str, lang: str = DEFAULT_LANG):
 @app.get("/v1/bank/{word}")
 def bank_get(word: str, lang: str = DEFAULT_LANG, format: str = "ogg"):
     """Serve a word's audio (OGG by default, WAV master in dev)."""
-    row = app.state.bank.get(word, lang)
+    row = app.state.bank.get(word, _lang(lang))
     if row is None:
         raise HTTPException(404, "not in bank")
     return _serve_audio(row["file_path"], format)
@@ -252,7 +264,7 @@ def bank_get(word: str, lang: str = DEFAULT_LANG, format: str = "ogg"):
 @app.get("/v1/phrase/info")
 def phrase_info(text: str, lang: str = DEFAULT_LANG, voice: Optional[str] = None):
     """Sizes/availability for a phrase (optionally pin a voice)."""
-    row = app.state.bank.get_phrase(text, lang, voice)
+    row = app.state.bank.get_phrase(text, _lang(lang), voice)
     if row is None:
         raise HTTPException(404, "not in phrase bank")
     rel = row["file_path"]
@@ -266,7 +278,7 @@ def phrase_info(text: str, lang: str = DEFAULT_LANG, voice: Optional[str] = None
 def phrase_get(text: str, lang: str = DEFAULT_LANG, voice: Optional[str] = None,
                format: str = "ogg"):
     """Serve a phrase's audio (OGG by default, WAV master in dev)."""
-    row = app.state.bank.get_phrase(text, lang, voice)
+    row = app.state.bank.get_phrase(text, _lang(lang), voice)
     if row is None:
         raise HTTPException(404, "not in phrase bank")
     return _serve_audio(row["file_path"], format)
@@ -374,6 +386,9 @@ async def _upstream_clip(url: str, text: str, lang: str, voice: Optional[str],
     label = speech.voice
     if label and canonical_voice(label):
         label = f"gemini-{canonical_voice(label)}"
+    if label and (label in (".", "..") or any(c in label for c in "/\\\0")):
+        # the label becomes a directory of the saved clip: one plain segment only
+        raise HTTPException(502, f"upstream reported an unusable voice label {label!r}")
     return speech.ogg, label or fallback_voice
 
 
@@ -385,13 +400,22 @@ def _save_phrase(text: str, lang: str, bank_voice: str, ogg: bytes,
     collide with a word clip of the same id, voice, and slug."""
     from wordbank.manifest import DONE, Manifest
     from wordbank.paths import safe_filename
+    from wordbank.voices import path_under
+    clip_dir = os.path.join(lang, bank_voice, "phrases")
+    try:
+        # lang and the voice label are checked on the way in; this is the last
+        # line of defence, run before the row exists so a refusal leaves nothing.
+        for root in (app.state.ogg_root, app.state.wav_root):
+            path_under(root, clip_dir)
+    except ValueError as exc:
+        raise HTTPException(500, str(exc)) from exc
     db = os.getenv("BANK_DB", "wordbank.db")
     os.makedirs(os.path.dirname(db) or ".", exist_ok=True)   # bank-less deploy: first write creates it
     m = Manifest(db, table="phrases", text_col="text")
     try:
         m.add_words([text], lang, voice=bank_voice)
         row = m.get_entry(text, lang, bank_voice)
-        rel = os.path.join(lang, bank_voice, "phrases", str(row["id"] // 1000),
+        rel = os.path.join(clip_dir, str(row["id"] // 1000),
                            f"{row['id']}_{safe_filename(text)}.wav")
         ogg_path = _ogg_abs(rel)
         os.makedirs(os.path.dirname(ogg_path), exist_ok=True)
@@ -439,6 +463,9 @@ async def speak(
     `instruct` (style direction) makes the request a one-off: the bank has no
     key for style, so it is neither looked up nor saved.
 
+    `lang` is a language code like `en-us` (case-insensitive, filed lowercase);
+    anything else is a 400 before the bank, Gemini, or upstream is touched.
+
     Response headers: `X-Source: bank|gemini|upstream`, `X-Voice: <voice label>`.
     """
     text = text.strip()
@@ -446,6 +473,7 @@ async def speak(
         raise HTTPException(400, "text must not be empty")
     if len(text) > MAX_TEXT_LEN:
         raise HTTPException(400, f"text exceeds {MAX_TEXT_LEN} characters")
+    lang = _lang(lang)
     voice = _gemini_voice(voice)
     instruct = (instruct or "").strip()
     eff_voice = voice or canonical_voice(GEMINI_TTS_VOICE) or GEMINI_TTS_VOICE
@@ -508,6 +536,7 @@ async def tts(
         instruct = None
     if len(text) > MAX_TEXT_LEN:
         raise HTTPException(400, f"text exceeds {MAX_TEXT_LEN} characters")
+    lang = _lang(lang)
 
     ref_path: Optional[str] = None
     cleanup_ref = False
@@ -591,13 +620,13 @@ def gemini_voices():
 @app.get("/v1/voices")
 def list_voices(lang: Optional[str] = None):
     """Saved clone references (optionally one language) — for the picker UI."""
-    return {"voices": app.state.bank.voices(lang)}
+    return {"voices": app.state.bank.voices(None if lang is None else _lang(lang))}
 
 
 @app.get("/v1/voices/{lang}/{name}/audio")
 def voice_audio(lang: str, name: str):
     """Serve a saved reference clip so the UI can replay it."""
-    row = app.state.bank.get_voice(name, lang)
+    row = app.state.bank.get_voice(name, _lang(lang))
     if row is None:
         raise HTTPException(404, "no such voice")
     from wordbank.voices import resolve_voice_path
@@ -618,6 +647,7 @@ async def save_voice(
 ):
     """Save an audio clip as a reusable OmniVoice clone reference (writes the WAV
     under VOICES_ROOT and registers it in the manifest's `voices` table)."""
+    lang = _lang(lang)
     raw = await audio.read(MAX_REF_BYTES + 1)
     if len(raw) > MAX_REF_BYTES:
         raise HTTPException(413, "audio exceeds size limit")
@@ -630,6 +660,8 @@ async def save_voice(
     try:
         rel = save_voice_clip(m, app.state.voices_root, name, lang, raw,
                               ref_text, instruct=(instruct or None), source=source)
+    except ValueError as exc:   # path outside VOICES_ROOT (lang is checked above)
+        raise HTTPException(500, str(exc)) from exc
     finally:
         m.close()
     app.state.bank.close()   # drop the memoized read conn so the new row is visible

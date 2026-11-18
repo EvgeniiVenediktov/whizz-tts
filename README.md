@@ -84,6 +84,13 @@ Read-only endpoints are public. The `POST` routes marked **JWT** require
 `Authorization: Bearer <token>` when `JWT_SECRET` is set (see [Auth](#auth));
 with it unset the whole API is open (dev mode).
 
+`lang` (every endpoint that takes it) is a language code, default `en-us`,
+case-insensitive and stored lowercase (`EN-US` = `en-us`). Anything else
+(`../x`, an absolute path, `en_us`, non-ASCII, an empty query value) is a
+**400** `invalid lang '…'`; on `POST` routes an empty form field means the
+default. In edge mode, `/v1/speak` answers **502** if the upstream's `X-Voice`
+isn't a single path segment.
+
 #### Read-only (bank + status)
 
 **`GET /health`** — no params. `{status, healthy, model, model_enabled, bank,
