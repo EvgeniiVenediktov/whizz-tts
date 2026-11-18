@@ -23,13 +23,15 @@ from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
 
 from .constants import SAMPLE_RATE  # Gemini TTS emits 24 kHz / 16-bit mono PCM
-# Chosen for cost. A 3.x model because the 2.5 TTS models answer imperative
-# text ("Read this one slowly please.") with 400 "Model tried to generate text"
-# and drop audio far more often on digit runs. 3.8 Lite returns a whole WAV file
-# (with a C2PA provenance chunk), not bare PCM — pcm_from_payload unwraps it.
-# NOT the word bank's model (gemini_batch.BATCH_DEFAULT_MODEL), so /v1/speak
-# phrases can sound slightly different from the banked words.
-DEFAULT_MODEL = "gemini-3.8-flash-lite-tts"
+# 3.8 Flash: with a speech_metadata style it said the words 3.8 Lite acted out
+# ("laughing", "haha", "russian"), at 1.5x Lite's price. A 3.x model because the
+# 2.5 TTS models answer imperative text ("Read this one slowly please.") with
+# 400 "Model tried to generate text" and drop audio far more often on digit
+# runs. The 3.8 models return a whole WAV file (with a C2PA provenance chunk),
+# not bare PCM — pcm_from_payload unwraps it. NOT the word bank's model
+# (gemini_batch.BATCH_DEFAULT_MODEL), so /v1/speak phrases can sound slightly
+# different from the banked words.
+DEFAULT_MODEL = "gemini-3.8-flash-tts"
 
 # TTS (speechConfig), batches and file uploads are v1beta-only. google-genai 3.x
 # defaults to v1, which rejects speechConfig with 400 INVALID_ARGUMENT, so every

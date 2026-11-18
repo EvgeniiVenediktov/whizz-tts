@@ -270,7 +270,7 @@ SERVE_FRONTEND=1 .venv/bin/uvicorn src.server:app --port 8000
 | `JWT_AUDIENCE` / `JWT_ISSUER` | unset | optional — if set, tokens must carry a matching `aud`/`iss` claim |
 | `SYNC_BUCKET` / `SYNC_PREFIX` | — | pull the bank from S3 at container start (structured + quoted; preferred over `BANK_SYNC_CMD`) |
 | `BANK_SYNC_CMD` | — | escape hatch: arbitrary shell command run at container start to pull the bank into the volume. Runs via `sh -c` — **set it only from trusted configuration** |
-| `GEMINI_TTS_MODEL` | `gemini-3.8-flash-lite-tts` | Gemini TTS model for `/v1/speak` misses and the studio default |
+| `GEMINI_TTS_MODEL` | `gemini-3.8-flash-tts` | Gemini TTS model for `/v1/speak` misses and the studio default |
 | `GEMINI_TTS_VOICE` | `Kore` | default voice for `/v1/speak` and the studio |
 | `GEMINI_TTS_STYLE` | unset | deployment-wide delivery direction for every `/v1/speak` miss (not `instruct` one-offs, not the studio), sent as the speech-metadata style with the text verbatim, and saved as the clip's `style`. Needs a style-capable `GEMINI_TTS_MODEL` (`gemini-3.8-flash-tts`, `gemini-3.8-flash-lite-tts`): with another model the server warns at startup and misses answer `500`. Ignored in edge mode. Changing it doesn't touch banked clips |
 | `GEMINI_TTS_EMPTY_RETRIES` | `2` | extra attempts when Gemini TTS returns no audio with a transient `finish_reason` (`OTHER`/unset); blocks (`SAFETY`, `PROHIBITED_CONTENT`, a prompt `block_reason`, ...) are never retried. A final empty response is a `502` naming the reason |
