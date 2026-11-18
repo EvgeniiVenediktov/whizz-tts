@@ -47,6 +47,7 @@ Both share the same columns:
 | `status` | `pending → submitted → done` (or `verified` / `failed` / `quarantined`) |
 | `file_path` | **relative to the bank root**, e.g. `en/gemini-Kore/1/1914_hello.wav` |
 | `seed`, `ref_audio`, `ref_text` | provenance of phrases made by the removed local OmniVoice pipeline; null for Gemini clips |
+| `model`, `style` | **provenance for Gemini clips** — the model and the delivery direction used (`style`: the speech-metadata style on 3.8 models, the inline prefix such as `VOICE_INSTRUCTION` on 3.1/2.5; NULL = none). NULL on rows generated before these columns existed. Shown by `wordbank export` |
 | `attempts`, `batch_id`, `transcript`, `billed_chars`, `error`, `created_at`, `updated_at` | bookkeeping + metadata |
 
 Banks created before the local pipeline was removed may also hold an unused
@@ -73,7 +74,7 @@ the `UNIQUE` index; prefix autocomplete uses an index range scan.
 | `GET /v1/bank?prefix=he` | word-only autocomplete (index range scan) |
 | `GET /v1/bank/{word}` · `/info` | serve a word (OGG default; `wav` dev-only) · sizes+type+voice |
 | `GET /v1/phrase?text=…` · `/info` | serve a phrase (by text, optional `voice`) · sizes+type+voice+provenance |
-| `POST /v1/speak` | get-or-generate — `text` (required), `lang` (default `en-us`), `voice` (optional Gemini prebuilt, case-insensitive; unknown → `400`), `instruct` (optional). Bank hit in that voice → stored OGG, `X-Source: bank`. Miss → Gemini synth in that voice, saved into the phrase bank (`voice=gemini-<Voice>`), served with `X-Source: gemini`; `X-Voice` names the voice served. Needs `GEMINI_API_KEY` only on a miss |
+| `POST /v1/speak` | get-or-generate — `text` (required), `lang` (default `en-us`), `voice` (optional Gemini prebuilt, case-insensitive; unknown → `400`), `instruct` (optional, one-off: not looked up or saved). Bank hit in that voice → stored OGG, `X-Source: bank`. Miss → Gemini synth in that voice, saved into the phrase bank (`voice=gemini-<Voice>`), served with `X-Source: gemini`; `X-Voice` names the voice served. Needs `GEMINI_API_KEY` only on a miss |
 | voice studio | `GET /v1/gemini/voices` (the voices `/v1/speak` accepts), `POST /v1/gemini/tts` (preview a voice, nothing saved) |
 
 ### Endpoint reference
@@ -126,18 +127,28 @@ Gemini auto-detects language from the text.
 
 **`POST /v1/speak`** — get-or-generate. `text` (required, ≤ `MAX_TEXT_LEN`) ·
 `lang` (default `en-us`) · `voice` (Gemini prebuilt, default `GEMINI_TTS_VOICE`
-= Kore; also pins the bank lookup to `gemini-<voice>`) · `instruct` (style hint,
-used only when generating). Bank hit (words table for single tokens, phrases
-otherwise) → stored OGG with `X-Source: bank`; miss → Gemini synth, persisted
-into the phrase bank, returned with `X-Source: gemini`. `instruct` is not part
-of the bank key — a banked phrase wins over a new instruct variant. Errors:
-`400` empty/oversize text, `502` Gemini failure (detail names the `finish_reason` when it
-returned no audio), `503` encoding stack absent.
+= Kore; also pins the bank lookup to `gemini-<voice>`) · `instruct` (delivery
+direction). Bank hit (words table for single tokens, phrases otherwise) → stored
+OGG with `X-Source: bank`; miss → Gemini synth, persisted into the phrase bank,
+returned with `X-Source: gemini`. A request with `instruct` is a **one-off**:
+never looked up or saved (the bank has no key for it). How `instruct` reaches
+Gemini depends on `GEMINI_TTS_MODEL`: the 3.8 models get it as the
+speech-metadata **style**, with `text` sent verbatim (they read an inline prefix
+aloud); 3.1/2.5 get it as an inline prefix (`"<instruct>: <text>"`). Misses
+without `instruct` are generated with `GEMINI_TTS_STYLE` when set and saved with
+it (`model`/`style` columns); the one-off's `instruct` replaces it rather than
+adding to it. Errors: `400` empty/oversize text, `500` `GEMINI_TTS_STYLE` set with
+a model that takes no style (misses only; hits and `instruct` one-offs still
+work), `502` Gemini failure (detail names the `finish_reason`, or the
+Interactions `status`, when it returned no audio), `503` encoding stack absent.
 
 **`POST /v1/gemini/tts`** — studio preview. `text` (required, ≤ `MAX_TEXT_LEN`)
-· `voice` (default `GEMINI_TTS_VOICE`) · `instruct` (style) · `model` (default
+· `voice` (default `GEMINI_TTS_VOICE`) · `instruct` (direction, routed per model
+as in `/v1/speak`) · `style` (speech-metadata style; 3.8 models only, else `400`;
+with `instruct` too, the style comes first) · `model` (default
 `GEMINI_TTS_MODEL`). Synthesizes one phrase with Gemini and returns **WAV**
-(never banked). Needs `GEMINI_API_KEY`; `502` on upstream failure.
+(never banked). `GEMINI_TTS_STYLE` does not apply. Needs `GEMINI_API_KEY`;
+`502` on upstream failure.
 
 ## Run
 
@@ -259,6 +270,9 @@ SERVE_FRONTEND=1 .venv/bin/uvicorn src.server:app --port 8000
 | `JWT_AUDIENCE` / `JWT_ISSUER` | unset | optional — if set, tokens must carry a matching `aud`/`iss` claim |
 | `SYNC_BUCKET` / `SYNC_PREFIX` | — | pull the bank from S3 at container start (structured + quoted; preferred over `BANK_SYNC_CMD`) |
 | `BANK_SYNC_CMD` | — | escape hatch: arbitrary shell command run at container start to pull the bank into the volume. Runs via `sh -c` — **set it only from trusted configuration** |
+| `GEMINI_TTS_MODEL` | `gemini-3.8-flash-lite-tts` | Gemini TTS model for `/v1/speak` misses and the studio default |
+| `GEMINI_TTS_VOICE` | `Kore` | default voice for `/v1/speak` and the studio |
+| `GEMINI_TTS_STYLE` | unset | deployment-wide delivery direction for every `/v1/speak` miss (not `instruct` one-offs, not the studio), sent as the speech-metadata style with the text verbatim, and saved as the clip's `style`. Needs a style-capable `GEMINI_TTS_MODEL` (`gemini-3.8-flash-tts`, `gemini-3.8-flash-lite-tts`): with another model the server warns at startup and misses answer `500`. Ignored in edge mode. Changing it doesn't touch banked clips |
 | `GEMINI_TTS_EMPTY_RETRIES` | `2` | extra attempts when Gemini TTS returns no audio with a transient `finish_reason` (`OTHER`/unset); blocks (`SAFETY`, `PROHIBITED_CONTENT`, a prompt `block_reason`, ...) are never retried. A final empty response is a `502` naming the reason |
 | `SPEAK_UPSTREAM_URL` | unset | **edge mode**: `/v1/speak` misses are fetched from this whizz-tts server instead of Gemini (see [Edge cache](#edge-cache)) |
 | `SPEAK_STORE` | `1` | `0` = `/v1/speak` never writes the bank (stateless upstream for edges); misses are generated and returned only. `/health` reports it as `store` |
@@ -297,7 +311,8 @@ generate. `voice` pins the recording: `voice=Puck` only ever serves or generates
 Puck (a banked Kore word is not a hit). Without `voice`, any banked recording
 serves (the default `GEMINI_TTS_VOICE` first) and a miss uses the default.
 `instruct` (style direction) is a one-off render — never looked up or saved,
-since the bank has no key for style.
+since the bank has no key for style; on the 3.8 models it is sent as the
+speech-metadata style, so it is never spoken.
 
 ```bash
 curl -H "Authorization: Bearer $TOKEN" -F text="good morning" -F voice=Puck http://localhost:8000/v1/speak -o out.ogg
@@ -319,8 +334,33 @@ python scripts/fetch_wordlist.py --lang en --n 50000          # credible word li
 GEMINI_API_KEY=… python -m wordbank batch-run --words data/words_en.txt --voice Kore
 python scripts/encode_wavs.py output/words output/words_ogg   # OGG copies
 python -m wordbank status                                     # progress (words + phrases)
+
+# Word bank with a delivery style (3.8 models only; keeps them from acting out
+# "haha", "laughing", "russian"). Batch carries it as speechMetadata (documented,
+# smoke-test first: scripts/gemini_batch_smoke.py --model … --style "…"):
+GEMINI_API_KEY=… python -m wordbank --lang en-gb batch-run --words words.txt \
+    --model gemini-3.8-flash-lite-tts --voice en-gb-tutor-11 --style "plain and neutral"
+# …or synchronously (Interactions API, verified), rate-limited, resumable:
+GEMINI_API_KEY=… python -m wordbank --lang en-gb gemini-run --words words.txt \
+    --model gemini-3.8-flash-lite-tts --voice en-gb-tutor-11 --style "plain and neutral" --rpm 10
+
+# Redo some words: move their current take to <db dir>/takes/<UTC>/{wav,ogg}/
+# (+ words.json), reset them to pending, generate again, re-encode:
+python -m wordbank --lang en-gb regenerate --words-file redo.txt --ogg-root output/words_ogg
+GEMINI_API_KEY=… python -m wordbank --lang en-gb gemini-run --model gemini-3.8-flash-tts \
+    --voice Kore --style "plain and neutral"
+python scripts/encode_wavs.py output/words output/words_ogg
 ```
 The phrase bank fills itself: every `/v1/speak` miss is generated and saved.
+
+Directions per model (`gemini_tts.TTS_MODELS`): the 3.8 models take a `--style`
+and read any inline instruction aloud, so `batch*`/`gemini-run` never send them
+one — an explicit `--instruction` becomes the style, and with neither flag they
+refuse rather than default to `VOICE_INSTRUCTION` (`--instruction=` = the bare
+word). 3.1/2.5 keep the inline `--instruction` (default `VOICE_INSTRUCTION`) and
+reject `--style`. `gemini-run` takes `--rpm` (default 10, Tier 1),
+`--max-attempts` (3) and `--limit`; it retries 429/5xx with backoff and stops if
+they persist, or after 5 rows in a row fail otherwise.
 
 ## Tests
 

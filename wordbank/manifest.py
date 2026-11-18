@@ -24,6 +24,12 @@ VERIFIED = "verified"    # audio written AND confirmed by STT (sync path)
 FAILED = "failed"
 QUARANTINED = "quarantined"
 
+# SET clause for the generation provenance (params: model, model, style): with a
+# model, both columns take the given values (style None = "no direction");
+# without one, both are kept. See Manifest.set_status.
+_PROVENANCE_SQL = ("model = COALESCE(?, model), "
+                   "style = CASE WHEN ? IS NULL THEN style ELSE ? END")
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS words (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -38,6 +44,8 @@ CREATE TABLE IF NOT EXISTS words (
     seed         INTEGER,
     ref_audio    TEXT,
     ref_text     TEXT,
+    model        TEXT,
+    style        TEXT,
     error        TEXT,
     batch_id     TEXT,
     created_at   REAL,
@@ -63,6 +71,8 @@ CREATE TABLE IF NOT EXISTS phrases (
     seed         INTEGER,
     ref_audio    TEXT,
     ref_text     TEXT,
+    model        TEXT,
+    style        TEXT,
     error        TEXT,
     batch_id     TEXT,
     created_at   REAL,
@@ -87,7 +97,8 @@ class Manifest:
         for tbl in ("words", "phrases"):
             for col, decl in (("batch_id", "TEXT"), ("voice", "TEXT"),
                               ("seed", "INTEGER"), ("ref_audio", "TEXT"),
-                              ("ref_text", "TEXT")):
+                              ("ref_text", "TEXT"), ("model", "TEXT"),
+                              ("style", "TEXT")):
                 try:
                     self._conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {decl}")
                 except sqlite3.OperationalError:
@@ -148,12 +159,16 @@ class Manifest:
             after = cur.execute(f"SELECT COUNT(*) FROM {self.table}").fetchone()[0]
         return after - before
 
-    def pending(self, limit: Optional[int] = None, max_attempts: int = 3):
-        sql = (
-            f"SELECT * FROM {self.table} WHERE status IN (?, ?) AND attempts < ? "
-            "ORDER BY id"
-        )
+    def pending(self, limit: Optional[int] = None, max_attempts: int = 3,
+                lang: Optional[str] = None):
+        """Rows still to generate (pending, or failed under max_attempts), in id
+        order; `lang` restricts them to one language."""
+        sql = f"SELECT * FROM {self.table} WHERE status IN (?, ?) AND attempts < ? "
         params = [PENDING, FAILED, max_attempts]
+        if lang is not None:
+            sql += "AND lang = ? "
+            params.append(lang)
+        sql += "ORDER BY id"
         if limit is not None:
             sql += " LIMIT ?"
             params.append(limit)
@@ -177,28 +192,51 @@ class Manifest:
                    file_path: Optional[str] = None, transcript: Optional[str] = None,
                    billed_chars: Optional[int] = None, voice: Optional[str] = None,
                    seed: Optional[int] = None, ref_audio: Optional[str] = None,
-                   ref_text: Optional[str] = None) -> None:
+                   ref_text: Optional[str] = None, model: Optional[str] = None,
+                   style: Optional[str] = None) -> None:
         # voice/seed/ref_* use COALESCE so a later status-only update (e.g. a
-        # retry marking FAILED) never clobbers recorded provenance.
+        # retry marking FAILED) never clobbers recorded provenance. model/style
+        # are one record: passing `model` (a generation result) writes both,
+        # style exactly as given — None means "no direction", so a re-take
+        # without one doesn't inherit the old take's style; without `model`
+        # both are kept.
         with self._lock:
             self._conn.execute(
                 f"UPDATE {self.table} SET status = ?, error = ?, file_path = ?, "
                 "transcript = ?, billed_chars = ?, voice = COALESCE(?, voice), "
                 "seed = COALESCE(?, seed), ref_audio = COALESCE(?, ref_audio), "
-                "ref_text = COALESCE(?, ref_text), updated_at = ? WHERE id = ?",
+                "ref_text = COALESCE(?, ref_text), "
+                f"{_PROVENANCE_SQL}, updated_at = ? WHERE id = ?",
                 (status, error, file_path, transcript, billed_chars, voice,
-                 seed, ref_audio, ref_text, time.time(), row_id),
+                 seed, ref_audio, ref_text, model, model, style,
+                 time.time(), row_id),
             )
             self._conn.commit()
 
-    def mark_submitted(self, row_ids, batch_id: str) -> None:
-        """Mark entries as enqueued in an async batch job (counts as one attempt)."""
+    def mark_submitted(self, row_ids, batch_id: str, *, model: Optional[str] = None,
+                       style: Optional[str] = None) -> None:
+        """Mark entries as enqueued in an async batch job (counts as one attempt).
+        `model`/`style` record the request's provenance now, since a later
+        collect (possibly another process) doesn't know them."""
         now = time.time()
         with self._lock:
             self._conn.executemany(
                 f"UPDATE {self.table} SET status = ?, batch_id = ?, "
-                "attempts = attempts + 1, updated_at = ? WHERE id = ?",
-                [(SUBMITTED, batch_id, now, wid) for wid in row_ids],
+                f"attempts = attempts + 1, {_PROVENANCE_SQL}, "
+                "updated_at = ? WHERE id = ?",
+                [(SUBMITTED, batch_id, model, model, style, now, wid) for wid in row_ids],
+            )
+            self._conn.commit()
+
+    def reset(self, row_ids) -> None:
+        """Back to a fresh pending row (attempts 0, no error, no batch job), for
+        a regenerate. file_path and provenance stay until the next take."""
+        now = time.time()
+        with self._lock:
+            self._conn.executemany(
+                f"UPDATE {self.table} SET status = ?, attempts = 0, error = NULL, "
+                "batch_id = NULL, updated_at = ? WHERE id = ?",
+                [(PENDING, now, rid) for rid in row_ids],
             )
             self._conn.commit()
 

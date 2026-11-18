@@ -325,3 +325,87 @@ def test_no_results_reason(state, dest, reason):
     batch = GeminiBatch(client=object())
     assert batch.is_done(job)
     assert batch.no_results_reason(job) == reason
+
+
+# --- style directions (3.8 models): speechMetadata, never an inline prefix ----
+
+STYLE = "read the word exactly as written, plain and neutral"
+
+
+def test_build_request_body_with_style_keeps_the_word_verbatim():
+    r = build_request_body("laughing", "Kore", instruction="", style=STYLE)
+    assert r["contents"][0]["parts"] == [{"text": "laughing", "speechMetadata": {"style": STYLE}}]
+    assert r["generationConfig"]["speechConfig"]["voiceConfig"]["prebuiltVoiceConfig"] == \
+        {"voiceName": "Kore"}
+
+
+def test_gemini_batch_never_sends_an_inline_instruction_to_a_38_model():
+    """Even the library default VOICE_INSTRUCTION moves into the style there;
+    3.1 keeps it inline, as before."""
+    batch = GeminiBatch(model="gemini-3.8-flash-tts")
+    assert (batch.style, batch.instruction) == (VOICE_INSTRUCTION, "")
+    batch = GeminiBatch(model="gemini-3.1-flash-tts-preview")
+    assert (batch.style, batch.instruction) == (None, VOICE_INSTRUCTION)
+
+
+class RecordingBatch(FakeBatch):
+    """FakeBatch that keeps every submitted JSONL line."""
+    def __init__(self, **kw):
+        GeminiBatch.__init__(self, **kw)
+        self._jobs, self._n, self.deleted, self.lines = {}, 0, [], []
+
+    def submit_file(self, jsonl, display_name):
+        self.lines += [json.loads(l) for l in jsonl.decode().splitlines() if l.strip()]
+        return super().submit_file(jsonl, display_name)
+
+
+def test_style_batch_sends_speech_metadata_and_records_provenance(tmp_path):
+    m = Manifest(str(tmp_path / "wb.db"))
+    m.add_words(["laughing", "haha"], "en-gb")
+    batch = RecordingBatch(model="gemini-3.8-flash-lite-tts", voice="en-gb-tutor-11",
+                           instruction="", style=STYLE)
+    submit_pending(m, batch, lang="en-gb", chunk=10, log=quiet)
+    assert [l["request"]["contents"][0]["parts"] for l in batch.lines] == [
+        [{"text": w, "speechMetadata": {"style": STYLE}}] for w in ("laughing", "haha")]
+
+    for r in m.iter_rows():                 # recorded at submit time...
+        assert (r["status"], r["model"], r["style"]) == (SUBMITTED, "gemini-3.8-flash-lite-tts", STYLE)
+
+    # ...so a collect in a later process, by a batch that knows nothing of the
+    # style (batch-collect takes no --style), keeps it
+    collector = RecordingBatch(model="gemini-3.8-flash-lite-tts", instruction="")
+    collector._jobs = batch._jobs
+    collect_active(m, collector, str(tmp_path / "out"), lang="en-gb",
+                   voice="en-gb-tutor-11", sleep=lambda *_: None, log=quiet)
+    for r in m.iter_rows():
+        assert (r["status"], r["model"], r["style"]) == (DONE, "gemini-3.8-flash-lite-tts", STYLE)
+        assert r["file_path"].startswith("en-gb/gemini-en-gb-tutor-11/0/")
+    m.close()
+
+
+def test_cli_direction_args():
+    """(instruction, style) from --instruction/--style; an unset --instruction
+    defaults to VOICE_INSTRUCTION only where it stays unspoken."""
+    from wordbank.__main__ import _direction_args
+
+    def direction(model, instruction=None, style=None):
+        return _direction_args(SimpleNamespace(model=model, instruction=instruction, style=style))
+
+    assert direction("gemini-3.8-flash-tts", style=STYLE) == ("", STYLE)
+    assert direction("gemini-3.8-flash-tts", instruction="") == ("", None)
+    assert direction("gemini-3.1-flash-tts-preview") == (VOICE_INSTRUCTION, None)
+    with pytest.raises(SystemExit, match="--style needs a style-capable"):
+        direction("gemini-3.1-flash-tts-preview", style=STYLE)
+
+
+def test_batch_run_on_a_38_model_needs_an_explicit_direction(tmp_path):
+    """batch-run used to send VOICE_INSTRUCTION inline to whatever model it was
+    given; on 3.8 that instruction was read out in every clip."""
+    from wordbank.__main__ import main
+    words = tmp_path / "w.txt"
+    words.write_text("laughing\n")
+    db = tmp_path / "wb.db"
+    with pytest.raises(SystemExit, match="reads inline instructions aloud"):
+        main(["--db", str(db), "--out", str(tmp_path / "out"), "batch-run",
+              "--words", str(words), "--model", "gemini-3.8-flash-tts"])
+    assert not db.exists()                                  # refused before ingesting

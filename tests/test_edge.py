@@ -220,7 +220,7 @@ def test_startup_warns_about_a_missing_or_expiring_upstream_token(bank_env, monk
 _UPSTREAM_SERVER = """
 import sys
 import wordbank.gemini_tts as g
-g.synthesize_pcm = lambda text, voice="Kore", instruct="", model=None: bytes(range(256)) * 200
+g.synthesize_pcm = lambda text, voice="Kore", instruct="", model=None, **kw: bytes(range(256)) * 200
 import uvicorn
 uvicorn.run("src.server:app", host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
 """

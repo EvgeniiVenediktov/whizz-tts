@@ -45,7 +45,7 @@ for mod in ("numpy", "soundfile"):
 d = tempfile.mkdtemp()
 os.environ.update(BANK_DB=d + "/wb.db", OGG_ROOT=d + "/ogg", WAV_ROOT=d + "/wav")
 import wordbank.gemini_tts as g
-g.synthesize_pcm = lambda text, voice="Kore", instruct="", model=None: b"\\x00\\x10" * 12000
+g.synthesize_pcm = lambda text, voice="Kore", instruct="", model=None, **kw: b"\\x00\\x10" * 12000
 from fastapi.testclient import TestClient
 from src.server import app
 with TestClient(app) as c:

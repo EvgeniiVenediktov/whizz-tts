@@ -107,3 +107,31 @@ def test_speak_into_old_schema_bank(tmp_path, bank_env, fake_gemini):
         assert miss.status_code == 200, miss.text
         hit = c.post("/v1/speak", data={"text": "good morning", "voice": "Puck"})
         assert hit.headers["x-source"] == "bank" and hit.content == miss.content
+
+
+def test_manifest_adds_provenance_columns_to_an_old_bank(tmp_path):
+    """model/style are ALTER-added to both tables; existing rows stay NULL.
+    A generation result (model given) records both, style exactly as given;
+    a status-only update keeps them."""
+    db = str(tmp_path / "old.db")
+    _make_old_bank(db)
+    for table, col in (("words", "word"), ("phrases", "text")):
+        m = Manifest(db, table=table, text_col=col)
+        [old] = m.iter_rows()
+        assert (old["model"], old["style"], old["status"]) == (None, None, "done")
+
+        m.set_status(old["id"], "done", file_path=old["file_path"],
+                     model="gemini-3.8-flash-tts", style="plain")
+        m.set_status(old["id"], "failed", error="later retry")          # status only
+        [row] = m.iter_rows()
+        assert (row["model"], row["style"]) == ("gemini-3.8-flash-tts", "plain")
+
+        m.set_status(old["id"], "done", file_path=old["file_path"],
+                     model="gemini-3.8-flash-lite-tts")                   # re-take, no style
+        [row] = m.iter_rows()
+        assert (row["model"], row["style"]) == ("gemini-3.8-flash-lite-tts", None)
+        m.close()
+
+    bank = BankLookup(db)                       # the reader still serves it
+    assert bank.get_phrase("good morning", "en-us") is not None
+    bank.close()

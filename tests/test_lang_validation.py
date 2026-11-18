@@ -25,6 +25,10 @@ BAD_LANGS = [
     "ру-ру",            # non-ASCII
     "KK",     # Kelvin signs: lowercase to ASCII "kk", refused before folding
 ]
+# Every shape above is checked once against the validator itself; each route is
+# then checked with the two that would escape the bank (a relative traversal and
+# an absolute path), which proves the route runs the validator.
+ESCAPES = ["../../escaped", "{out}/abs-escape"]
 VALID_LANGS = ["en-us", "en-gb", "ru-ru"]
 
 
@@ -79,49 +83,55 @@ def edge(bank_env, fake_gemini, _upstream, monkeypatch):
 
 # ---- bad lang: 400, before anything is looked up, generated, or written ----
 
-@pytest.mark.parametrize("lang", BAD_LANGS)
-def test_speak_rejects_bad_lang_before_generating(client, tmp_path, lang):
-    with _nothing_written(tmp_path, client.paths.db):
-        r = client.post("/v1/speak", data={"text": "hello there", "lang": _bad(lang, tmp_path)})
-    assert r.status_code == 400 and "invalid lang" in r.json()["detail"]
+def test_speak_rejects_bad_lang_before_generating(client, tmp_path):
+    for lang in ESCAPES:
+        with _nothing_written(tmp_path, client.paths.db):
+            r = client.post("/v1/speak", data={"text": "hello there", "lang": _bad(lang, tmp_path)})
+        assert r.status_code == 400 and "invalid lang" in r.json()["detail"], lang
     assert client.gemini.calls == []
 
 
-@pytest.mark.parametrize("lang", ["../../escaped", "{out}/abs-escape", "ру-ру"])
-@pytest.mark.parametrize("mode", ["instruct", "stateless"])
-def test_speak_one_off_paths_reject_bad_lang_too(client, tmp_path, monkeypatch, lang, mode):
+def test_speak_one_off_paths_reject_bad_lang_too(client, tmp_path, monkeypatch):
     """instruct and SPEAK_STORE=0 skip the bank but still call Gemini."""
-    data = {"text": "hello there", "lang": _bad(lang, tmp_path)}
-    if mode == "instruct":
-        data["instruct"] = "whisper"
-    else:
-        monkeypatch.setenv("SPEAK_STORE", "0")
+    bad = {"text": "hello there", "lang": _bad(ESCAPES[0], tmp_path)}
     with _nothing_written(tmp_path, client.paths.db):
-        r = client.post("/v1/speak", data=data)
-    assert r.status_code == 400 and client.gemini.calls == []
+        assert client.post("/v1/speak", data={**bad, "instruct": "whisper"}).status_code == 400
+        monkeypatch.setenv("SPEAK_STORE", "0")
+        assert client.post("/v1/speak", data=bad).status_code == 400
+    assert client.gemini.calls == []
 
 
-@pytest.mark.parametrize("lang", BAD_LANGS)
-def test_edge_speak_rejects_bad_lang_before_fetching_upstream(edge, tmp_path, lang):
-    with _nothing_written(tmp_path, edge.paths.db):
-        r = edge.post("/v1/speak", data={"text": "hello there", "lang": _bad(lang, tmp_path)})
-    assert r.status_code == 400 and "invalid lang" in r.json()["detail"]
+def test_edge_speak_rejects_bad_lang_before_fetching_upstream(edge, tmp_path):
+    for lang in ESCAPES:
+        with _nothing_written(tmp_path, edge.paths.db):
+            r = edge.post("/v1/speak", data={"text": "hello there", "lang": _bad(lang, tmp_path)})
+        assert r.status_code == 400 and "invalid lang" in r.json()["detail"], lang
     assert edge.upstream.requests == [] and edge.gemini.calls == []
 
 
-@pytest.mark.parametrize("label", ["../../escaped", "a/b", "..", "x\\y"])
-def test_edge_refuses_an_upstream_voice_label_that_is_not_one_segment(edge, tmp_path, label):
+def test_edge_refuses_an_upstream_voice_label_that_is_not_one_segment(edge, tmp_path):
     """The upstream's X-Voice becomes a directory of the saved clip."""
-    edge.upstream.respond = lambda f: (200, {"X-Source": "gemini", "X-Voice": label}, b"OggS-x")
-    with _nothing_written(tmp_path, edge.paths.db):
-        r = edge.post("/v1/speak", data={"text": "hello there"})
-    assert r.status_code == 502 and "unusable voice label" in r.json()["detail"]
+    for label in ("../../escaped", "a/b", "..", "x\\y"):
+        edge.upstream.respond = lambda f, label=label: (200, {"X-Source": "gemini", "X-Voice": label}, b"OggS-x")
+        with _nothing_written(tmp_path, edge.paths.db):
+            r = edge.post("/v1/speak", data={"text": "hello there"})
+        assert r.status_code == 502 and "unusable voice label" in r.json()["detail"], label
+
+
+def test_read_routes_reject_bad_lang(client):
+    for path, params in [
+        ("/v1/search", {"prefix": "he"}), ("/v1/bank", {"prefix": "he"}),
+        ("/v1/bank/hello", {}), ("/v1/bank/hello/info", {}),
+        ("/v1/phrase", {"text": "hello there"}), ("/v1/phrase/info", {"text": "hello there"}),
+    ]:
+        r = client.get(path, params={**params, "lang": "../x"})
+        assert r.status_code == 400 and "invalid lang" in r.json()["detail"], path
 
 
 # ---- valid langs still work end to end ----
 
-@pytest.mark.parametrize("lang", VALID_LANGS)
-def test_valid_lang_speak_saves_under_it_and_then_serves_from_bank(client, lang):
+def test_valid_lang_speak_saves_under_it_and_then_serves_from_bank(client):
+    lang = "en-gb"
     r = client.post("/v1/speak", data={"text": "hello there", "lang": lang})
     assert r.status_code == 200 and r.headers["x-source"] == "gemini"
     m = Manifest(str(client.paths.db), table="phrases", text_col="text")
@@ -169,14 +179,14 @@ def test_edge_forwards_and_files_the_normalized_lang(edge):
 # ---- the validator itself ----
 
 def test_normalize_lang_accepts_codes_and_returns_the_stored_form():
-    assert [normalize_lang(c) for c in ("en-us", "EN-GB", " ru-RU\n", "fr", "zh-hant-tw", "ar-xa")] \
-        == ["en-us", "en-gb", "ru-ru", "fr", "zh-hant-tw", "ar-xa"]
+    assert [normalize_lang(c) for c in VALID_LANGS + ["EN-GB", " ru-RU\n", "fr", "zh-hant-tw", "ar-xa"]] \
+        == VALID_LANGS + ["en-gb", "ru-ru", "fr", "zh-hant-tw", "ar-xa"]
 
 
-@pytest.mark.parametrize("lang", BAD_LANGS + ["", None, "/tmp/x", "en-" + "-".join(["abcdefgh"] * 4)])
-def test_normalize_lang_rejects_non_codes(lang):
-    with pytest.raises(ValueError, match="invalid lang"):
-        normalize_lang(lang)
+def test_normalize_lang_rejects_non_codes():
+    for lang in BAD_LANGS + ["", None, "/tmp/x", "en-" + "-".join(["abcdefgh"] * 4)]:
+        with pytest.raises(ValueError, match="invalid lang"):
+            normalize_lang(lang)
 
 
 def test_is_lang_code_wants_the_canonical_form():
@@ -199,13 +209,12 @@ def test_path_under(tmp_path):
     assert path_under(str(tmp_path / "linked-root"), "en-us/x.wav")
 
 
-@pytest.mark.parametrize("lang,voice", [("../../escaped", "gemini-Kore"),
-                                        ("{out}", "gemini-Kore"),
-                                        ("en-us", "../../../escaped")])
-def test_save_phrase_refuses_a_path_outside_the_bank(client, tmp_path, lang, voice):
-    """Called directly, past the request validation: the writer's own check."""
+def test_save_phrase_refuses_a_path_outside_the_bank(client, tmp_path):
+    """Called directly, past the request validation: the writer's own check
+    (a bad lang, an absolute lang, and a bad voice label)."""
     from src.server import _save_phrase
-    with _nothing_written(tmp_path, client.paths.db):
-        with pytest.raises(HTTPException) as exc:
-            _save_phrase("hello there", _bad(lang, tmp_path), voice, b"OggS", pcm=b"\0\0")
-    assert exc.value.status_code == 500 and "outside" in exc.value.detail
+    for lang, voice in [("../../escaped", "gemini-Kore"), ("{out}", "gemini-Kore"), ("en-us", "../../../escaped")]:
+        with _nothing_written(tmp_path, client.paths.db):
+            with pytest.raises(HTTPException) as exc:
+                _save_phrase("hello there", _bad(lang, tmp_path), voice, b"OggS", pcm=b"\0\0")
+        assert exc.value.status_code == 500 and "outside" in exc.value.detail, (lang, voice)

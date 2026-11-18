@@ -16,7 +16,14 @@ google-genai is lazily imported; tests inject a fake batch client.
 ⚠️ Confirm with scripts/gemini_batch_smoke.py + a real key before a bulk run:
   - batch accepts the per-request TTS generationConfig on the model;
   - result audio is base64 at candidates[0].content.parts[*].inlineData.data;
-  - the leading voice instruction steers delivery and is NOT spoken.
+  - the leading voice instruction steers delivery and is NOT spoken;
+  - with --style (3.8 models), the part's speechMetadata.style is honoured. The
+    docs say so (Batch API takes generateContent requests; 3.8 TTS supports
+    batch and "Attach speech_metadata … to each part"), but it was not tried live.
+
+Directions are routed per model by gemini_tts.route_direction: 3.1/2.5 get the
+instruction as an inline prefix; the 3.8 models read inline text aloud, so they
+get it (and/or --style) as the part's speechMetadata.style, the word verbatim.
 """
 import base64
 import json
@@ -28,7 +35,8 @@ import wave
 from typing import Callable, Iterable, List, Optional
 
 from .constants import SAMPLE_RATE
-from .gemini_tts import GeminiAudioFormatError, new_client, pcm_from_payload
+from .gemini_tts import (GeminiAudioFormatError, new_client, pcm_from_payload,
+                         route_direction)
 from .manifest import DONE, FAILED, SUBMITTED, Manifest
 from .paths import safe_filename
 
@@ -43,18 +51,25 @@ BATCH_DEFAULT_MODEL = "gemini-3.1-flash-tts-preview"
 # Matched by suffix, so the API's raw BATCH_STATE_* spellings work too.
 _TERMINAL = ("SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED")
 
-# Style direction prepended to each word. Gemini TTS treats a leading "Say …:"
-# clause as delivery instruction, not text to speak. Confirm via the smoke test.
+# Style direction prepended to each word. The 3.1/2.5 TTS models treat a leading
+# "Say …:" clause as delivery instruction, not text to speak; the 3.8 models
+# read it aloud, so the CLI never defaults to it for them (see __main__).
 VOICE_INSTRUCTION = "Say the following single word clearly and naturally, in a neutral tone:"
 
 
 # --- request / response helpers (pure, easily testable) --------------------
 
-def build_request_body(word: str, voice: str, instruction: str = VOICE_INSTRUCTION) -> dict:
-    """Raw REST GenerateContentRequest body (camelCase) for one word's audio."""
-    text = f"{instruction} {word}" if instruction else word
+def build_request_body(word: str, voice: str, instruction: str = VOICE_INSTRUCTION,
+                       style: Optional[str] = None) -> dict:
+    """Raw REST GenerateContentRequest body (camelCase) for one word's audio.
+    `instruction` is an inline prefix; `style` goes in the part's
+    speechMetadata (the word stays verbatim). Which one a model gets is
+    GeminiBatch's call (route_direction), not this builder's."""
+    part = {"text": f"{instruction} {word}" if instruction else word}
+    if style:
+        part["speechMetadata"] = {"style": style}
     return {
-        "contents": [{"parts": [{"text": text}], "role": "user"}],
+        "contents": [{"parts": [part], "role": "user"}],
         "generationConfig": {
             "responseModalities": ["AUDIO"],
             "speechConfig": {
@@ -64,11 +79,12 @@ def build_request_body(word: str, voice: str, instruction: str = VOICE_INSTRUCTI
     }
 
 
-def build_jsonl(rows, voice: str, instruction: str = VOICE_INSTRUCTION) -> bytes:
+def build_jsonl(rows, voice: str, instruction: str = VOICE_INSTRUCTION,
+                style: Optional[str] = None) -> bytes:
     """One JSONL line per word: {"key": "<id>", "request": {...}}."""
     lines = [
         json.dumps({"key": str(r["id"]),
-                    "request": build_request_body(r["word"], voice, instruction)})
+                    "request": build_request_body(r["word"], voice, instruction, style)})
         for r in rows
     ]
     return ("\n".join(lines) + "\n").encode("utf-8")
@@ -105,11 +121,23 @@ def write_wav_from_pcm_bytes(path: pathlib.Path, pcm: bytes, sample_rate: int = 
 
 class GeminiBatch:
     def __init__(self, model: str = BATCH_DEFAULT_MODEL, voice: str = "Kore",
-                 instruction: str = VOICE_INSTRUCTION, client=None):
+                 instruction: str = VOICE_INSTRUCTION, style: Optional[str] = None,
+                 client=None):
+        """`instruction`/`style` are routed for `model` (route_direction):
+        afterwards `instruction` is what is prepended inline and `style` what
+        goes in speechMetadata — on a 3.8 model the instruction moves into the
+        style, so it is never spoken. A style for a model that takes none
+        raises GeminiStyleUnsupportedError here, before anything is submitted."""
         self.model = model
         self.voice = voice
-        self.instruction = instruction
+        self.style, self.instruction = route_direction(model, instruction, style)
         self._client = client
+
+    @property
+    def direction(self) -> Optional[str]:
+        """The delivery direction this batch sends (style or inline), recorded
+        as each row's `style` provenance."""
+        return self.style or self.instruction or None
 
     def _get_client(self):
         if self._client is None:
@@ -194,7 +222,8 @@ class GeminiBatch:
 # --- pipeline --------------------------------------------------------------
 
 def _write_and_mark(manifest: Manifest, out_dir: pathlib.Path, lang: str,
-                    voice: str, row, pcm: bytes) -> None:
+                    voice: str, row, pcm: bytes, *, model: Optional[str] = None,
+                    style: Optional[str] = None) -> None:
     # Store the path RELATIVE to the bank root (out_dir) so the manifest is
     # location-independent: the server resolves it under WAV_ROOT/OGG_ROOT,
     # which differ between dev (output/words) and the container (/data/words).
@@ -203,8 +232,11 @@ def _write_and_mark(manifest: Manifest, out_dir: pathlib.Path, lang: str,
     path = out_dir / rel
     path.parent.mkdir(parents=True, exist_ok=True)
     write_wav_from_pcm_bytes(path, pcm)
+    # model/style: the sync runner passes them; batch collect leaves them as
+    # submit_pending recorded them (see Manifest.set_status).
     manifest.set_status(row["id"], DONE, file_path=rel,
-                        billed_chars=len(row["word"]), voice=voice)
+                        billed_chars=len(row["word"]), voice=voice,
+                        model=model, style=style)
 
 
 def _collect(manifest: Manifest, batch: GeminiBatch, job_name: str,
@@ -280,7 +312,7 @@ def submit_pending(manifest: Manifest, batch: GeminiBatch, *, lang: str = "en",
         rows = manifest.pending(limit=chunk)
         if not rows:
             break
-        jsonl = build_jsonl(rows, batch.voice, batch.instruction)
+        jsonl = build_jsonl(rows, batch.voice, batch.instruction, batch.style)
         try:
             job_name = batch.submit_file(jsonl, display_name=f"wordbank-{lang}-{rows[0]['id']}")
         except Exception as e:  # noqa: BLE001 - inspect for quota, re-raise others
@@ -290,7 +322,8 @@ def submit_pending(manifest: Manifest, batch: GeminiBatch, *, lang: str = "en",
                 break
             raise
         # rows stay 'pending' until this commits, so a crash never half-submits
-        manifest.mark_submitted([r["id"] for r in rows], job_name)
+        manifest.mark_submitted([r["id"] for r in rows], job_name,
+                                model=batch.model, style=batch.direction)
         log(f"submitted {len(rows)} words as {job_name}")
         jobs.append(job_name)
     return jobs

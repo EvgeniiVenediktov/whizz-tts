@@ -14,7 +14,9 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from .auth import require_auth
 from .upstream import UpstreamError, fetch_speech
 from wordbank.constants import BANK_OGG_APPLICATION, BANK_OGG_BITRATE
-from wordbank.gemini_tts import DEFAULT_MODEL as GEMINI_TTS_DEFAULT_MODEL, canonical_voice
+from wordbank.gemini_tts import (DEFAULT_MODEL as GEMINI_TTS_DEFAULT_MODEL,
+                                 GeminiStyleUnsupportedError, canonical_voice,
+                                 style_models, supports_style)
 from wordbank.languages import normalize_lang
 from wordbank.lookup import BankLookup
 from wordbank.paths import voice_from_path
@@ -45,6 +47,29 @@ def _upstream_url() -> Optional[str]:
     """Edge mode: with SPEAK_UPSTREAM_URL set, /v1/speak misses are fetched
     from that whizz-tts server (and saved here) instead of from Gemini."""
     return os.getenv("SPEAK_UPSTREAM_URL") or None
+
+
+def _tts_style() -> Optional[str]:
+    """GEMINI_TTS_STYLE: a deployment-wide delivery direction for every clip
+    /v1/speak generates for the bank (misses, saved or with SPEAK_STORE=0
+    handed to edges), sent as the speech_metadata style. Not applied to
+    `instruct` one-offs or the studio. Needs a style-capable GEMINI_TTS_MODEL.
+    Read per call; unset by default."""
+    return os.getenv("GEMINI_TTS_STYLE", "").strip() or None
+
+
+def _warn_about_tts_style(log: logging.Logger) -> None:
+    """GEMINI_TTS_STYLE with a model that can't take it would fail every miss
+    (500); say so at startup rather than on the first request."""
+    if not _tts_style():
+        return
+    if _upstream_url():
+        log.warning("GEMINI_TTS_STYLE is ignored in edge mode (SPEAK_UPSTREAM_URL): "
+                    "misses come from the upstream, generated with its own style")
+    elif not supports_style(GEMINI_TTS_MODEL):
+        log.warning(f"GEMINI_TTS_STYLE is set but GEMINI_TTS_MODEL={GEMINI_TTS_MODEL} does "
+                    f"not accept a style (style-capable: {', '.join(style_models())}): every "
+                    "/v1/speak miss will fail with 500 until one of them changes")
 
 
 def _speak_store() -> bool:
@@ -117,6 +142,7 @@ async def lifespan(app: FastAPI):
     if not os.getenv("JWT_SECRET"):
         log.warning("JWT_SECRET not set: /v1/speak, /v1/gemini/tts are unauthenticated")
     _warn_about_upstream_token(log)
+    _warn_about_tts_style(log)
     yield
     app.state.bank.close()
 
@@ -321,14 +347,20 @@ async def _single_flight(key: tuple):
             del _miss_locks[key]
 
 
-async def _gemini_clip(text: str, voice: str, instruct: str) -> tuple:
-    """Synthesize with Gemini -> (OGG in the bank profile, raw PCM)."""
+async def _gemini_clip(text: str, voice: str, instruct: str,
+                       style: Optional[str] = None) -> tuple:
+    """Synthesize with Gemini -> (OGG in the bank profile, raw PCM). The model
+    decides how `instruct`/`style` are sent (gemini_tts.route_direction): on a
+    3.8 model both go as the speech_metadata style, never into the text."""
     def _gen():
         from wordbank.gemini_tts import synthesize_pcm  # lazy: genai
-        return synthesize_pcm(text, voice=voice, instruct=instruct, model=GEMINI_TTS_MODEL)
+        return synthesize_pcm(text, voice=voice, instruct=instruct, model=GEMINI_TTS_MODEL,
+                              style=style)
 
     try:
         pcm = await asyncio.get_running_loop().run_in_executor(None, _gen)
+    except GeminiStyleUnsupportedError as exc:   # only GEMINI_TTS_STYLE gets here
+        raise HTTPException(500, f"server misconfigured: GEMINI_TTS_STYLE is set but {exc}") from exc
     except (ImportError, ModuleNotFoundError) as exc:
         raise HTTPException(503, f"google-genai not installed: {exc}") from exc
     except Exception as exc:
@@ -370,7 +402,8 @@ async def _upstream_clip(url: str, text: str, lang: str, voice: Optional[str],
 
 
 def _save_phrase(text: str, lang: str, bank_voice: str, ogg: bytes,
-                 pcm: Optional[bytes] = None, billed_chars: Optional[int] = None) -> None:
+                 pcm: Optional[bytes] = None, billed_chars: Optional[int] = None,
+                 model: Optional[str] = None, style: Optional[str] = None) -> None:
     """Persist a /v1/speak clip into the phrase bank. Phrases get their own `phrases/` subtree: phrase and word ids
     are separate sequences, so `<lang>/<voice>/<n>/<id>_<slug>` alone could
     collide with a word clip of the same id, voice, and slug."""
@@ -406,7 +439,8 @@ def _save_phrase(text: str, lang: str, bank_voice: str, ogg: bytes,
                     f.write(pcm_to_wav_bytes(pcm))
             except OSError:
                 pass
-        m.set_status(row["id"], DONE, file_path=rel, billed_chars=billed_chars, voice=bank_voice)
+        m.set_status(row["id"], DONE, file_path=rel, billed_chars=billed_chars, voice=bank_voice,
+                     model=model, style=style)
     finally:
         m.close()
     app.state.bank.close()   # drop the memoized read conn so the new row is visible
@@ -437,7 +471,11 @@ async def speak(
     first) and a miss is generated in the default voice.
 
     `instruct` (style direction) makes the request a one-off: the bank has no
-    key for style, so it is neither looked up nor saved.
+    key for style, so it is neither looked up nor saved. How it reaches Gemini
+    depends on GEMINI_TTS_MODEL: the 3.8 models get it as the speech_metadata
+    style (they would speak an inline prefix), 3.1/2.5 as the inline prefix.
+    Every other miss is generated with GEMINI_TTS_STYLE (when set) and saved
+    with it as provenance (`model`, `style` columns).
 
     `lang` is a language code like `en-us` (case-insensitive, filed lowercase);
     anything else is a 400 before the bank, Gemini, or upstream is touched.
@@ -457,14 +495,17 @@ async def speak(
     upstream = _upstream_url()
 
     async def _generate():
+        """-> (ogg, voice label, source, pcm, billed chars, provenance kwargs)."""
         if upstream:
             ogg, label = await _upstream_clip(upstream, text, lang, voice, instruct, bank_voice)
-            return ogg, label, "upstream", None, None
-        ogg, pcm = await _gemini_clip(text, eff_voice, instruct)
-        return ogg, bank_voice, "gemini", pcm, len(text)
+            return ogg, label, "upstream", None, None, {}
+        style = None if instruct else _tts_style()   # a one-off's instruct replaces it
+        ogg, pcm = await _gemini_clip(text, eff_voice, instruct, style)
+        return ogg, bank_voice, "gemini", pcm, len(text), {"model": GEMINI_TTS_MODEL,
+                                                           "style": style}
 
     if instruct:
-        ogg, label, source, _, _ = await _generate()
+        ogg, label, source, *_ = await _generate()
         return Response(content=ogg, media_type="audio/ogg",
                         headers=_bank_voice_headers(source, label))
 
@@ -472,15 +513,15 @@ async def speak(
     if hit is not None:
         return hit
     if not _speak_store():
-        ogg, label, source, _, _ = await _coalesced((text.lower(), lang, bank_voice), _generate)
+        ogg, label, source, *_ = await _coalesced((text.lower(), lang, bank_voice), _generate)
         return Response(content=ogg, media_type="audio/ogg",
                         headers=_bank_voice_headers(source, label))
     async with _single_flight((text.lower(), lang, bank_voice)):
         hit = _speak_bank_hit(text, lang, voice, bank_voice)   # a queued twin may have saved it
         if hit is not None:
             return hit
-        ogg, label, source, pcm, billed = await _generate()
-        _save_phrase(text, lang, label, ogg, pcm, billed)
+        ogg, label, source, pcm, billed, provenance = await _generate()
+        _save_phrase(text, lang, label, ogg, pcm, billed, **provenance)
     return Response(content=ogg, media_type="audio/ogg",
                     headers=_bank_voice_headers(source, label))
 
@@ -493,21 +534,28 @@ async def gemini_tts(
     voice: Annotated[str, Form()] = GEMINI_TTS_VOICE,
     instruct: Annotated[Optional[str], Form()] = None,
     model: Annotated[str, Form()] = GEMINI_TTS_MODEL,
+    style: Annotated[Optional[str], Form()] = None,
 ):
     """Generate a phrase with Gemini (a prebuilt voice) → WAV, to preview a
-    voice. Nothing is saved. Needs GEMINI_API_KEY on the server."""
+    voice. Nothing is saved. Needs GEMINI_API_KEY on the server.
+    `instruct` is routed like /v1/speak's (the style on 3.8 models, an inline
+    prefix on 3.1/2.5); `style` is a speech_metadata style, 3.8 models only
+    (400 otherwise). GEMINI_TTS_STYLE does not apply here."""
     if len(text) > MAX_TEXT_LEN:
         raise HTTPException(400, f"text exceeds {MAX_TEXT_LEN} characters")
     voice = _gemini_voice(voice) or GEMINI_TTS_VOICE
 
     def _gen():
         from wordbank.gemini_tts import pcm_to_wav_bytes, synthesize_pcm  # lazy: genai
-        pcm = synthesize_pcm(text, voice=voice, instruct=instruct or "", model=model)
+        pcm = synthesize_pcm(text, voice=voice, instruct=instruct or "", model=model,
+                             style=style)
         return pcm_to_wav_bytes(pcm)
 
     try:
         loop = asyncio.get_running_loop()
         wav = await loop.run_in_executor(None, _gen)
+    except GeminiStyleUnsupportedError as exc:
+        raise HTTPException(400, str(exc)) from exc
     except (ImportError, ModuleNotFoundError) as exc:
         raise HTTPException(503, f"google-genai not installed: {exc}") from exc
     except Exception as exc:

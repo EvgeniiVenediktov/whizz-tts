@@ -4,11 +4,15 @@ Confirms, against a real key:
   - file-based batch accepts the per-request TTS generationConfig;
   - results carry base64 PCM keyed back to each request;
   - the voice instruction is NOT spoken (listen to the WAVs);
+  - with --style on a 3.8 model, the batch honours the part's speechMetadata
+    style (documented, not yet tried live) and still speaks only the word;
   - audio decodes and writes to WAV (no ffmpeg).
 
 Requires GEMINI_API_KEY (or GOOGLE_API_KEY).
 
   python scripts/gemini_batch_smoke.py --voice Kore
+  python scripts/gemini_batch_smoke.py --model gemini-3.8-flash-tts --voice Kore \
+      --style "read the word exactly as written, plain and neutral"
 """
 import argparse
 import pathlib
@@ -21,8 +25,9 @@ from wordbank.gemini_batch import (
     BATCH_DEFAULT_MODEL, VOICE_INSTRUCTION, GeminiBatch, audio_from_line, build_jsonl,
     write_wav_from_pcm_bytes,
 )
+from wordbank.gemini_tts import model_caps
 
-WORDS = ["cat", "elephant", "rhythm", "umbrella", "two"]
+WORDS = ["cat", "elephant", "rhythm", "umbrella", "two", "laughing", "haha", "russian"]
 OUT = pathlib.Path(__file__).parent.parent / "output" / "gemini_batch_smoke"
 
 
@@ -30,14 +35,18 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--voice", default="Kore")
     p.add_argument("--model", default=BATCH_DEFAULT_MODEL)
+    p.add_argument("--style", default=None, help="speechMetadata style (3.8 models only)")
     p.add_argument("--poll-interval", type=int, default=15)
     args = p.parse_args()
 
-    batch = GeminiBatch(model=args.model, voice=args.voice)
+    # VOICE_INSTRUCTION only where it stays unspoken; GeminiBatch routes the rest
+    instruction = VOICE_INSTRUCTION if model_caps(args.model).inline else ""
+    batch = GeminiBatch(model=args.model, voice=args.voice, instruction=instruction,
+                        style=args.style)
     rows = [{"id": i, "word": w} for i, w in enumerate(WORDS, start=1)]
     by_key = {str(r["id"]): r["word"] for r in rows}
 
-    job_name = batch.submit_file(build_jsonl(rows, args.voice, VOICE_INSTRUCTION),
+    job_name = batch.submit_file(build_jsonl(rows, args.voice, batch.instruction, batch.style),
                                  display_name="wordbank-smoke")
     print(f"submitted job: {job_name}")
 

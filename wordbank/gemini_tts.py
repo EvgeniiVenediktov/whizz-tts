@@ -1,16 +1,26 @@
-"""Synchronous single-phrase Gemini TTS → raw PCM. Used to author voice-clone
-references (the UI "voice studio" and the `gemini-voice` CLI). Distinct from
-`gemini_batch.py`, which builds the large async word bank.
+"""Synchronous single-phrase Gemini TTS → raw PCM. Used by /v1/speak, the voice
+studio, the `gemini-voice` CLI and the sync bank runner (`gemini_run.py`).
+Distinct from `gemini_batch.py`, which builds the large async word bank.
 
-Lazily imports google-genai; needs GEMINI_API_KEY in the environment.
+Two request paths, picked per model by the capability registry (TTS_MODELS):
+generateContent through google-genai (lazily imported) for plain text and for
+inline directions, and the Interactions API (raw REST, stdlib) for a `style`
+direction, which only the 3.8 models accept. Needs GEMINI_API_KEY (or
+GOOGLE_API_KEY) in the environment.
 """
+import base64
 import io
+import json
 import logging
 import os
+import socket
 import struct
 import time
+import urllib.error
+import urllib.request
 import wave
-from typing import Optional
+from dataclasses import dataclass
+from typing import Callable, Optional, Tuple
 
 from .constants import SAMPLE_RATE  # Gemini TTS emits 24 kHz / 16-bit mono PCM
 # Chosen for cost. A 3.x model because the 2.5 TTS models answer imperative
@@ -43,6 +53,104 @@ class GeminiNoAudioError(RuntimeError):
 
 class GeminiAudioFormatError(ValueError):
     """Gemini's audio isn't 16-bit mono PCM at SAMPLE_RATE (never resampled)."""
+
+
+class GeminiStyleUnsupportedError(ValueError):
+    """A `style` direction was asked of a model that doesn't accept one. Raised
+    before any request is sent."""
+
+
+class GeminiAPIError(RuntimeError):
+    """An Interactions request failed. `code` is the HTTP status, like
+    google-genai's APIError.code, so callers classify both request paths the
+    same way; None when there was no response (GeminiNetworkError) or no key."""
+
+    def __init__(self, message: str, code: Optional[int] = None):
+        super().__init__(message)
+        self.code = code
+
+
+class GeminiNetworkError(GeminiAPIError):
+    """No HTTP response: the connection failed or timed out (transient)."""
+
+
+# --- model capabilities: how a delivery direction reaches each TTS model -------
+# Every caller (synthesize_pcm, the batch request builder, the CLI, the server)
+# routes directions through this registry, so it's the one place to add a model.
+#
+# - style:  accepts a `style` direction as structured speech metadata (the
+#           Interactions `speech_metadata` annotation, or `speechMetadata` on a
+#           generateContent part). The text stays a verbatim transcript.
+# - inline: treats a leading "<direction>: " in the text as direction, not as
+#           words to speak (today's `instruct` prefix).
+# Verified live (2026-11): both 3.8 models take a style and read any inline
+# prefix ALOUD ("Say …: word" came back as the whole prompt spoken); both reject
+# generateContent system_instruction ("Developer instruction is not enabled").
+# 3.1 rejects speech metadata (400 "Speech metadata is not supported for this
+# model."). 2.5 was not probed for style; it is treated like 3.1.
+@dataclass(frozen=True)
+class TTSModel:
+    style: bool
+    inline: bool
+
+
+TTS_MODELS = {
+    "gemini-3.8-flash-tts": TTSModel(style=True, inline=False),
+    "gemini-3.8-flash-lite-tts": TTSModel(style=True, inline=False),
+    "gemini-3.1-flash-tts-preview": TTSModel(style=False, inline=True),
+    "gemini-2.5-flash-preview-tts": TTSModel(style=False, inline=True),
+    "gemini-2.5-pro-preview-tts": TTSModel(style=False, inline=True),
+}
+# An unlisted model keeps the pre-registry behaviour (inline prefix, no style).
+_UNLISTED = TTSModel(style=False, inline=True)
+
+
+def model_caps(model: str) -> TTSModel:
+    """Capabilities of a TTS model id ("models/" prefix allowed)."""
+    return TTS_MODELS.get(model.removeprefix("models/"), _UNLISTED)
+
+
+def supports_style(model: str) -> bool:
+    return model_caps(model).style
+
+
+def style_models() -> list:
+    return sorted(m for m, caps in TTS_MODELS.items() if caps.style)
+
+
+def combine_style(style: Optional[str], instruct: Optional[str]) -> Optional[str]:
+    """One style string from a base `style` and a per-call `instruct`: the
+    style first, then the instruct as its own sentence ("plain and neutral" +
+    "whisper it" -> "plain and neutral. whisper it"). Either alone is returned
+    unchanged; neither -> None."""
+    parts = [p.strip() for p in (style, instruct) if p and p.strip()]
+    if len(parts) < 2:
+        return parts[0] if parts else None
+    first = parts[0] if parts[0][-1] in ".!?;:" else parts[0] + "."
+    return f"{first} {parts[1]}"
+
+
+def route_direction(model: str, instruct: Optional[str] = None,
+                    style: Optional[str] = None) -> Tuple[Optional[str], str]:
+    """How a delivery direction reaches `model` -> (style, inline_prefix); at
+    most one is non-empty. Style-capable models get `style` and `instruct`
+    combined (combine_style) as the style, never inline: they would speak it.
+    Other models keep `instruct` as the inline prefix; a `style` for them, or
+    any direction for a model that takes neither, raises
+    GeminiStyleUnsupportedError."""
+    caps = model_caps(model)
+    style = (style or "").strip() or None
+    instruct = (instruct or "").strip()
+    if caps.style:
+        return combine_style(style, instruct), ""
+    if style:
+        raise GeminiStyleUnsupportedError(
+            f"model {model!r} does not accept a style direction (speech metadata); "
+            f"style-capable models: {', '.join(style_models())}")
+    if instruct and not caps.inline:
+        raise GeminiStyleUnsupportedError(
+            f"model {model!r} takes no delivery direction (neither style nor inline)")
+    return None, instruct
 
 # Prebuilt Gemini TTS voices: (name, style descriptor, gender). Voices are NOT
 # language-specific — the model auto-detects language from the input text, so
@@ -191,42 +299,159 @@ def _empty_retries() -> int:
     return max(0, int(os.getenv("GEMINI_TTS_EMPTY_RETRIES", "2")))
 
 
-def synthesize_pcm(text: str, voice: str = "Kore", instruct: str = "",
-                   model: str = DEFAULT_MODEL) -> bytes:
-    """Speak `text` with a Gemini prebuilt voice; return raw 24 kHz PCM bytes
-    (a WAV payload is unwrapped — see pcm_from_payload).
+# --- Interactions API (style directions) --------------------------------------
+# Raw REST over urllib rather than google-genai's client.interactions: the
+# request/response below is the wire format verified live, while the SDK's
+# generated Interactions surface has changed between the releases this project
+# runs (2.31 in the dev venv, 3.x in the images). The URL carries
+# GEMINI_API_VERSION like every google-genai client from new_client().
+GEMINI_API_BASE = "https://generativelanguage.googleapis.com"
+_INTERACTIONS_TIMEOUT_S = 120
+# A completed interaction with no audio is the Interactions analogue of an
+# empty generateContent candidate (finish_reason OTHER) and is retried; a
+# failed / cancelled / incomplete one, or one carrying errors, is not.
+_RETRYABLE_STATUS = {None, "completed"}
 
-    `instruct` is style/accent direction (e.g. "British accent") — prepended,
-    not spoken. A response with no audio and a transient finish_reason (OTHER,
-    unset) is retried up to GEMINI_TTS_EMPTY_RETRIES times (default 2); a block
-    is not. Raises GeminiNoAudioError, naming the reason, if no audio comes back,
-    and GeminiAudioFormatError (not retried) for audio in another format.
-    """
-    from google.genai import types
 
-    client = _get_client()
-    prompt = f"{instruct}: {text}" if instruct else text
-    config = types.GenerateContentConfig(
-        response_modalities=["AUDIO"],
-        speech_config=types.SpeechConfig(voice_config=types.VoiceConfig(
-            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice))),
+def build_interaction_body(text: str, voice: str, style: str, model: str) -> dict:
+    """Single-speaker Interactions request: `text` is the verbatim transcript,
+    `style` rides in a speech_metadata annotation (never in the text)."""
+    return {
+        "model": model,
+        "input": [{"type": "user_input", "content": [{
+            "type": "text", "text": text,
+            "annotations": [{"type": "speech_metadata", "style": style}],
+        }]}],
+        "response_format": {"type": "audio"},
+        "generation_config": {"speech_config": [{"voice": voice}]},
+    }
+
+
+def _api_key() -> Optional[str]:
+    # google-genai's precedence: GOOGLE_API_KEY wins when both are set
+    return os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or None
+
+
+def _error_detail(raw: bytes) -> str:
+    """{"error": {"message": ...}} -> the message, else the raw text."""
+    text = raw.decode("utf-8", errors="replace").strip()
+    try:
+        err = json.loads(text).get("error")
+        if isinstance(err, dict) and err.get("message"):
+            return str(err["message"])
+    except (ValueError, AttributeError):
+        pass
+    return text[:500]
+
+
+def _post_interaction(body: dict) -> dict:
+    """POST one Interactions request -> the parsed JSON response. The single
+    transport of the style path (tests replace it). HTTP errors raise
+    GeminiAPIError with the status; no response raises GeminiNetworkError."""
+    key = _api_key()
+    if not key:
+        raise GeminiAPIError("no Gemini API key: set GEMINI_API_KEY (or GOOGLE_API_KEY)")
+    req = urllib.request.Request(
+        f"{GEMINI_API_BASE}/{GEMINI_API_VERSION}/interactions",
+        data=json.dumps(body).encode("utf-8"),
+        headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+        method="POST",
     )
+    try:
+        with urllib.request.urlopen(req, timeout=_INTERACTIONS_TIMEOUT_S) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        raise GeminiAPIError(
+            f"Gemini Interactions {exc.code}: {_error_detail(exc.read()) or exc.reason}",
+            code=exc.code) from exc
+    except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError) as exc:
+        raise GeminiNetworkError(
+            f"Gemini Interactions unreachable: {getattr(exc, 'reason', exc)}") from exc
+
+
+def _interaction_audio_or_reason(resp: dict):
+    """-> (pcm, None) from the last audio block of the model's output steps,
+    else (None, why): the interaction's status and errors."""
+    for step in reversed(resp.get("steps") or []):
+        if step.get("type") != "model_output":
+            continue
+        for item in reversed(step.get("content") or []):
+            if item.get("type") == "audio" and item.get("data"):
+                pcm = pcm_from_payload(base64.b64decode(item["data"]), item.get("mime_type"))
+                if pcm:                     # a WAV with an empty data chunk is no audio
+                    return pcm, None
+    return None, {"status": resp.get("status"), "errors": resp.get("errors") or None}
+
+
+def synthesize_pcm(text: str, voice: str = "Kore", instruct: str = "",
+                   model: str = DEFAULT_MODEL, style: Optional[str] = None,
+                   on_request: Optional[Callable[[], None]] = None) -> bytes:
+    """Speak `text` with a Gemini voice; return raw 24 kHz PCM bytes (a WAV
+    payload is unwrapped — see pcm_from_payload).
+
+    Directions are routed per model (route_direction):
+    - `style` (delivery direction): only for style-capable models (3.8), sent as
+      a speech_metadata annotation through the Interactions API with `text`
+      verbatim. Any other model raises GeminiStyleUnsupportedError before a
+      request is made.
+    - `instruct` (style/accent direction, e.g. "British accent"): on
+      style-capable models it is sent as the style (after `style` when both are
+      given, see combine_style) — never inline, since 3.8 reads inline text
+      aloud. On other models it is prepended to the text as today.
+    - neither: generateContent with the bare text, as before.
+
+    A response with no audio and a transient reason (generateContent
+    finish_reason OTHER/unset; an Interactions status "completed") is retried
+    up to GEMINI_TTS_EMPTY_RETRIES times (default 2); a block or failure is not.
+    Raises GeminiNoAudioError, naming the reason, if no audio comes back, and
+    GeminiAudioFormatError (not retried) for audio in another format.
+    `on_request` is called before every request, retries included (the sync
+    bank runner passes its rate limiter).
+    """
+    style, inline = route_direction(model, instruct, style)
+    if style:
+        body = build_interaction_body(text, voice, style, model)
+
+        def fetch():
+            pcm, why = _interaction_audio_or_reason(_post_interaction(body))
+            return pcm, why, not why or (why["errors"] is None
+                                         and why["status"] in _RETRYABLE_STATUS)
+    else:
+        from google.genai import types
+
+        client = _get_client()
+        prompt = f"{inline}: {text}" if inline else text
+        config = types.GenerateContentConfig(
+            response_modalities=["AUDIO"],
+            speech_config=types.SpeechConfig(voice_config=types.VoiceConfig(
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice))),
+        )
+
+        def fetch():
+            resp = client.models.generate_content(model=model, contents=prompt, config=config)
+            pcm, why = _audio_or_reason(resp)
+            return pcm, why, not why or (why["block_reason"] is None
+                                         and why["finish_reason"] in _RETRYABLE_FINISH)
+
     attempts = 1 + _empty_retries()
     for attempt in range(1, attempts + 1):
-        resp = client.models.generate_content(model=model, contents=prompt, config=config)
-        pcm, why = _audio_or_reason(resp)
+        if on_request is not None:
+            on_request()
+        pcm, why, retryable = fetch()
         if pcm:
             return pcm
-        retryable = why["block_reason"] is None and why["finish_reason"] in _RETRYABLE_FINISH
         if not retryable or attempt == attempts:
             break
-        log.warning("Gemini TTS returned no audio (finish_reason=%s, voice=%s); "
-                    "retry %d/%d", why["finish_reason"], voice, attempt, attempts - 1)
+        log.warning("Gemini TTS returned no audio (%s, voice=%s); retry %d/%d",
+                    _reason(why) or "no reason", voice, attempt, attempts - 1)
         time.sleep(_RETRY_BACKOFF_S * attempt)
-    detail = ", ".join(f"{k}={v}" for k, v in why.items() if v)
     raise GeminiNoAudioError(
-        f"no audio in response ({detail or 'finish_reason=None'}) "
+        f"no audio in response ({_reason(why) or 'finish_reason=None'}) "
         f"after {attempt} attempt{'s' if attempt > 1 else ''}")
+
+
+def _reason(why: dict) -> str:
+    return ", ".join(f"{k}={v}" for k, v in why.items() if v)
 
 
 def pcm_to_wav_bytes(pcm: bytes, sample_rate: int = SAMPLE_RATE) -> bytes:
