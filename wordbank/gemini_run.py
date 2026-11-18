@@ -57,9 +57,11 @@ def run_sync(manifest: Manifest, out_dir: str, *, lang: str, voice: str, model: 
 
     `instruction`/`style` are routed per model exactly as in synthesize_pcm
     (route_direction): a style for a model that takes none raises
-    GeminiStyleUnsupportedError before any row is touched.
+    GeminiStyleUnsupportedError before any row is touched, as does a locale
+    voice on a model not verified with it (GeminiVoiceUnsupportedError).
     """
     _check_voice(voice)
+    gemini_tts.check_voice(voice, model)
     sent_style, inline = route_direction(model, instruction, style)
     direction = sent_style or inline or None              # recorded as provenance
     synth = synth or gemini_tts.synthesize_pcm

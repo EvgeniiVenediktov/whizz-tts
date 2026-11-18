@@ -35,8 +35,8 @@ import wave
 from typing import Callable, Iterable, List, Optional
 
 from .constants import SAMPLE_RATE
-from .gemini_tts import (GeminiAudioFormatError, new_client, pcm_from_payload,
-                         route_direction)
+from .gemini_tts import (GeminiAudioFormatError, check_voice, new_client,
+                         pcm_from_payload, route_direction)
 from .manifest import DONE, FAILED, SUBMITTED, Manifest
 from .paths import safe_filename
 
@@ -168,6 +168,9 @@ class GeminiBatch:
             file = client.files.get(name=file.name)
 
     def submit_file(self, jsonl: bytes, display_name: str) -> str:
+        # a locale voice on a model not verified with it fails before the
+        # upload (not in __init__: collect-only batches carry no real model)
+        check_voice(self.voice, self.model)
         from google.genai import types
         client = self._get_client()
         with tempfile.NamedTemporaryFile("wb", suffix=".jsonl", delete=False) as f:

@@ -4,7 +4,7 @@ from wordbank.gemini_tts import canonical_voice
 
 def test_every_listed_voice_is_accepted_by_name(client):
     voices = client.get("/v1/gemini/voices").json()["voices"]
-    assert len(voices) == 30
+    assert len(voices) == 30 and all(set(v) == {"name", "style", "gender"} for v in voices)
     assert all(v["gender"] in ("male", "female") and v["style"] for v in voices)
     for v in voices:   # the list the UI offers is exactly what the API validates
         assert canonical_voice(v["name"]) == v["name"]

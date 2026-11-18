@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
 
 from .constants import SAMPLE_RATE  # Gemini TTS emits 24 kHz / 16-bit mono PCM
+from .languages import VOICE_LANGUAGES
 # 3.8 Flash: with a speech_metadata style it said the words 3.8 Lite acted out
 # ("laughing", "haha", "russian"), at 1.5x Lite's price. A 3.x model because the
 # 2.5 TTS models answer imperative text ("Read this one slowly please.") with
@@ -62,6 +63,12 @@ class GeminiStyleUnsupportedError(ValueError):
     before any request is sent."""
 
 
+class GeminiVoiceUnsupportedError(ValueError):
+    """A locale voice (any voice beyond the 30 classic ones) was asked of a
+    model it isn't verified on (TTSModel.locale_voices). Raised before any
+    request is sent."""
+
+
 class GeminiAPIError(RuntimeError):
     """An Interactions request failed. `code` is the HTTP status, like
     google-genai's APIError.code, so callers classify both request paths the
@@ -90,21 +97,28 @@ class GeminiNetworkError(GeminiAPIError):
 # generateContent system_instruction ("Developer instruction is not enabled").
 # 3.1 rejects speech metadata (400 "Speech metadata is not supported for this
 # model."). 2.5 was not probed for style; it is treated like 3.1.
+#
+# - locale_voices: takes the voice library's locale voices (`en-gb-tutor-11`),
+#           not just the 30 classic ones. Verified (2026-11) on both 3.8 models
+#           with en-gb-tutor-11; UNVERIFIED on 3.1/2.5 (never tried), so refused
+#           there before any request (check_voice). Classic voices work on all.
 @dataclass(frozen=True)
 class TTSModel:
     style: bool
     inline: bool
+    locale_voices: bool
 
 
 TTS_MODELS = {
-    "gemini-3.8-flash-tts": TTSModel(style=True, inline=False),
-    "gemini-3.8-flash-lite-tts": TTSModel(style=True, inline=False),
-    "gemini-3.1-flash-tts-preview": TTSModel(style=False, inline=True),
-    "gemini-2.5-flash-preview-tts": TTSModel(style=False, inline=True),
-    "gemini-2.5-pro-preview-tts": TTSModel(style=False, inline=True),
+    "gemini-3.8-flash-tts": TTSModel(style=True, inline=False, locale_voices=True),
+    "gemini-3.8-flash-lite-tts": TTSModel(style=True, inline=False, locale_voices=True),
+    "gemini-3.1-flash-tts-preview": TTSModel(style=False, inline=True, locale_voices=False),
+    "gemini-2.5-flash-preview-tts": TTSModel(style=False, inline=True, locale_voices=False),
+    "gemini-2.5-pro-preview-tts": TTSModel(style=False, inline=True, locale_voices=False),
 }
-# An unlisted model keeps the pre-registry behaviour (inline prefix, no style).
-_UNLISTED = TTSModel(style=False, inline=True)
+# An unlisted model keeps the pre-registry behaviour (inline prefix, no style,
+# classic voices only).
+_UNLISTED = TTSModel(style=False, inline=True, locale_voices=False)
 
 
 def model_caps(model: str) -> TTSModel:
@@ -118,6 +132,10 @@ def supports_style(model: str) -> bool:
 
 def style_models() -> list:
     return sorted(m for m, caps in TTS_MODELS.items() if caps.style)
+
+
+def locale_voice_models() -> list:
+    return sorted(m for m, caps in TTS_MODELS.items() if caps.locale_voices)
 
 
 def combine_style(style: Optional[str], instruct: Optional[str]) -> Optional[str]:
@@ -154,12 +172,12 @@ def route_direction(model: str, instruct: Optional[str] = None,
             f"model {model!r} takes no delivery direction (neither style nor inline)")
     return None, instruct
 
-# Prebuilt Gemini TTS voices: (name, style descriptor, gender). Voices are NOT
-# language-specific — the model auto-detects language from the input text, so
-# any voice speaks any supported language. The accent/language of a reference
-# comes from the phrase you write (and optional `instruct`), not the voice.
-# Gender is the community-perceived gender (Google doesn't officially assign one
-# — the names are mythological); 14 female / 16 male.
+# The 30 classic prebuilt Gemini TTS voices: (name, style descriptor, gender).
+# Voices are NOT language-specific — the model auto-detects language from the
+# input text, so any voice speaks any supported language. Every TTS model takes
+# them. Gender is the community-perceived one, kept for /v1/gemini/voices
+# (14 female / 16 male); the voice library (GET /v1beta/voices) now lists a
+# gender too and agrees except Pulcherrima ("neutral" there).
 # Source: https://ai.google.dev/gemini-api/docs/speech-generation
 VOICES = [
     ("Zephyr", "Bright", "female"), ("Puck", "Upbeat", "male"),
@@ -181,12 +199,37 @@ VOICES = [
 
 _VOICE_NAMES = {name.lower(): name for name, _, _ in VOICES}
 
+# Locale voices the server accepts beyond the classic ones: the curated
+# per-language picks (languages.VOICE_LANGUAGES; its en-us picks are classic).
+# Labelled by their lowercase library id ("en-gb-tutor-11"), as the batch path
+# files them (`<lang>/gemini-<id>/…`). 3.8 models only (check_voice).
+LOCALE_VOICES = frozenset(v["id"] for lang in VOICE_LANGUAGES
+                          for v in lang["voices"]) - _VOICE_NAMES.keys()
+
 
 def canonical_voice(name: str) -> Optional[str]:
-    """Case-insensitive match against VOICES -> the canonical spelling ("puck"
-    -> "Puck"), or None if it isn't a prebuilt voice. Banked clips are keyed by
-    voice name, so normalizing here keeps "puck"/"Puck" one bank entry."""
-    return _VOICE_NAMES.get(name.strip().lower())
+    """Case-insensitive match against the classic VOICES and LOCALE_VOICES ->
+    the canonical label, or None if it is neither. Classic voices keep their
+    capitalized name ("puck" -> "Puck": banks key on it, `gemini-Kore`); a
+    locale voice is its lowercase id ("EN-GB-Tutor-11" -> "en-gb-tutor-11").
+    Banked clips are keyed by this label, so "puck"/"Puck" stay one entry."""
+    key = name.strip().lower()
+    return _VOICE_NAMES.get(key) or (key if key in LOCALE_VOICES else None)
+
+
+def is_classic_voice(name: str) -> bool:
+    return name.strip().lower() in _VOICE_NAMES
+
+
+def check_voice(voice: str, model: str) -> None:
+    """Raise GeminiVoiceUnsupportedError when `voice` is not a classic voice and
+    `model` isn't verified with locale voices (TTSModel.locale_voices). Any
+    non-classic name counts, curated or not: the batch CLI passes ids through."""
+    if model_caps(model).locale_voices or is_classic_voice(voice):
+        return
+    raise GeminiVoiceUnsupportedError(
+        f"voice {voice!r} is not one of the 30 classic voices; locale voices are "
+        f"verified only on {', '.join(locale_voice_models())}, not on {model}")
 
 
 _client = None
@@ -408,8 +451,10 @@ def synthesize_pcm(text: str, voice: str = "Kore", instruct: str = "",
     Raises GeminiNoAudioError, naming the reason, if no audio comes back, and
     GeminiAudioFormatError (not retried) for audio in another format.
     `on_request` is called before every request, retries included (the sync
-    bank runner passes its rate limiter).
+    bank runner passes its rate limiter). A locale voice on a model not
+    verified with it raises GeminiVoiceUnsupportedError first (check_voice).
     """
+    check_voice(voice, model)
     style, inline = route_direction(model, instruct, style)
     if style:
         body = build_interaction_body(text, voice, style, model)

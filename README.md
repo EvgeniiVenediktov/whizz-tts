@@ -74,8 +74,8 @@ the `UNIQUE` index; prefix autocomplete uses an index range scan.
 | `GET /v1/bank?prefix=he` | word-only autocomplete (index range scan) |
 | `GET /v1/bank/{word}` · `/info` | serve a word (OGG default; `wav` dev-only) · sizes+type+voice |
 | `GET /v1/phrase?text=…` · `/info` | serve a phrase (by text, optional `voice`) · sizes+type+voice+provenance |
-| `POST /v1/speak` | get-or-generate — `text` (required), `lang` (default `en-us`), `voice` (optional Gemini prebuilt, case-insensitive; unknown → `400`), `instruct` (optional, one-off: not looked up or saved). Bank hit in that voice → stored OGG, `X-Source: bank`. Miss → Gemini synth in that voice, saved into the phrase bank (`voice=gemini-<Voice>`), served with `X-Source: gemini`; `X-Voice` names the voice served. Needs `GEMINI_API_KEY` only on a miss |
-| voice studio | `GET /v1/gemini/voices` (the voices `/v1/speak` accepts), `POST /v1/gemini/tts` (preview a voice, nothing saved) |
+| `POST /v1/speak` | get-or-generate — `text` (required), `lang` (default `en-us`), `voice` (optional: a classic Gemini voice or a curated locale voice, case-insensitive; unknown → `400`), `instruct` (optional, one-off: not looked up or saved). Bank hit in that voice → stored OGG, `X-Source: bank`. Miss → Gemini synth in that voice, saved into the phrase bank (`voice=gemini-<Voice>`, e.g. `gemini-Kore`, `gemini-en-gb-tutor-11`), served with `X-Source: gemini`; `X-Voice` names the voice served. Needs `GEMINI_API_KEY` only on a miss |
+| voice studio | `GET /v1/gemini/voices` (the 30 classic voices), `GET /v1/gemini/languages` (the curated female + male voice per language), `POST /v1/gemini/tts` (preview a voice, nothing saved) |
 
 ### Endpoint reference
 
@@ -119,16 +119,44 @@ specific voice; omitted = any) · `format`. The phrase's audio, or 404.
 `seed`, `ref_audio`, `ref_text` (set only on phrases from the removed local
 pipeline).
 
-**`GET /v1/gemini/voices`** — no params. The 30 prebuilt Gemini voices
-`{name, style, gender}`. Voices are style presets, **not** language-bound —
-Gemini auto-detects language from the text.
+**`GET /v1/gemini/voices`** — no params. The 30 classic Gemini voices
+`{name, style, gender}`. They are style presets, **not** language-bound —
+Gemini auto-detects language from the text — and work on every TTS model.
+
+**`GET /v1/gemini/languages`** — no params. The curated voices per language
+(`wordbank/gemini_voices.json`): one female and one male voice for each of
+`en-us`, `en-gb`, `ru-ru`, `fr-fr`, `de-de`, `zh-cn`, `ja-jp`, `es-es` (bank
+`lang` codes), with their Gemini voice-library metadata, plus
+`locale_voice_models` (the models that take locale voices):
+```json
+{"languages": [
+  {"code": "en-gb", "name": "English (UK)", "voices": [
+    {"name": "en-gb-tutor-11", "classic": false, "gender": "female",
+     "display_name": "Tutor 11", "language_code": "en-GB", "accent": "Winchester English",
+     "pitch": "medium", "persona": "Educational Tutor (Music Teacher)", "description": "…"},
+    {"name": "en-gb-tutor-14", "classic": false, "gender": "male", "…": "…"}]},
+  {"code": "en-us", "name": "English (US)", "voices": [
+    {"name": "Kore", "classic": true, "…": "…"}, {"name": "Iapetus", "classic": true, "…": "…"}]},
+  "…"],
+ "locale_voice_models": ["gemini-3.8-flash-lite-tts", "gemini-3.8-flash-tts"]}
+```
+`name` is what `voice` takes. `en-us` uses two classic voices (`classic: true`,
+language-agnostic); the others are **locale voices**, which carry their accent
+and are verified only on the 3.8 models: on 3.1/2.5 they are untested, so a
+request pairing one with those models is refused (`400`) before any Gemini call.
+The curated voices are not the `generate` list of `/v1/languages` (no bank is
+implied). Refresh their metadata, or list candidates for a new pick, with
+`scripts/fetch_gemini_voices.py`.
 
 #### Write / synthesis (JWT, multipart form fields)
 
 **`POST /v1/speak`** — get-or-generate. `text` (required, ≤ `MAX_TEXT_LEN`) ·
-`lang` (default `en-us`) · `voice` (Gemini prebuilt, default `GEMINI_TTS_VOICE`
-= Kore; also pins the bank lookup to `gemini-<voice>`) · `instruct` (delivery
-direction). Bank hit (words table for single tokens, phrases otherwise) → stored
+`lang` (default `en-us`) · `voice` (a classic voice from `/v1/gemini/voices`
+or a curated locale voice from `/v1/gemini/languages`, case-insensitive; default
+`GEMINI_TTS_VOICE` = Kore; also pins the bank lookup: words by the bare label,
+phrases by `gemini-<label>`, where a classic label keeps its capitals (`Kore`)
+and a locale voice is its lowercase id (`en-gb-tutor-11`); any language may use
+any of them) · `instruct` (delivery direction). Bank hit (words table for single tokens, phrases otherwise) → stored
 OGG with `X-Source: bank`; miss → Gemini synth, persisted into the phrase bank,
 returned with `X-Source: gemini`. A request with `instruct` is a **one-off**:
 never looked up or saved (the bank has no key for it). How `instruct` reaches
@@ -137,13 +165,17 @@ speech-metadata **style**, with `text` sent verbatim (they read an inline prefix
 aloud); 3.1/2.5 get it as an inline prefix (`"<instruct>: <text>"`). Misses
 without `instruct` are generated with `GEMINI_TTS_STYLE` when set and saved with
 it (`model`/`style` columns); the one-off's `instruct` replaces it rather than
-adding to it. Errors: `400` empty/oversize text, `500` `GEMINI_TTS_STYLE` set with
+adding to it. Errors: `400` empty/oversize text, unknown `voice`, or a locale
+`voice` when `GEMINI_TTS_MODEL` isn't a 3.8 model (misses and one-offs only: a
+banked clip in that voice still serves), `500` `GEMINI_TTS_STYLE` set with
 a model that takes no style (misses only; hits and `instruct` one-offs still
-work), `502` Gemini failure (detail names the `finish_reason`, or the
+work) or a default `GEMINI_TTS_VOICE` that is a locale voice on a non-3.8
+model, `502` Gemini failure (detail names the `finish_reason`, or the
 Interactions `status`, when it returned no audio), `503` encoding stack absent.
 
 **`POST /v1/gemini/tts`** — studio preview. `text` (required, ≤ `MAX_TEXT_LEN`)
-· `voice` (default `GEMINI_TTS_VOICE`) · `instruct` (direction, routed per model
+· `voice` (as in `/v1/speak`, default `GEMINI_TTS_VOICE`; a locale voice with a
+non-3.8 `model` → `400`) · `instruct` (direction, routed per model
 as in `/v1/speak`) · `style` (speech-metadata style; 3.8 models only, else `400`;
 with `instruct` too, the style comes first) · `model` (default
 `GEMINI_TTS_MODEL`). Synthesizes one phrase with Gemini and returns **WAV**
@@ -358,7 +390,10 @@ and read any inline instruction aloud, so `batch*`/`gemini-run` never send them
 one — an explicit `--instruction` becomes the style, and with neither flag they
 refuse rather than default to `VOICE_INSTRUCTION` (`--instruction=` = the bare
 word). 3.1/2.5 keep the inline `--instruction` (default `VOICE_INSTRUCTION`) and
-reject `--style`. `gemini-run` takes `--rpm` (default 10, Tier 1),
+reject `--style`. `--voice` takes a classic name (`Kore`) or any voice-library
+id (`en-gb-tutor-11`, filed as `gemini-en-gb-tutor-11`); a non-classic voice
+with a non-3.8 `--model` (the batch default is 3.1) exits before anything is
+ingested or sent. `gemini-run` takes `--rpm` (default 10, Tier 1),
 `--max-attempts` (3) and `--limit`; it retries 429/5xx with backoff and stops if
 they persist, or after 5 rows in a row fail otherwise.
 

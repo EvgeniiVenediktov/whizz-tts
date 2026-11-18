@@ -47,10 +47,12 @@ def _sent(api):
 # --- registry and routing --------------------------------------------------------
 
 def test_capability_registry():
-    assert gemini_tts.style_models() == sorted([FLASH, LITE])
-    assert gemini_tts.model_caps(f"models/{LITE}") == gemini_tts.TTSModel(style=True, inline=False)
+    assert gemini_tts.style_models() == gemini_tts.locale_voice_models() == sorted([FLASH, LITE])
+    assert gemini_tts.model_caps(f"models/{LITE}") == gemini_tts.TTSModel(
+        style=True, inline=False, locale_voices=True)
     for model in (PREVIEW, "gemini-2.5-pro-preview-tts", "gemini-9-unlisted-tts"):
-        assert gemini_tts.model_caps(model) == gemini_tts.TTSModel(style=False, inline=True), model
+        assert gemini_tts.model_caps(model) == gemini_tts.TTSModel(
+            style=False, inline=True, locale_voices=False), model
 
 
 def test_route_direction():

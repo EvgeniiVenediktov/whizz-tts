@@ -54,11 +54,15 @@ def _add_direction_args(p) -> None:
                         "verbatim; 3.8 models only (see gemini_tts.TTS_MODELS)")
 
 
+_VOICE_HELP = ("Gemini voice: a classic name (Kore), or a library id like en-gb-tutor-11 "
+               "(3.8 models only), filed as gemini-<voice>")
+
+
 def _add_gemini_args(p, *, words=True, instruction=True, chunk=True, poll=True):
     """Common args for the Gemini batch subcommands (which differ only slightly)."""
     if words:
         p.add_argument("--words", required=True, help="text file, one word per line")
-    p.add_argument("--voice", default="Kore", help="Gemini voice name")
+    p.add_argument("--voice", default="Kore", help=_VOICE_HELP)
     p.add_argument("--model", default="gemini-3.1-flash-tts-preview")
     if instruction:
         _add_direction_args(p)
@@ -92,12 +96,24 @@ def _direction_args(args) -> Tuple[str, Optional[str]]:
              "metadata), or --instruction= for the bare word")
 
 
+def _check_voice_args(args) -> None:
+    """Exit before anything is ingested or sent when --voice is a locale voice
+    (not one of the 30 classic) and --model isn't verified with those: only the
+    3.8 models are (gemini_tts.TTS_MODELS)."""
+    from .gemini_tts import GeminiVoiceUnsupportedError, check_voice
+    try:
+        check_voice(args.voice, args.model)
+    except GeminiVoiceUnsupportedError as exc:
+        sys.exit(f"--voice: {exc}")
+
+
 def _make_batch(args, *, submit: bool = True):
     """The GeminiBatch for a command; `submit=False` (collect only) needs no
-    direction, since no request is built."""
+    direction or voice check, since no request is built."""
     from .gemini_batch import GeminiBatch
     if not submit:
         return GeminiBatch(model=args.model, voice=args.voice, instruction="")
+    _check_voice_args(args)
     instruction, style = _direction_args(args)
     return GeminiBatch(model=args.model, voice=args.voice, instruction=instruction,
                        style=style)
@@ -162,6 +178,7 @@ def cmd_gemini_run(args, cfg: Config) -> None:
     """Sync, rate-limited Gemini generation of pending words (resumable)."""
     from .gemini_run import run_sync
 
+    _check_voice_args(args)
     instruction, style = _direction_args(args)
     m = _ingest(cfg, args.words) if args.words else Manifest(cfg.db)
     try:
@@ -336,7 +353,7 @@ def main(argv=None) -> None:
     gr.add_argument("--words", default=None,
                     help="text file, one word per line, added first (default: just "
                          "generate what the manifest has pending, e.g. after regenerate)")
-    gr.add_argument("--voice", default="Kore", help="Gemini voice name")
+    gr.add_argument("--voice", default="Kore", help=_VOICE_HELP)
     gr.add_argument("--model", default=GEMINI_TTS_DEFAULT_MODEL,
                     help=f"Gemini TTS model (default {GEMINI_TTS_DEFAULT_MODEL})")
     _add_direction_args(gr)

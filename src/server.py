@@ -15,7 +15,8 @@ from .auth import require_auth
 from .upstream import UpstreamError, fetch_speech
 from wordbank.constants import BANK_OGG_APPLICATION, BANK_OGG_BITRATE
 from wordbank.gemini_tts import (DEFAULT_MODEL as GEMINI_TTS_DEFAULT_MODEL,
-                                 GeminiStyleUnsupportedError, canonical_voice,
+                                 GeminiStyleUnsupportedError, GeminiVoiceUnsupportedError,
+                                 canonical_voice, check_voice, is_classic_voice,
                                  style_models, supports_style)
 from wordbank.languages import normalize_lang
 from wordbank.lookup import BankLookup
@@ -101,14 +102,28 @@ def _warn_about_upstream_token(log: logging.Logger) -> None:
 
 
 def _gemini_voice(voice: Optional[str]) -> Optional[str]:
-    """Canonical prebuilt-voice name for a request field, None when omitted.
-    An unknown name is a 400 here rather than a 502 from a wasted Gemini call."""
+    """Canonical voice label for a request field (a classic name like "Kore",
+    or a curated locale voice id like "en-gb-tutor-11"), None when omitted. An
+    unknown name is a 400 here rather than a 502 from a wasted Gemini call."""
     if not voice or not voice.strip():
         return None
     canon = canonical_voice(voice)
     if canon is None:
-        raise HTTPException(400, f"unknown Gemini voice {voice!r} (see /v1/gemini/voices)")
+        raise HTTPException(400, f"unknown Gemini voice {voice!r} "
+                                 "(see /v1/gemini/voices and /v1/gemini/languages)")
     return canon
+
+
+def _check_voice(voice: str, model: str, server_default: bool = False) -> None:
+    """A locale voice on a model not verified with it (only the 3.8 models
+    are) fails here, before any Gemini call: 400 for a voice the request chose,
+    500 for the server's own GEMINI_TTS_VOICE (a misconfiguration)."""
+    try:
+        check_voice(voice, model)
+    except GeminiVoiceUnsupportedError as exc:
+        if server_default:
+            raise HTTPException(500, f"server misconfigured: GEMINI_TTS_VOICE: {exc}") from exc
+        raise HTTPException(400, str(exc)) from exc
 
 
 def _lang(lang: str) -> str:
@@ -464,11 +479,14 @@ async def speak(
     With SPEAK_STORE=0 nothing is saved: misses are generated and returned
     only (the stateless upstream that edges cache from).
 
-    `voice` is a Gemini prebuilt voice name (case-insensitive). When given, only
-    a recording in that voice is served — words match the bare name ("Kore"),
-    phrases the bank voice `gemini-<voice>` — and a miss is generated in it.
-    When omitted, any banked recording serves (the default GEMINI_TTS_VOICE
-    first) and a miss is generated in the default voice.
+    `voice` is a classic Gemini voice name or a curated locale voice id
+    (/v1/gemini/languages), case-insensitive. When given, only a recording in
+    that voice is served — words match the bare label ("Kore",
+    "en-gb-tutor-11"), phrases the bank voice `gemini-<label>` — and a miss is
+    generated in it. When omitted, any banked recording serves (the default
+    GEMINI_TTS_VOICE first) and a miss is generated in the default voice. A
+    locale voice needs a 3.8 GEMINI_TTS_MODEL: on another model a miss is a
+    400 (bank hits still serve).
 
     `instruct` (style direction) makes the request a one-off: the bank has no
     key for style, so it is neither looked up nor saved. How it reaches Gemini
@@ -499,6 +517,7 @@ async def speak(
         if upstream:
             ogg, label = await _upstream_clip(upstream, text, lang, voice, instruct, bank_voice)
             return ogg, label, "upstream", None, None, {}
+        _check_voice(eff_voice, GEMINI_TTS_MODEL, server_default=not voice)
         style = None if instruct else _tts_style()   # a one-off's instruct replaces it
         ogg, pcm = await _gemini_clip(text, eff_voice, instruct, style)
         return ogg, bank_voice, "gemini", pcm, len(text), {"model": GEMINI_TTS_MODEL,
@@ -538,12 +557,14 @@ async def gemini_tts(
 ):
     """Generate a phrase with Gemini (a prebuilt voice) → WAV, to preview a
     voice. Nothing is saved. Needs GEMINI_API_KEY on the server.
-    `instruct` is routed like /v1/speak's (the style on 3.8 models, an inline
-    prefix on 3.1/2.5); `style` is a speech_metadata style, 3.8 models only
-    (400 otherwise). GEMINI_TTS_STYLE does not apply here."""
+    `voice` takes what /v1/speak's does; a locale voice with a non-3.8
+    `model` is a 400. `instruct` is routed like /v1/speak's (the style on 3.8
+    models, an inline prefix on 3.1/2.5); `style` is a speech_metadata style,
+    3.8 models only (400 otherwise). GEMINI_TTS_STYLE does not apply here."""
     if len(text) > MAX_TEXT_LEN:
         raise HTTPException(400, f"text exceeds {MAX_TEXT_LEN} characters")
     voice = _gemini_voice(voice) or GEMINI_TTS_VOICE
+    _check_voice(voice, model)
 
     def _gen():
         from wordbank.gemini_tts import pcm_to_wav_bytes, synthesize_pcm  # lazy: genai
@@ -565,10 +586,33 @@ async def gemini_tts(
 
 @app.get("/v1/gemini/voices")
 def gemini_voices():
-    """The prebuilt Gemini TTS voices (static list, name + style) that
-    /v1/speak and /v1/gemini/tts accept. Voices aren't language-bound — Gemini auto-detects language."""
+    """The 30 classic Gemini TTS voices (static list, name + style + gender),
+    which /v1/speak and /v1/gemini/tts accept on every model. They aren't
+    language-bound — Gemini auto-detects language. The curated per-language
+    voices are listed by /v1/gemini/languages."""
     from wordbank.gemini_tts import VOICES
     return {"voices": [{"name": n, "style": s, "gender": g} for n, s, g in VOICES]}
+
+
+@app.get("/v1/gemini/languages")
+def gemini_languages():
+    """The curated Gemini voices per language (wordbank/gemini_voices.json):
+    each bank `lang` code with one female and one male voice and their voice
+    library metadata. A voice's `name` is what /v1/speak and /v1/gemini/tts
+    take as `voice`, and the label clips are filed under (`gemini-<name>`).
+    `classic` marks the language-agnostic classic voices (en-us uses two);
+    the others are locale voices, which need a 3.8 model (`locale_voice_models`)."""
+    from wordbank.gemini_tts import locale_voice_models
+    from wordbank.languages import VOICE_LANGUAGES
+    return {
+        "languages": [{
+            "code": lang["code"], "name": lang["name"],
+            "voices": [{"name": canonical_voice(v["id"]), "classic": is_classic_voice(v["id"]),
+                        **{k: x for k, x in v.items() if k != "id"}}
+                       for v in lang["voices"]],
+        } for lang in VOICE_LANGUAGES],
+        "locale_voice_models": locale_voice_models(),
+    }
 
 
 # Optionally serve the static frontend from this server (same origin → relative

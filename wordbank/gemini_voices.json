@@ -1,0 +1,214 @@
+{
+ "source": "GET https://generativelanguage.googleapis.com/v1beta/voices",
+ "fetched": "2026-11-18",
+ "languages": [
+  {
+   "code": "en-us",
+   "name": "English (US)",
+   "voices": [
+    {
+     "id": "kore",
+     "gender": "female",
+     "display_name": "Kore",
+     "language_code": "en-US",
+     "accent": "General American",
+     "pitch": "medium",
+     "persona": "News & Podcast Host",
+     "description": "Firm, direct, and authoritative voice with a medium pitch. Recommended for news reports or official messages."
+    },
+    {
+     "id": "iapetus",
+     "gender": "male",
+     "display_name": "Iapetus",
+     "language_code": "en-US",
+     "accent": "General American",
+     "pitch": "low",
+     "persona": "Tech Support Agent",
+     "description": "Clear, crisp, and articulate voice with a lower-middle pitch. Recommended for help videos or onboarding walkthroughs."
+    }
+   ]
+  },
+  {
+   "code": "en-gb",
+   "name": "English (UK)",
+   "voices": [
+    {
+     "id": "en-gb-tutor-11",
+     "gender": "female",
+     "display_name": "Tutor 11",
+     "language_code": "en-GB",
+     "accent": "Winchester English",
+     "pitch": "medium",
+     "persona": "Educational Tutor (Music Teacher)",
+     "description": "59-year-old Music Teacher from Winchester. Speaks with a Winchester English accent. Currently in an oscar winning film. Voice is warm and engaging."
+    },
+    {
+     "id": "en-gb-tutor-14",
+     "gender": "male",
+     "display_name": "Tutor 14",
+     "language_code": "en-GB",
+     "accent": "Winchester English",
+     "pitch": "low",
+     "persona": "Educational Tutor",
+     "description": "32-year-old Tutor from Winchester. Speaks with a Winchester English accent. Currently on the phone. Sounds confident and clear."
+    }
+   ]
+  },
+  {
+   "code": "ru-ru",
+   "name": "Russian",
+   "voices": [
+    {
+     "id": "ru-ru-podcaster-1",
+     "gender": "female",
+     "display_name": "Podcaster 1",
+     "language_code": "ru-RU",
+     "accent": "Russian",
+     "pitch": "low",
+     "persona": "News & Podcast Host / Podcaster",
+     "description": "32-year-old Podcaster from Russia. Speaks Russian. Voice is warm and engaging."
+    },
+    {
+     "id": "ru-ru-concierge-1",
+     "gender": "male",
+     "display_name": "Concierge 1",
+     "language_code": "ru-RU",
+     "accent": "Russian",
+     "pitch": "low",
+     "persona": "Concierge & EA",
+     "description": "45-year-old Concierge from Russia. Speaks Russian. Voice is calm, polite, and clear."
+    }
+   ]
+  },
+  {
+   "code": "fr-fr",
+   "name": "French (France)",
+   "voices": [
+    {
+     "id": "fr-fr-tutor-12",
+     "gender": "female",
+     "display_name": "Tutor 12",
+     "language_code": "fr-FR",
+     "accent": "Paris French",
+     "pitch": "medium",
+     "persona": "Educational Tutor",
+     "description": "26-year-old Tutor from Paris. Speaks Paris French. Voice is light, airy, and precise"
+    },
+    {
+     "id": "fr-fr-tutor-10",
+     "gender": "male",
+     "display_name": "Tutor 10",
+     "language_code": "fr-FR",
+     "accent": "Paris French",
+     "pitch": "low",
+     "persona": "Educational Tutor",
+     "description": "30-year-old Tutor from Paris. Speaks Paris French. Currently at an appointment. Sounds confident and clear."
+    }
+   ]
+  },
+  {
+   "code": "de-de",
+   "name": "German",
+   "voices": [
+    {
+     "id": "de-de-tutor-2",
+     "gender": "female",
+     "display_name": "Tutor 2",
+     "language_code": "de-DE",
+     "accent": "German",
+     "pitch": "medium",
+     "persona": "Educational Tutor (Professor)",
+     "description": "34-year-old Professor from Germany. Speaks German. Voice is relaxed."
+    },
+    {
+     "id": "de-de-tutor-5",
+     "gender": "male",
+     "display_name": "Tutor 5",
+     "language_code": "de-DE",
+     "accent": "German",
+     "pitch": "low",
+     "persona": "Educational Tutor (Professor)",
+     "description": "44-year-old Professor from Germany. Speaks German. Currently at a meditation retreat. Sounds confident and clear."
+    }
+   ]
+  },
+  {
+   "code": "zh-cn",
+   "name": "Chinese (Mandarin)",
+   "voices": [
+    {
+     "id": "zh-cn-techagent-1",
+     "gender": "female",
+     "display_name": "Tech Advisor 1",
+     "language_code": "zh-CN",
+     "accent": "Mandarin",
+     "pitch": "high",
+     "persona": "Tech Support Agent / Tech Advisor",
+     "description": "23-year-old Tech Support Agent from Shanghai, China. Speaks Mandarin. Voice is bright, polite, and helpful."
+    },
+    {
+     "id": "zh-cn-concierge-1",
+     "gender": "male",
+     "display_name": "Concierge 1",
+     "language_code": "zh-CN",
+     "accent": "Mandarin",
+     "pitch": "low",
+     "persona": "Concierge & EA",
+     "description": "51-year-old Concierge from China. Speaks Mandarin. Voice is warm, straightforward, and welcoming."
+    }
+   ]
+  },
+  {
+   "code": "ja-jp",
+   "name": "Japanese",
+   "voices": [
+    {
+     "id": "ja-jp-tutor-1",
+     "gender": "female",
+     "display_name": "Tutor 1",
+     "language_code": "ja-JP",
+     "accent": "Tokyo Japanese",
+     "pitch": "medium",
+     "persona": "Video Voiceover & Host / Training Voiceover (Librarian)",
+     "description": "42-year-old Librarian from Tokyo. Speaks Tokyo Japanese. Tone is conversational, slightly dry humor, and warm"
+    },
+    {
+     "id": "ja-jp-tutor-4",
+     "gender": "male",
+     "display_name": "Tutor 4",
+     "language_code": "ja-JP",
+     "accent": "Tokyo Japanese",
+     "pitch": "low",
+     "persona": "Educational Tutor (Professor)",
+     "description": "24-year-old Professor from Tokyo. Speaks Tokyo Japanese. Currently on podcast. Tone is professional yet approachable."
+    }
+   ]
+  },
+  {
+   "code": "es-es",
+   "name": "Spanish (Spain)",
+   "voices": [
+    {
+     "id": "es-es-tutor-12",
+     "gender": "female",
+     "display_name": "Tutor 12",
+     "language_code": "es-ES",
+     "accent": "Castilian Spanish",
+     "pitch": "medium",
+     "persona": "Storyteller & Narrator (Therapist)",
+     "description": "41-year-old Therapist from Spain. Speaks Castilian Spanish (Castellano). Voice is intimate talkshow."
+    },
+    {
+     "id": "es-es-advisor-2",
+     "gender": "male",
+     "display_name": "Authoritative Advisor 2",
+     "language_code": "es-ES",
+     "accent": "Castilian Spanish",
+     "pitch": "low",
+     "persona": "High-Trust Advisor / Authoritative Advisor (Lawyer)",
+     "description": "38-year-old Lawyer from Spain. Speaks Castilian Spanish (Castellano). Tone is peer-to-peer and curious"
+    }
+   ]
+  }
+ ]
+}

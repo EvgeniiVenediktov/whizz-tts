@@ -118,6 +118,10 @@
     <datalist id="bank-suggest"></datalist>
   </label>
   <label class="field-label">
+    Language <span style="color:#444;text-transform:none;letter-spacing:0;font-size:0.75rem">— bank language for lookup and Speak; lists its two voices below</span>
+    <select id="bank-lang"><option value="en-us">English (US)</option></select>
+  </label>
+  <label class="field-label">
     Speak voice <span style="color:#444;text-transform:none;letter-spacing:0;font-size:0.75rem">— Gemini voice for Speak; “any” serves whatever is banked, else generates in the default voice</span>
     <select id="bank-voice"><option value="">— any banked / default —</option></select>
   </label>
@@ -153,10 +157,13 @@
     <textarea id="g-text">this was such a unique experience</textarea>
   </label>
 
+  <label class="field-label">Language <span style="color:#444;text-transform:none;letter-spacing:0;font-size:0.75rem">— lists its two voices</span>
+    <select id="g-lang"><option value="en-us">English (US)</option></select>
+  </label>
   <label class="field-label">Voice
     <select id="g-voice"><option value="Kore">Kore — Firm</option></select>
   </label>
-  <p class="hint" style="margin-top:-8px">A voice is a <em>style</em> preset and speaks any language — Gemini auto-detects language from your phrase.</p>
+  <p class="hint" style="margin-top:-8px">Classic voices are <em>style</em> presets that speak any language; a language’s own voices carry its accent (3.8 models only). Gemini auto-detects the language from your phrase.</p>
 
   <label class="field-label">
     Instruct <span style="color:#444;text-transform:none;letter-spacing:0;font-size:0.75rem">optional accent/style, e.g. “British accent” (not spoken)</span>
@@ -222,6 +229,8 @@
   const wavSize = document.getElementById('wav-size');
   const oggSize = document.getElementById('ogg-size');
   const oggMissing = document.getElementById('ogg-missing');
+  const bankLang = document.getElementById('bank-lang');
+  const langQ = () => `lang=${encodeURIComponent(bankLang.value)}`;
 
   const kb = b => b == null ? '' : `(${(b / 1024).toFixed(1)} KB)`;
 
@@ -234,7 +243,7 @@
     if (!p) { bankList.innerHTML = ''; return; }
     suggestTimer = setTimeout(async () => {
       try {                                    // merged: words + phrases, tagged
-        const res = await fetch(`${SEARCH}?prefix=${encodeURIComponent(p)}&limit=10`);
+        const res = await fetch(`${SEARCH}?prefix=${encodeURIComponent(p)}&limit=10&${langQ()}`);
         const { results } = await res.json();
         bankList.innerHTML = results.map(r =>
           `<option value="${esc(r.text)}" label="${r.type}${r.voice ? ' · ' + r.voice : ''}">`).join('');
@@ -244,10 +253,10 @@
 
   // Resolve a text to its bank entry: try the word bank, then the phrase bank.
   async function entryInfo(text) {
-    let r = await fetch(`${BANK}/${encodeURIComponent(text)}/info`);
-    if (r.ok) return { info: await r.json(), url: f => `${BANK}/${encodeURIComponent(text)}?format=${f}` };
-    r = await fetch(`${PHRASE}/info?text=${encodeURIComponent(text)}`);
-    if (r.ok) return { info: await r.json(), url: f => `${PHRASE}?text=${encodeURIComponent(text)}&format=${f}` };
+    let r = await fetch(`${BANK}/${encodeURIComponent(text)}/info?${langQ()}`);
+    if (r.ok) return { info: await r.json(), url: f => `${BANK}/${encodeURIComponent(text)}?format=${f}&${langQ()}` };
+    r = await fetch(`${PHRASE}/info?text=${encodeURIComponent(text)}&${langQ()}`);
+    if (r.ok) return { info: await r.json(), url: f => `${PHRASE}?text=${encodeURIComponent(text)}&format=${f}&${langQ()}` };
     return null;
   }
 
@@ -298,7 +307,7 @@
 
   async function refreshSuggestions(prefix) {
     try {                                    // merged: words + phrases, tagged
-      const res = await fetch(`${SEARCH}?prefix=${encodeURIComponent(prefix)}&limit=10`);
+      const res = await fetch(`${SEARCH}?prefix=${encodeURIComponent(prefix)}&limit=10&${langQ()}`);
       const { results } = await res.json();
       bankList.innerHTML = results.map(r =>
         `<option value="${esc(r.text)}" label="${r.type}${r.voice ? ' · ' + r.voice : ''}">`).join('');
@@ -313,6 +322,7 @@
     try {
       const form = new FormData();
       form.append('text', text);
+      form.append('lang', bankLang.value);
       const voice = document.getElementById('bank-voice').value;
       if (voice) form.append('voice', voice);
       const res = await fetch(SPEAK, { method: 'POST', headers: authHeaders(), body: form });
@@ -341,26 +351,52 @@
   }
   bankSpeakBtn.addEventListener('click', speakBank);
 
-  // ---- Gemini voice studio ----  // ---- Saved voice references + Gemini voice studio ----
-  // Populate the Gemini voice dropdowns (studio + Speak) — 30 style presets,
-  // not language-bound. Grouped Female / Male (community-perceived gender).
+  // ---- Gemini voices (studio + Speak) ----
+  // Per language: its two curated voices (/v1/gemini/languages), then the 30
+  // classic style presets, which speak any language, grouped Female / Male.
+  let voiceLangs = [], classicVoices = [];
+  const voiceOpt = (v, label) =>
+    `<option value="${v.name}" title="${esc(v.description || '')}">${label}</option>`;
+  function voiceOptions(code) {
+    const lang = voiceLangs.find(l => l.code === code);
+    const own = lang ? lang.voices : [];
+    const classic = (label, gender) => {
+      const items = classicVoices.filter(v => v.gender === gender && !own.some(o => o.name === v.name));
+      return items.length ? `<optgroup label="${label}">` + items.map(v =>
+        voiceOpt(v, `${v.name} — ${v.style}`)).join('') + '</optgroup>' : '';
+    };
+    return (own.length ? `<optgroup label="${lang.name}">` + own.map(v =>
+        voiceOpt(v, `${v.gender}: ${v.display_name} — ${v.accent}${v.classic ? '' : ` (${v.name})`}`)).join('')
+        + '</optgroup>' : '')
+      + classic('Classic female (any language)', 'female') + classic('Classic male (any language)', 'male');
+  }
+  const gLang = document.getElementById('g-lang');
+  const gVoice = document.getElementById('g-voice');
+  const speakVoice = document.getElementById('bank-voice');
+  const anyVoice = speakVoice.options[0].outerHTML;
+  function showStudioVoices() {
+    const lang = voiceLangs.find(l => l.code === gLang.value);
+    gVoice.innerHTML = voiceOptions(gLang.value);
+    gVoice.value = lang ? lang.voices[0].name : 'Kore';
+  }
+  function showSpeakVoices() {
+    speakVoice.innerHTML = anyVoice + voiceOptions(bankLang.value);
+  }
   async function loadGeminiVoices() {
     try {
-      const res = await fetch(`${API_BASE}/v1/gemini/voices`);
-      const { voices } = await res.json();
-      const group = (label, gender) => {
-        const items = voices.filter(v => v.gender === gender);
-        return items.length ? `<optgroup label="${label}">` + items.map(v =>
-          `<option value="${v.name}">${v.name} — ${v.style}</option>`).join('') + '</optgroup>' : '';
-      };
-      const options = group('Female', 'female') + group('Male', 'male');
-      const sel = document.getElementById('g-voice');
-      sel.innerHTML = options;
-      sel.value = 'Kore';
-      const speakSel = document.getElementById('bank-voice');
-      speakSel.innerHTML = speakSel.options[0].outerHTML + options;
+      classicVoices = (await (await fetch(`${API_BASE}/v1/gemini/voices`)).json()).voices;
+      const res = await fetch(`${API_BASE}/v1/gemini/languages`);
+      if (res.ok) voiceLangs = (await res.json()).languages;
     } catch { /* keep the default options */ }
+    if (voiceLangs.length) {
+      const langOpts = voiceLangs.map(l => `<option value="${l.code}">${l.name}</option>`).join('');
+      gLang.innerHTML = bankLang.innerHTML = langOpts;
+      gLang.value = bankLang.value = 'en-us';
+    }
+    if (classicVoices.length) { showStudioVoices(); showSpeakVoices(); }
   }
+  gLang.addEventListener('change', showStudioVoices);
+  bankLang.addEventListener('change', () => { showSpeakVoices(); bankList.innerHTML = ''; });
   loadGeminiVoices();
 
   // Timer bound to a given element id.
