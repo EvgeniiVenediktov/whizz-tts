@@ -231,6 +231,8 @@
   const oggMissing = document.getElementById('ogg-missing');
   const bankLang = document.getElementById('bank-lang');
   const langQ = () => `lang=${encodeURIComponent(bankLang.value)}`;
+  // Look up the voice picked for Speak too: a language can have several voices.
+  const voiceQ = () => { const v = document.getElementById('bank-voice').value; return v ? `&voice=${encodeURIComponent(v)}` : ''; };
 
   const kb = b => b == null ? '' : `(${(b / 1024).toFixed(1)} KB)`;
   // Server strings (bank texts, voice labels) only ever reach the page as
@@ -247,12 +249,12 @@
   // Resolve a text to its bank entry: try the word bank (public), then the
   // phrase bank (needs the token, so its audio is fetched and played as a blob).
   async function entryInfo(text) {
-    let r = await fetch(`${BANK}/${encodeURIComponent(text)}/info?${langQ()}`);
-    if (r.ok) return { info: await r.json(), url: async f => `${BANK}/${encodeURIComponent(text)}?format=${f}&${langQ()}` };
-    r = await fetch(`${PHRASE}/info?text=${encodeURIComponent(text)}&${langQ()}`, { headers: authHeaders() });
+    let r = await fetch(`${BANK}/${encodeURIComponent(text)}/info?${langQ()}${voiceQ()}`);
+    if (r.ok) return { info: await r.json(), url: async f => `${BANK}/${encodeURIComponent(text)}?format=${f}&${langQ()}${voiceQ()}` };
+    r = await fetch(`${PHRASE}/info?text=${encodeURIComponent(text)}&${langQ()}${voiceQ()}`, { headers: authHeaders() });
     if (r.status === 401) throw new Error(await readError(r));
     if (r.ok) return { info: await r.json(), url: async f => {
-      const a = await fetch(`${PHRASE}?text=${encodeURIComponent(text)}&format=${f}&${langQ()}`, { headers: authHeaders() });
+      const a = await fetch(`${PHRASE}?text=${encodeURIComponent(text)}&format=${f}&${langQ()}${voiceQ()}`, { headers: authHeaders() });
       if (!a.ok) throw new Error(await readError(a));
       return URL.createObjectURL(await a.blob());
     } };
