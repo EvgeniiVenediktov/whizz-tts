@@ -4,8 +4,8 @@ JSONL keyed by manifest id, so each result maps 1:1 to its word whatever the
 order. The PCM (gemini_tts.pcm_from_payload) is written as a WAV master as is;
 OGG encoding is scripts/encode_wavs.py's separate pass. Directions are routed
 per model (gemini_tts.route_direction): an inline prefix on 3.1/2.5, the
-part's speechMetadata.style on 3.8 (documented, not yet tried live: run
-scripts/gemini_batch_smoke.py first).
+part's speechMetadata.style on 3.8 (verified live on gemini-3.8-flash-tts;
+scripts/gemini_batch_smoke.py checks another model or voice first).
 
 QC (wordbank/qc.py): a flagged clip can't be re-taken on the spot, so its row
 becomes RETAKE (best take at qc.retake_path) for the next submission with the

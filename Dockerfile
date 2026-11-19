@@ -75,8 +75,8 @@ EXPOSE 8000
 # base image (python:3.12-slim), so use a stdlib-only check: urllib raises on any non-2xx status (including the
 # 503 above), which makes `python -c` exit non-zero — no explicit status parsing
 # needed.
-#   --start-period=300s: first boot may need to unpack a ~129 MB archive of
-#     ~48,000 small OGG files (docker-entrypoint.sh) before the server even
+#   --start-period=300s: first boot may need to unpack a ~370 MB archive of
+#     ~144,000 small OGG files (docker-entrypoint.sh) before the server even
 #     starts listening. Locally that extraction is ~1s on fast disk, but many
 #     tiny-file creates can take minutes on network-backed volumes (EBS/EFS/NFS)
 #     — 5 minutes gives real headroom without permanently marking a legitimately

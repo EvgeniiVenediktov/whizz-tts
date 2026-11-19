@@ -5,7 +5,7 @@ Confirms, against a real key:
   - results carry base64 PCM keyed back to each request;
   - the voice instruction is NOT spoken (listen to the WAVs);
   - with --style on a 3.8 model, the batch honours the part's speechMetadata
-    style (documented, not yet tried live) and still speaks only the word;
+    style (verified on gemini-3.8-flash-tts) and still speaks only the word;
   - audio decodes and writes to WAV (no ffmpeg).
 
 Requires GEMINI_API_KEY (or GOOGLE_API_KEY).

@@ -421,8 +421,8 @@ python scripts/encode_wavs.py output/words output/words_ogg   # OGG copies
 python -m wordbank status                                     # progress (words + phrases)
 
 # Word bank with a delivery style (3.8 models only; keeps them from acting out
-# "haha", "laughing", "russian"). Batch carries it as speechMetadata (documented,
-# smoke-test first: scripts/gemini_batch_smoke.py --model … --style "…"):
+# "haha", "laughing", "russian"). Batch carries it as speechMetadata (verified on
+# gemini-3.8-flash-tts; for another model, scripts/gemini_batch_smoke.py first):
 GEMINI_API_KEY=… python -m wordbank --lang en-gb batch-run --words words.txt \
     --model gemini-3.8-flash-lite-tts --voice en-gb-tutor-11 --style "plain and neutral"
 # …or synchronously (Interactions API, verified), rate-limited, resumable:
