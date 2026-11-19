@@ -4,7 +4,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 from wordbank.lookup import BankLookup
-from wordbank.manifest import DONE, VERIFIED, Manifest
+from wordbank.manifest import DONE, Manifest
 
 
 def _phrase_manifest(db):
@@ -46,9 +46,7 @@ def _seed(db):
     # camel left pending → not ready
     pm.add_words(["cathedral bells"], "en-us", voice="en-gb")
     pid = pm.iter_rows()[0]["id"]
-    pm.set_status(pid, VERIFIED, file_path="en-us/local-en-gb/0/1_cathedral.wav",
-                  voice="en-gb", seed=1234, ref_audio="refs/en-gb/ref.wav",
-                  ref_text="the quick brown fox")
+    pm.set_status(pid, DONE, file_path="en-us/gemini-en-gb/0/1_cathedral.wav", voice="en-gb")
     wm.close()
     pm.close()
 
@@ -69,34 +67,10 @@ def test_search_merges_and_tags(tmp_path):
     assert bl.get("cat", "en-us")["voice"] == "Kore"       # voice on word result
     ph = bl.get_phrase("cathedral bells", "en-us")
     assert ph["voice"] == "en-gb" and ph["file_path"].endswith("1_cathedral.wav")
-    assert ph["seed"] == 1234 and ph["ref_audio"] == "refs/en-gb/ref.wav"
-    assert ph["ref_text"] == "the quick brown fox"       # reproducibility provenance
     assert bl.get_phrase("nope", "en-us") is None
     assert bl.phrase_languages() == [{"code": "en-us", "words": 1}]
     bl.close()
 
-
-def test_lookup_handles_bank_without_phrases(tmp_path):
-    """A pre-phrases bank (no `phrases` table, no `voice` col) degrades gracefully."""
-    import sqlite3
-    db = str(tmp_path / "old.db")
-    conn = sqlite3.connect(db)
-    conn.execute("CREATE TABLE words (id INTEGER PRIMARY KEY, word TEXT, lang TEXT, "
-                 "status TEXT, file_path TEXT)")
-    conn.execute("INSERT INTO words (word, lang, status, file_path) VALUES "
-                 "('cat','en-us','done','en-us/x/0/1_cat.wav')")
-    conn.commit()
-    conn.close()
-    bl = BankLookup(db)
-    hits = bl.search("ca", "en-us", 10)
-    assert hits == [{"text": "cat", "type": "word", "voice": None}]
-    assert bl.get("cat", "en-us")["voice"] is None
-    assert bl.get_phrase("cat", "en-us") is None
-    assert bl.phrase_languages() == []
-    bl.close()
-
-
-# ---- server: /v1/search, phrase serving, voice/type on info ----
 
 @pytest.fixture
 def search_client(tmp_path, monkeypatch):
@@ -117,9 +91,8 @@ def search_client(tmp_path, monkeypatch):
     wm.set_status(wm.iter_rows()[0]["id"], DONE,
                   file_path="en-us/gemini-Kore/0/1_cat.wav", voice="Kore")
     pm.add_words(["hello world"], "en-us", voice="en-gb")
-    pm.set_status(pm.iter_rows()[0]["id"], VERIFIED,
-                  file_path="en-us/local-en-gb/0/1_hello.wav", voice="en-gb",
-                  seed=7, ref_audio="refs/en-gb/ref.wav", ref_text="fox")
+    pm.set_status(pm.iter_rows()[0]["id"], DONE,
+                  file_path="en-us/local-en-gb/0/1_hello.wav", voice="en-gb")
     wm.close()
     pm.close()
 
@@ -143,8 +116,6 @@ def test_search_returns_words_and_phrases(search_client):
 def test_phrase_info_endpoint(search_client):
     pinfo = search_client.get("/v1/phrase/info", params={"text": "hello world", "lang": "en-us"}).json()
     assert pinfo["type"] == "phrase" and pinfo["voice"] == "en-gb" and pinfo["ogg"]["exists"]
-    assert pinfo["seed"] == 7 and pinfo["ref_audio"] == "refs/en-gb/ref.wav"
-    assert pinfo["ref_text"] == "fox"
 
 
 def test_phrase_audio_endpoint(search_client):

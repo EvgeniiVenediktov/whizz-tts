@@ -40,7 +40,7 @@ def main() -> None:
     args = p.parse_args()
 
     # VOICE_INSTRUCTION only where it stays unspoken; GeminiBatch routes the rest
-    instruction = VOICE_INSTRUCTION if model_caps(args.model).inline else ""
+    instruction = VOICE_INSTRUCTION if not model_caps(args.model).style else ""
     batch = GeminiBatch(model=args.model, voice=args.voice, instruction=instruction,
                         style=args.style)
     rows = [{"id": i, "word": w} for i, w in enumerate(WORDS, start=1)]

@@ -4,7 +4,7 @@ import pathlib
 import shutil
 
 from wordbank.library import describe, verify
-from wordbank.manifest import DONE, VERIFIED, Manifest
+from wordbank.manifest import DONE, Manifest
 
 
 def _seed_root(root, db=None, ogg_root=None):
@@ -23,7 +23,7 @@ def _seed_root(root, db=None, ogg_root=None):
         wm.set_status(r["id"], DONE,
                       file_path=f"en-us/gemini-Kore/0/{r['id']}_{r['word']}.wav", voice="Kore")
     pm.add_words(["hello world"], "en-us", voice="en-gb")
-    pm.set_status(pm.iter_rows()[0]["id"], VERIFIED,
+    pm.set_status(pm.iter_rows()[0]["id"], DONE,
                   file_path="en-us/local-en-gb/0/1_hello.wav", voice="en-gb")
     wm.close()
     pm.close()
@@ -87,14 +87,11 @@ def test_verify_detects_missing_ogg_and_missing_folder(tmp_path):
     assert str(tmp_path / "words_ogg") in missing          # names where it looked
 
 
-def test_verify_resolves_other_listed_folders_under_root(tmp_path):
-    """Descriptions packed before clone references were removed list a `voices`
-    folder; the entrypoint still unpacks it, so it is checked under --root."""
+def test_verify_ignores_folders_nothing_serves(tmp_path):
+    """Older descriptions also list a `voices` folder: not required."""
     _seed_root(tmp_path)
     desc = _describe(tmp_path)
     (tmp_path / "library.json").write_text(json.dumps({**desc, "folders": ["words_ogg", "voices"]}))
-    assert any("missing folder: voices" in p for p in verify(str(tmp_path / "library.json"), str(tmp_path)))
-    (tmp_path / "voices").mkdir()
     assert verify(str(tmp_path / "library.json"), str(tmp_path)) == []
 
 

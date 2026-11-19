@@ -52,8 +52,8 @@ def verify(desc_path: str, root: Optional[str] = None, *, db: Optional[str] = No
         `root/"words_ogg"` (matches docker-entrypoint.sh).
       - else: the same defaults the server uses — $BANK_DB (default
         "wordbank.db"), $OGG_ROOT (default "output/words_ogg").
-    Other listed folders (e.g. "voices" in descriptions written before clone
-    references were removed) resolve under `root`.
+    Only words_ogg is checked: older descriptions also list a "voices" folder,
+    which nothing serves any more.
     """
     dp = pathlib.Path(desc_path)
     if not dp.exists():
@@ -68,19 +68,10 @@ def verify(desc_path: str, root: Optional[str] = None, *, db: Optional[str] = No
         ogg_root = str(root_path / "words_ogg") if root_path is not None \
             else os.getenv("OGG_ROOT", "output/words_ogg")
 
-    resolved = {"words_ogg": pathlib.Path(ogg_root)}
-
     problems: List[str] = []
-    for folder in desc.get("folders", []):
-        if folder in resolved:
-            path = resolved[folder]
-        elif root_path is not None:
-            path = root_path / folder
-        else:
-            problems.append(f"cannot resolve folder: {folder} (no --root and not a known folder)")
-            continue
-        if not path.is_dir():
-            problems.append(f"missing folder: {folder} (looked in {path.resolve()})")
+    tree = pathlib.Path(ogg_root)
+    if not tree.is_dir():
+        problems.append(f"missing folder: words_ogg (looked in {tree.resolve()})")
 
     db_path = pathlib.Path(db)
     bl = BankLookup(db)
@@ -92,7 +83,6 @@ def verify(desc_path: str, root: Optional[str] = None, *, db: Optional[str] = No
     if "phrases" in desc and phrases < desc["phrases"]:
         problems.append(f"phrase count {phrases} < expected {desc['phrases']} (db: {db_path.resolve()})")
     if "ogg_files" in desc:
-        tree = pathlib.Path(ogg_root)
         n = sum(1 for _ in tree.rglob("*.ogg")) if tree.is_dir() else 0
         if n < desc["ogg_files"]:
             problems.append(

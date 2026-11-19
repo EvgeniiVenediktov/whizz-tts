@@ -1,6 +1,6 @@
 """Word-bank CLI:  python -m wordbank <command> ...
 
-Commands: batch / batch-submit / batch-collect / batch-run (Gemini async) ·
+Commands: batch-submit / batch-collect / batch-run (Gemini async) ·
 gemini-run (Gemini sync, rate-limited) · regenerate (back up + reset words) ·
 qc (check clips, re-take flagged ones) · describe / verify (deployment library
 description) · status · export.
@@ -19,7 +19,7 @@ import sys
 from typing import List, Optional, Tuple
 
 from .config import Config
-from .gemini_tts import DEFAULT_MODEL as GEMINI_TTS_DEFAULT_MODEL   # stdlib-only import
+from .gemini_tts import DEFAULT_MODEL as GEMINI_TTS_DEFAULT_MODEL, voice_label   # stdlib-only
 from .languages import normalize_lang
 from .manifest import RETAKE, Manifest
 from .qc import DEFAULT_RETRIES as QC_DEFAULT_RETRIES
@@ -74,16 +74,14 @@ _VOICE_HELP = ("Gemini voice: a classic name (Kore), or a library id like en-gb-
                "(3.8 models only), filed as gemini-<voice>")
 
 
-def _add_gemini_args(p, *, words=True, instruction=True, chunk=True, poll=True):
-    """Common args for the Gemini batch subcommands (which differ only slightly).
-    Collecting commands (poll) also take --qc-retries."""
-    if words:
+def _add_gemini_args(p, *, submit=True, poll=True):
+    """Args of the Gemini batch subcommands: submitting ones take the words,
+    voice, model and direction; collecting ones (poll) --qc-retries."""
+    if submit:
         p.add_argument("--words", required=True, help="text file, one word per line")
-    p.add_argument("--voice", default="Kore", help=_VOICE_HELP)
-    p.add_argument("--model", default="gemini-3.1-flash-tts-preview")
-    if instruction:
+        p.add_argument("--voice", default="Kore", type=voice_label, help=_VOICE_HELP)
+        p.add_argument("--model", default="gemini-3.1-flash-tts-preview")
         _add_direction_args(p)
-    if chunk:
         p.add_argument("--chunk", type=int, default=2000, help="words per batch job")
     if poll:
         p.add_argument("--poll-interval", type=int, default=60, dest="poll_interval")
@@ -107,26 +105,28 @@ def _direction_args(args) -> Tuple[str, Optional[str]]:
         return args.instruction, style
     if style:
         return "", style
-    if caps.inline:
+    if not caps.style:
         return VOICE_INSTRUCTION, None
     sys.exit(f"{args.model} reads inline instructions aloud, so the default --instruction "
              "is not sent to it: pass --style \"...\" for a delivery direction (speech "
              "metadata), or --instruction= for the bare word")
 
 
-def _check_voice_args(args) -> None:
-    """Canonicalize --voice to its bank label (gemini_tts.voice_label: rows key
-    on it) and exit before anything is ingested or sent when it isn't one path
-    segment, or is a locale voice (not one of the 30 classic) and --model isn't
-    verified with those: only the 3.8 models are (gemini_tts.TTS_MODELS)."""
-    from .gemini_run import check_voice_name
-    from .gemini_tts import check_voice, voice_label
-    args.voice = voice_label(args.voice)
+def _check_voice(voice: str, model: str, flag: str = "--voice") -> None:
+    """Exit before anything is ingested or sent when `voice` isn't one path
+    segment, or is a locale voice `model` isn't verified with (check_voice)."""
+    from .gemini_tts import check_voice
+    from .paths import check_segment
     try:
-        check_voice_name(args.voice)
-        check_voice(args.voice, args.model)
+        check_segment(voice)
+        check_voice(voice, model)
     except ValueError as exc:               # GeminiVoiceUnsupportedError included
-        sys.exit(f"--voice: {exc}")
+        sys.exit(f"{flag}: {exc}")
+
+
+def _require_db(cfg: Config) -> None:
+    if not os.path.isfile(cfg.db):
+        sys.exit(f"no word bank at {cfg.db} (pass --db)")
 
 
 def _print_totals(m: Manifest) -> None:
@@ -140,15 +140,10 @@ def _print_totals(m: Manifest) -> None:
               "and --style/--instruction, or re-take them now with `qc --retry`")
 
 
-def _make_batch(args, *, submit: bool = True):
-    """The GeminiBatch for a command; `submit=False` (collect only) needs no
-    direction or voice check, since no request is built."""
+def _make_batch(args):
+    """The GeminiBatch a submitting command sends with (voice and direction checked)."""
     from .gemini_batch import GeminiBatch
-    from .gemini_tts import voice_label
-    if not submit:
-        args.voice = voice_label(args.voice)
-        return GeminiBatch(model=args.model, voice=args.voice, instruction="")
-    _check_voice_args(args)
+    _check_voice(args.voice, args.model)
     instruction, style = _direction_args(args)
     return GeminiBatch(model=args.model, voice=args.voice, instruction=instruction,
                        style=style)
@@ -163,34 +158,17 @@ def cmd_batch_submit(args, cfg: Config) -> None:
     jobs = submit_pending(m, batch, lang=cfg.lang, chunk=args.chunk)
     print(f"\nsubmitted {len(jobs)} batch job(s): {jobs}")
     print("job ids saved in the manifest. Collect later (jobs expire after 48h) with:")
-    print(f"  python -m wordbank --db {cfg.db} --out {cfg.out_dir} "
-          f"batch-collect --voice {args.voice}")
+    print(f"  python -m wordbank --db {cfg.db} --out {cfg.out_dir} batch-collect")
     m.close()
 
 
 def cmd_batch_collect(args, cfg: Config) -> None:
     """Poll in-flight job(s) and write finished clips. Run after a reboot."""
-    from .gemini_batch import collect_active
+    from .gemini_batch import GeminiBatch, collect_active
 
     m = Manifest(cfg.db)
-    collect_active(
-        m, _make_batch(args, submit=False), cfg.out_dir, lang=cfg.lang, voice=args.voice,
-        poll_interval=args.poll_interval, qc_retries=args.qc_retries,
-    )
-    _print_totals(m)
-    m.close()
-
-
-def cmd_batch(args, cfg: Config) -> None:
-    """Blocking convenience: submit then poll+collect in one process."""
-    from .gemini_batch import run_batch
-
-    batch = _make_batch(args)
-    m = _ingest(cfg, args.words, args.voice)
-    run_batch(
-        m, batch, cfg.out_dir, lang=cfg.lang, voice=args.voice,
-        chunk=args.chunk, poll_interval=args.poll_interval, qc_retries=args.qc_retries,
-    )
+    collect_active(m, GeminiBatch(instruction=""), cfg.out_dir,
+                   poll_interval=args.poll_interval, qc_retries=args.qc_retries)
     _print_totals(m)
     m.close()
 
@@ -202,7 +180,7 @@ def cmd_batch_run(args, cfg: Config) -> None:
     batch = _make_batch(args)
     m = _ingest(cfg, args.words, args.voice)
     run_in_waves(
-        m, batch, cfg.out_dir, lang=cfg.lang, voice=args.voice,
+        m, batch, cfg.out_dir, lang=cfg.lang,
         chunk=args.chunk, poll_interval=args.poll_interval, qc_retries=args.qc_retries,
     )
     _print_totals(m)
@@ -213,7 +191,7 @@ def cmd_gemini_run(args, cfg: Config) -> None:
     """Sync, rate-limited Gemini generation of pending words (resumable)."""
     from .gemini_run import run_sync
 
-    _check_voice_args(args)
+    _check_voice(args.voice, args.model)
     instruction, style = _direction_args(args)
     m = _ingest(cfg, args.words, args.voice) if args.words else Manifest(cfg.db)
     try:
@@ -279,12 +257,8 @@ def cmd_regenerate(args, cfg: Config) -> None:
     reset its row to pending, for gemini-run / batch-run to generate again.
     --voice limits it to that voice's rows; without it, every voice's."""
     words = _load_words(args.words_file)
-    if not os.path.isfile(cfg.db):
-        sys.exit(f"no word bank at {cfg.db} (pass --db)")
-    voice = None
-    if args.voice:
-        from .gemini_tts import voice_label
-        voice = voice_label(args.voice)
+    _require_db(cfg)
+    voice = args.voice
     bank = f"{cfg.lang} word bank" + (f" in voice {voice}" if voice else "")
     m = Manifest(cfg.db)
     try:
@@ -328,14 +302,10 @@ def cmd_qc(args, cfg: Config) -> None:
     replaced one moved to <db dir>/takes/<UTC>/."""
     import wave
     from . import qc
-    from .manifest import DONE, VERIFIED
+    from .manifest import DONE
 
-    if not os.path.isfile(cfg.db):
-        sys.exit(f"no word bank at {cfg.db} (pass --db)")
-    voice = None
-    if args.voice:
-        from .gemini_tts import voice_label
-        voice = voice_label(args.voice)
+    _require_db(cfg)
+    voice = args.voice
     lang = None if args.all_langs else cfg.lang
     scope = f"{lang or 'every language'}, {f'voice {voice}' if voice else 'every voice'}"
     out = pathlib.Path(cfg.out_dir)
@@ -348,7 +318,7 @@ def cmd_qc(args, cfg: Config) -> None:
     m = Manifest(cfg.db)
     try:
         in_scope = [r for r in m.iter_rows()
-                    if r["status"] in (DONE, VERIFIED, RETAKE) and r["file_path"]
+                    if r["status"] in (DONE, RETAKE) and r["file_path"]
                     and (lang is None or r["lang"] == lang) and (voice is None or r["voice"] == voice)]
         if args.accept_file:
             keep = set(_load_words(args.accept_file))
@@ -408,18 +378,13 @@ def _qc_retakes(args, cfg: Config, m: Manifest, flagged, checks, final, clip) ->
     (row id -> Check). -> (take dir, number of bank clips it replaced)."""
     from . import qc
     from .gemini_batch import _write_and_mark
-    from .gemini_run import best_of_takes, check_voice_name, sync_session
-    from .gemini_tts import check_voice
+    from .gemini_run import best_of_takes, sync_session
     from .paths import voice_from_path
 
     instruction, style = _direction_args(args)
     voice_of = {r["id"]: r["voice"] or voice_from_path(r["file_path"]) for r in flagged}
     for v in sorted({v for v in voice_of.values() if v}):
-        try:
-            check_voice_name(v)
-            check_voice(v, args.model)
-        except ValueError as exc:
-            sys.exit(f"--retry: {exc}")
+        _check_voice(v, args.model, "--retry")
     take, sent_style, inline = sync_session(model=args.model, instruction=instruction,
                                             style=style, rpm=args.rpm)
     direction = sent_style or inline or None
@@ -503,8 +468,7 @@ def cmd_export(args, cfg: Config) -> None:
     rows = m.iter_rows()
     out = open(args.output, "w", newline="", encoding="utf-8") if args.output else sys.stdout
     writer = csv.writer(out)
-    cols = ["id", "word", "lang", "voice", "status", "attempts", "file_path", "transcript",
-            "billed_chars", "error", "model", "style", "review", "qc_seconds", "qc_end_db",
+    cols = ["id", "word", "lang", "voice", "status", "attempts", "file_path", "billed_chars", "error", "model", "style", "review", "qc_seconds", "qc_end_db",
             "qc_takes"]
     writer.writerow(cols)
     for r in rows:
@@ -523,10 +487,6 @@ def main(argv=None) -> None:
     p.add_argument("--lang", default=cfg.lang, type=normalize_lang)  # a path segment of every clip
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    g = sub.add_parser("batch", help="generate via Gemini Batch API (async, ~half cost)")
-    _add_gemini_args(g)
-    g.set_defaults(func=cmd_batch)
-
     bs = sub.add_parser("batch-submit",
                         help="submit async job(s) and exit — safe to power off after")
     _add_gemini_args(bs, poll=False)
@@ -534,7 +494,7 @@ def main(argv=None) -> None:
 
     bc = sub.add_parser("batch-collect",
                         help="poll in-flight job(s) and write clips (run in the morning)")
-    _add_gemini_args(bc, words=False, instruction=False, chunk=False)
+    _add_gemini_args(bc, submit=False)
     bc.set_defaults(func=cmd_batch_collect)
 
     br = sub.add_parser("batch-run",
@@ -548,7 +508,7 @@ def main(argv=None) -> None:
     gr.add_argument("--words", default=None,
                     help="text file, one word per line, added first (default: just "
                          "generate what the manifest has pending, e.g. after regenerate)")
-    gr.add_argument("--voice", default="Kore", help=_VOICE_HELP)
+    gr.add_argument("--voice", default="Kore", type=voice_label, help=_VOICE_HELP)
     gr.add_argument("--model", default=GEMINI_TTS_DEFAULT_MODEL,
                     help=f"Gemini TTS model (default {GEMINI_TTS_DEFAULT_MODEL})")
     _add_direction_args(gr)
@@ -564,7 +524,7 @@ def main(argv=None) -> None:
                              "and reset them to pending")
     rg.add_argument("--words-file", required=True, dest="words_file",
                     help="text file, one word per line (words not in the bank are reported)")
-    rg.add_argument("--voice", default=None,
+    rg.add_argument("--voice", default=None, type=voice_label,
                     help="only this voice's rows (default: every voice the word is banked in)")
     rg.add_argument("--ogg-root", default=None, dest="ogg_root",
                     help="OGG tree to take the encoded copies from too, e.g. output/words_ogg")
@@ -573,7 +533,7 @@ def main(argv=None) -> None:
     q = sub.add_parser("qc",
                        help="check the clips (ends on sound, implausible length), record "
                             "flags; --retry re-takes flagged words until they pass")
-    q.add_argument("--voice", default=None, help="only this voice's clips (default: every voice)")
+    q.add_argument("--voice", default=None, type=voice_label, help="only this voice's clips (default: every voice)")
     q.add_argument("--all-langs", action="store_true", dest="all_langs",
                    help="every language, not just --lang")
     q.add_argument("--csv", default=None,

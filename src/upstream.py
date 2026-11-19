@@ -29,7 +29,6 @@ class UpstreamError(Exception):
 class UpstreamSpeech:
     ogg: bytes
     voice: Optional[str]    # upstream's X-Voice ("Puck"; from older code "gemini-Puck" for a phrase)
-    source: Optional[str]   # upstream's X-Source ("bank" | "gemini")
 
 
 def fetch_speech(base_url: str, token: Optional[str], text: str, lang: str,
@@ -72,7 +71,7 @@ def fetch_speech(base_url: str, token: Optional[str], text: str, lang: str,
 
     if body[:4] != b"OggS":
         raise UpstreamError(502, f"upstream returned {headers.get('Content-Type')!r}, not OGG audio")
-    return UpstreamSpeech(ogg=body, voice=headers.get("X-Voice"), source=headers.get("X-Source"))
+    return UpstreamSpeech(ogg=body, voice=headers.get("X-Voice"))
 
 
 def _detail(raw: bytes) -> str:

@@ -103,9 +103,6 @@ elif [ -f "$LIBRARY_ARCHIVE" ]; then
     fi
     tar xzf "$LIBRARY_ARCHIVE" -C "$DATA_DIR" --strip-components=1 output/words_ogg
     tar xzf "$LIBRARY_ARCHIVE" -C "$DATA_DIR" wordbank.db
-    # Archives packed before clone references were removed carry output/voices
-    # and list it in their description; without it they'd re-unpack every boot.
-    tar xzf "$LIBRARY_ARCHIVE" -C "$DATA_DIR" --strip-components=1 output/voices 2>/dev/null || true
     tar xzf "$LIBRARY_ARCHIVE" -C "$DATA_DIR" library.json 2>/dev/null || true
     if python -m wordbank verify --desc "$LIBRARY_DESC" --root "$DATA_DIR"; then
         echo "[entrypoint] library verified after unpack — starting"

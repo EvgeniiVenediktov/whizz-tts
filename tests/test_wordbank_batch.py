@@ -14,7 +14,7 @@ from tests.conftest import clip_pcm16
 from tests.test_gemini_payload import gemini_lite_wav
 from wordbank import qc
 from wordbank.gemini_batch import (
-    VOICE_INSTRUCTION, GeminiBatch, audio_from_line, build_request_body, collect_active, run_batch, run_in_waves, submit_pending,
+    VOICE_INSTRUCTION, GeminiBatch, audio_from_line, build_request_body, collect_active, run_in_waves, submit_pending,
     write_wav_from_pcm_bytes,
 )
 from wordbank.manifest import DONE, FAILED, PENDING, RETAKE, Manifest, SUBMITTED
@@ -22,6 +22,13 @@ from wordbank.manifest import DONE, FAILED, PENDING, RETAKE, Manifest, SUBMITTED
 
 def quiet(*_):
     pass
+
+
+def run_batch(manifest, batch, out_dir, *, lang, qc_retries=qc.DEFAULT_RETRIES,
+              sleep=None, log=quiet):
+    """One submission, then one collect (no further waves)."""
+    submit_pending(manifest, batch, lang=lang, log=log)
+    return collect_active(manifest, batch, out_dir, sleep=sleep, log=log, qc_retries=qc_retries)
 
 
 def pcm_for(key) -> bytes:
@@ -44,7 +51,6 @@ class FakeBatch(GeminiBatch):
         super().__init__(voice=voice)
         self._jobs = {}
         self._n = 0
-        self.deleted = []
 
     def submit_file(self, jsonl, display_name):
         self._n += 1
@@ -65,9 +71,6 @@ class FakeBatch(GeminiBatch):
             yield {"key": key,
                    "response": {"candidates": [{"content": {"parts": [
                        {"inlineData": {"data": b64, "mimeType": "audio/L16"}}]}}]}}
-
-    def delete(self, job_name):
-        self.deleted.append(job_name)
 
 
 # --- pure helpers ----------------------------------------------------------
@@ -113,25 +116,13 @@ def test_write_wav_is_valid(tmp_path):
 
 # --- end-to-end (keyed, WAV) ----------------------------------------------
 
-def test_collect_deletes_only_when_opted_in(tmp_path):
-    m = Manifest(str(tmp_path / "wb.db"))
-    m.add_words(["alpha", "beta"], "en")
-    fake = FakeBatch()
-    submit_pending(m, fake, lang="en", chunk=10)
-    collect_active(m, fake, str(tmp_path / "out"), lang="en", voice="Kore",
-                   sleep=lambda *_: None, delete_after=True)
-    assert fake.deleted               # opt-in deletion still works
-
-
 def test_keyed_one_to_one_correspondence(tmp_path):
     """Each word's file must hold ITS audio even though results came reversed."""
     m = Manifest(str(tmp_path / "wb.db"))
     m.add_words(["alpha", "beta", "gamma", "delta"], "en")
     fake = FakeBatch()
-    counts = run_batch(m, fake, str(tmp_path / "out"),
-                       lang="en", voice="Kore", sleep=lambda *_: None)
+    counts = run_batch(m, fake, str(tmp_path / "out"), lang="en", sleep=lambda *_: None)
     assert counts.get(DONE) == 4
-    assert not fake.deleted           # no auto-delete by default (cleanup is on request)
     out = tmp_path / "out"
     for r in m.iter_rows():
         assert r["status"] == DONE
@@ -154,7 +145,7 @@ def test_submit_then_collect_separately(tmp_path):
     assert not list((tmp_path / "out").rglob("*.wav"))    # nothing written at submit
 
     counts = collect_active(m, fake, str(tmp_path / "out"),
-                            lang="en", voice="Kore", sleep=lambda *_: None)
+                            sleep=lambda *_: None)
     assert counts.get(DONE) == 3
     assert len(list((tmp_path / "out").rglob("*.wav"))) == 3
     m.close()
@@ -166,7 +157,7 @@ class QuotaFakeBatch(FakeBatch):
     """Models the enqueued-token budget: at most `max_inflight` jobs counted at
     once. submit_file 429s when full; the budget frees when a job COMPLETES (it
     counts only active/non-terminal jobs) — so the wave loop drains because it
-    waits for completion before submitting the next batch. (delete is cleanup.)
+    waits for completion before submitting the next batch.
     """
     def __init__(self, max_inflight=2, voice="Kore"):
         super().__init__(voice=voice)
@@ -200,7 +191,7 @@ def test_run_in_waves_drains_everything_under_quota(tmp_path):
     m = Manifest(str(tmp_path / "wb.db"))
     m.add_words([f"w{i}" for i in range(10)], "en")     # 10 words, chunk 2, budget 2 jobs
     counts = run_in_waves(m, QuotaFakeBatch(max_inflight=2), str(tmp_path / "out"),
-                          lang="en", voice="Kore", chunk=2, sleep=lambda *_: None)
+                          lang="en", chunk=2, sleep=lambda *_: None)
     assert counts.get(DONE) == 10                       # all processed despite the cap
     assert len(list((tmp_path / "out").rglob("*.wav"))) == 10
     m.close()
@@ -225,8 +216,7 @@ def test_collect_writes_only_the_data_chunk_and_fails_unconvertible_audio(tmp_pa
     m.add_words(["alpha", "beta", "gamma"], "en")
     fake = WavPayloadBatch()
     fake.bad = str(m.pending()[1]["id"])
-    run_batch(m, fake, str(tmp_path / "out"), lang="en", voice="Kore",
-              sleep=lambda *_: None, log=quiet)
+    run_batch(m, fake, str(tmp_path / "out"), lang="en", sleep=lambda *_: None, log=quiet)
     rows = {r["word"]: r for r in m.iter_rows()}
     assert rows["beta"]["status"] == FAILED and "2 ch" in rows["beta"]["error"]
     for word in ("alpha", "gamma"):
@@ -285,7 +275,7 @@ def test_collect_fails_words_of_jobs_without_results_and_keeps_going(tmp_path):
     batch = GeminiBatch(client=FakeGenaiClient(
         js.JOB_STATE_EXPIRED, js.JOB_STATE_FAILED, js.JOB_STATE_SUCCEEDED))
     submit_pending(m, batch, lang="en", chunk=2, log=quiet)       # 3 jobs of 2
-    counts = collect_active(m, batch, str(tmp_path / "out"), lang="en",
+    counts = collect_active(m, batch, str(tmp_path / "out"),
                             sleep=lambda *_: None, log=quiet)
 
     rows = {r["word"]: r for r in m.iter_rows()}
@@ -295,7 +285,7 @@ def test_collect_fails_words_of_jobs_without_results_and_keeps_going(tmp_path):
     assert len(list((tmp_path / "out").rglob("*.wav"))) == 2
     assert m.active_batch_ids() == []
     assert [r["word"] for r in m.pending()] == list("abcd")       # normal retry path
-    assert collect_active(m, batch, str(tmp_path / "out"), lang="en",
+    assert collect_active(m, batch, str(tmp_path / "out"),
                           sleep=lambda *_: None, log=quiet) == counts
     m.close()
 
@@ -355,7 +345,7 @@ class RecordingBatch(FakeBatch):
     """FakeBatch that keeps every submitted JSONL line."""
     def __init__(self, **kw):
         GeminiBatch.__init__(self, **kw)
-        self._jobs, self._n, self.deleted, self.lines = {}, 0, [], []
+        self._jobs, self._n, self.lines = {}, 0, []
 
     def submit_file(self, jsonl, display_name):
         self.lines += [json.loads(l) for l in jsonl.decode().splitlines() if l.strip()]
@@ -378,8 +368,7 @@ def test_style_batch_sends_speech_metadata_and_records_provenance(tmp_path):
     # style (batch-collect takes no --style), keeps it
     collector = RecordingBatch(model="gemini-3.8-flash-lite-tts", instruction="")
     collector._jobs = batch._jobs
-    collect_active(m, collector, str(tmp_path / "out"), lang="en-gb",
-                   voice="en-gb-tutor-11", sleep=lambda *_: None, log=quiet)
+    collect_active(m, collector, str(tmp_path / "out"), sleep=lambda *_: None, log=quiet)
     for r in m.iter_rows():
         assert (r["status"], r["model"], r["style"]) == (DONE, "gemini-3.8-flash-lite-tts", STYLE)
         assert r["file_path"].startswith("en-gb/gemini-en-gb-tutor-11/0/")
@@ -431,6 +420,22 @@ def test_a_second_voice_is_submitted_without_touching_the_first(tmp_path):
     assert len(rows) == 5 and {r["status"] for r in rows.values()} == {DONE}
     assert rows[("cat", "Kore")]["file_path"].startswith("en/gemini-Kore/")
     assert rows[("cat", "Puck")]["file_path"].startswith("en/gemini-Puck/")
+    m.close()
+
+
+def test_an_unattributed_row_is_filed_under_the_voice_that_submitted_it(tmp_path):
+    """The voice is recorded at submit, so a collect in another process (whose
+    batch has the default voice) files the clip under the submitting voice."""
+    m = Manifest(str(tmp_path / "wb.db"))
+    m.add_words(["cat"], "en")                              # NULL voice
+    puck = FakeBatch(voice="Puck")
+    submit_pending(m, puck, lang="en", log=quiet)
+    collector = FakeBatch()                                 # Kore
+    collector._jobs = puck._jobs
+    collect_active(m, collector, str(tmp_path / "out"), sleep=lambda *_: None, log=quiet)
+    [row] = m.iter_rows()
+    assert (row["status"], row["voice"]) == (DONE, "Puck")
+    assert row["file_path"].startswith("en/gemini-Puck/")
     m.close()
 
 

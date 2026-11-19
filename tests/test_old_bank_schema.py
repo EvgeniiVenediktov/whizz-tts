@@ -49,36 +49,6 @@ def _make_old_bank(path):
     conn.close()
 
 
-def test_get_phrase_on_old_schema_bank(tmp_path):
-    db = str(tmp_path / "old.db")
-    _make_old_bank(db)
-    bank = BankLookup(db)
-    row = bank.get_phrase("good morning", "en-us")
-    assert row is not None
-    assert row["file_path"] == "en/local/1/1_good_morning.wav"
-    assert row["voice"] is None and row["seed"] is None
-    assert row["ref_audio"] is None and row["ref_text"] is None
-    bank.close()
-
-
-def test_voice_pinned_lookup_on_voiceless_bank_is_a_miss(tmp_path):
-    db = str(tmp_path / "old.db")
-    _make_old_bank(db)
-    bank = BankLookup(db)
-    assert bank.get_phrase("good morning", "en-us", voice="Kore") is None
-    bank.close()
-
-
-def test_search_on_old_schema_bank(tmp_path):
-    db = str(tmp_path / "old.db")
-    _make_old_bank(db)
-    bank = BankLookup(db)
-    results = bank.search("good", "en-us")
-    assert [r["text"] for r in results] == ["good morning"]
-    assert results[0]["type"] == "phrase" and results[0]["voice"] is None
-    bank.close()
-
-
 def test_manifest_migrates_old_phrase_key_so_a_second_voice_fits(tmp_path):
     """Old phrases tables have UNIQUE(text, lang); ALTER adds `voice` but can't
     widen the key, so the same text in another voice used to be silently dropped."""
@@ -108,52 +78,18 @@ def _phrase_bank(db, rows):
     conn.close()
 
 
-def _phrase_labels(db):
-    m = Manifest(db, table="phrases", text_col="text")
-    try:
-        return {r["id"]: (r["voice"], r["file_path"]) for r in m.iter_rows()}
-    finally:
-        m.close()
-
-
-def test_manifest_relabels_phrases_with_their_voices_word_label(tmp_path):
-    """Phrases were "gemini-<voice>" while words were "<voice>"; a phrase now
-    takes the word label: rewritten once on open, the clips (paths) untouched;
-    any other label is left as is."""
+def test_lookups_serve_the_oldest_clip_across_label_spellings(tmp_path):
+    """A text may be banked under both "gemini-Kore" (older code) and "Kore":
+    lookups read both as "Kore" and serve the oldest ready clip."""
     db = str(tmp_path / "wb.db")
     _phrase_bank(db, [
-        (1, "good morning", "en-us", "gemini-Kore", "done", "en-us/gemini-Kore/phrases/0/1_a.wav"),
-        (2, "good night", "en-us", "gemini-puck", "done", "en-us/gemini-puck/phrases/0/2_b.wav"),
-        (3, "hello there", "en-gb", "gemini-en-gb-tutor-11", "done", "en-gb/gemini-en-gb-tutor-11/x.wav"),
-        (4, "cheerio", "en-gb", "local-en-gb", "done", "en-gb/local-en-gb/0/4_c.wav"),
+        (1, "bye", "en-us", "Kore", "pending", None),
+        (2, "bye", "en-us", "gemini-Kore", "done", "a.wav"),
+        (3, "hi", "en-us", "gemini-Kore", "done", "b.wav"),
+        (4, "hi", "en-us", "Kore", "done", "c.wav"),
+        (5, "yes", "en-us", "Kore", "done", "d.wav"),
+        (7, "yes", "en-us", "gemini-kore", "done", "e.wav"),
     ])
-    labels = _phrase_labels(db)
-    assert {i: v for i, (v, _) in labels.items()} == \
-        {1: "Kore", 2: "Puck", 3: "en-gb-tutor-11", 4: "local-en-gb"}
-    assert labels[2][1] == "en-us/gemini-puck/phrases/0/2_b.wav"
-    assert _phrase_labels(db) == labels                     # reopen: nothing left to do
-
-
-def test_phrase_relabel_collision_keeps_the_clip_then_the_oldest(tmp_path):
-    """A relabel can meet a row already holding (text, lang, label). The one
-    with a clip, then the lower id, takes the label; the other is deleted if
-    it has no clip, else kept under a legacy spelling, where lookups still
-    match it but serve the winner first."""
-    db = str(tmp_path / "wb.db")
-    _phrase_bank(db, [
-        (1, "bye", "en-us", "Kore", "pending", None),           # no clip: deleted
-        (2, "bye", "en-us", "gemini-Kore", "done", "a.wav"),    # takes the label
-        (3, "hi", "en-us", "gemini-Kore", "done", "b.wav"),     # older clip: takes the label
-        (4, "hi", "en-us", "Kore", "done", "c.wav"),            # newer: takes 3's old spelling
-        (5, "yes", "en-us", "Kore", "done", "d.wav"),           # older clip: keeps the label
-        (6, "yes", "en-us", "gemini-Kore", "failed", None),     # no clip: deleted
-        (7, "yes", "en-us", "gemini-kore", "done", "e.wav"),    # newer: kept as it is
-    ])
-    labels = _phrase_labels(db)
-    assert {i: v for i, (v, _) in labels.items()} == \
-        {2: "Kore", 3: "Kore", 4: "gemini-Kore", 5: "Kore", 7: "gemini-kore"}
-    assert _phrase_labels(db) == labels                     # reopen: the pairs stay
-
     bank = BankLookup(db)
     assert [bank.get_phrase(t, "en-us", voice="Kore")["file_path"] for t in ("bye", "hi", "yes")] \
         == ["a.wav", "b.wav", "d.wav"]
@@ -184,18 +120,6 @@ def test_lookups_read_an_unmigrated_phrase_label_as_the_plain_one(client):
     conn = sqlite3.connect(db)
     assert conn.execute("SELECT voice FROM phrases").fetchall() == [("gemini-Kore",)]   # not migrated
     conn.close()
-
-
-def test_speak_into_old_schema_bank(tmp_path, bank_env, fake_gemini):
-    """End to end: /v1/speak on the real (old-schema) bank, for a phrase that
-    already exists without a voice, generates, saves, and then serves it."""
-    _make_old_bank(str(bank_env.db))
-    from src.server import app
-    with TestClient(app) as c:
-        miss = c.post("/v1/speak", data={"text": "good morning", "voice": "Puck"})
-        assert miss.status_code == 200, miss.text
-        hit = c.post("/v1/speak", data={"text": "good morning", "voice": "Puck"})
-        assert hit.headers["x-source"] == "bank" and hit.content == miss.content
 
 
 def test_manifest_adds_provenance_columns_to_an_old_bank(tmp_path):
@@ -264,8 +188,6 @@ def test_manifest_migrates_the_old_word_key_keeping_rows_and_ids(tmp_path):
     rows = {r["id"]: r for r in m.iter_rows()}
     assert [(r["word"], r["voice"]) for r in rows.values()] == [
         ("cat", "en-gb-tutor-11"), ("dog", "Kore"), ("emu", "en-gb-tutor-11"), ("gnu", None)]
-    assert (rows[1]["review"], rows[1]["error"], rows[1]["qc_end_db"]) == \
-        ("ends on sound (-31 dB)", None, None)                 # flag.py's note moved
     before = [dict(r) for r in m.iter_rows()]
 
     assert m.add_words(["cat", "emu"], "en-gb", voice="en-gb-tutor-14") == 2

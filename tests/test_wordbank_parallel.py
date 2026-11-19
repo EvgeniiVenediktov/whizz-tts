@@ -1,7 +1,4 @@
-"""Tests for the word-list cleaner and rate limiter."""
-import time
-
-from wordbank.ratelimit import RateLimiter
+"""Tests for the word-list cleaner."""
 from wordbank.wordlist import clean_words
 
 
@@ -18,15 +15,3 @@ def test_clean_words_filters_and_dedupes():
     assert "don't" not in out               # contraction dropped
     assert "12" not in out                  # numeric dropped
     assert all(2 <= len(w) <= 20 or w in ("a", "i") for w in out)
-
-
-# ---- rate limiter ----
-
-def test_rate_limiter_allows_burst_then_throttles():
-    rl = RateLimiter(rate_per_min=60)       # 1 token/sec, capacity 60
-    start = time.monotonic()
-    for _ in range(60):                     # full bucket → immediate
-        rl.acquire()
-    assert time.monotonic() - start < 0.5
-    rl.acquire()                            # 61st must wait ~1s for a refill
-    assert time.monotonic() - start >= 0.9

@@ -4,6 +4,7 @@ import os
 import subprocess
 import time
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Annotated, Optional
 
 import jwt
@@ -17,10 +18,10 @@ from wordbank.constants import BANK_OGG_APPLICATION, BANK_OGG_BITRATE
 from wordbank.gemini_tts import (DEFAULT_MODEL as GEMINI_TTS_DEFAULT_MODEL,
                                  GeminiStyleUnsupportedError, GeminiVoiceUnsupportedError,
                                  canonical_voice, check_voice, is_classic_voice,
-                                 plain_voice_label, style_models, supports_style)
+                                 style_models, supports_style, voice_label)
 from wordbank.languages import normalize_lang
 from wordbank.lookup import BankLookup
-from wordbank.paths import voice_from_path
+from wordbank.paths import check_segment, voice_from_path
 
 # NOTE: src.audio (ffmpeg) and google-genai are imported LAZILY inside the
 # handlers, so the serving image needs neither at import time.
@@ -115,12 +116,10 @@ def _gemini_voice(voice: Optional[str]) -> Optional[str]:
 
 
 def _bank_voice(voice: Optional[str]) -> Optional[str]:
-    """A lookup's `voice` as the bank labels words and phrases
-    (gemini_tts.plain_voice_label: "kore" -> "Kore"; the legacy phrase
-    spelling "gemini-Kore" too), None when omitted. Lenient, unlike
-    _gemini_voice: a read can't waste a Gemini call, and a bank may hold any
-    library voice."""
-    return plain_voice_label(voice) if voice and voice.strip() else None
+    """A lookup's `voice` as the bank label (voice_label: "kore" and the legacy
+    "gemini-Kore" -> "Kore"), None when omitted. Lenient, unlike _gemini_voice:
+    a read can't waste a Gemini call, and a bank may hold any library voice."""
+    return voice_label(voice) if voice and voice.strip() else None
 
 
 def _default_voice() -> str:
@@ -318,8 +317,6 @@ def phrase_info(text: str, lang: str = DEFAULT_LANG, voice: Optional[str] = None
         raise HTTPException(404, "not in phrase bank")
     rel = row["file_path"]
     return {"text": row["text"], "type": "phrase", "voice": row["voice"],
-            "seed": row["seed"], "ref_audio": row["ref_audio"],
-            "ref_text": row["ref_text"],
             "wav": _file_info(_wav_abs(rel)), "ogg": _file_info(_ogg_abs(rel))}
 
 
@@ -395,44 +392,49 @@ async def _single_flight(key: tuple):
             del _miss_locks[key]
 
 
-async def _gemini_clip(text: str, voice: str, instruct: str,
-                       style: Optional[str] = None) -> tuple:
-    """Synthesize with Gemini -> (OGG in the bank profile, raw PCM). The model
-    decides how `instruct`/`style` are sent (gemini_tts.route_direction): on a
-    3.8 model both go as the speech_metadata style, never into the text."""
-    def _gen():
-        from wordbank.gemini_tts import synthesize_pcm  # lazy: genai
-        return synthesize_pcm(text, voice=voice, instruct=instruct, model=GEMINI_TTS_MODEL,
-                              style=style)
-
+async def _synthesize(text: str, voice: str, instruct: str, model: str,
+                      style: Optional[str], server_style: bool = False) -> bytes:
+    """Gemini synthesis off the event loop -> PCM; failures as HTTP errors. A
+    style the model can't take is 400, or 500 when it is GEMINI_TTS_STYLE."""
+    from wordbank.gemini_tts import synthesize_pcm  # lazy: genai
     try:
-        pcm = await asyncio.get_running_loop().run_in_executor(None, _gen)
-    except GeminiStyleUnsupportedError as exc:   # only GEMINI_TTS_STYLE gets here
-        raise HTTPException(500, f"server misconfigured: GEMINI_TTS_STYLE is set but {exc}") from exc
-    except (ImportError, ModuleNotFoundError) as exc:
+        return await asyncio.get_running_loop().run_in_executor(None, lambda: synthesize_pcm(
+            text, voice=voice, instruct=instruct, model=model, style=style))
+    except GeminiStyleUnsupportedError as exc:
+        if server_style:
+            raise HTTPException(500, f"server misconfigured: GEMINI_TTS_STYLE is set but {exc}") from exc
+        raise HTTPException(400, str(exc)) from exc
+    except ImportError as exc:
         raise HTTPException(503, f"google-genai not installed: {exc}") from exc
     except Exception as exc:
         raise HTTPException(502, f"Gemini TTS failed: {exc}") from exc
 
-    # Encoded in the bank's own OGG profile, so a clip saved here matches the
-    # batch-encoded ones (scripts/encode_wavs.py uses the same constants).
+
+def _encode_ogg(pcm: bytes) -> bytes:
+    """PCM -> OGG in the bank profile, so saved clips match encode_wavs.py's."""
     from .audio import pcm16_to_ogg  # lazy: shells out to ffmpeg
     try:
-        ogg = pcm16_to_ogg(pcm, bitrate=BANK_OGG_BITRATE, application=BANK_OGG_APPLICATION)
+        return pcm16_to_ogg(pcm, bitrate=BANK_OGG_BITRATE, application=BANK_OGG_APPLICATION)
     except FileNotFoundError as exc:
         raise HTTPException(503, f"ffmpeg not installed: {exc}") from exc
     except subprocess.CalledProcessError as exc:
         raise HTTPException(500, f"OGG encoding failed: {exc.stderr.decode(errors='replace')}") from exc
-    return ogg, pcm
+
+
+@dataclass
+class _Clip:
+    ogg: bytes
+    voice: str
+    source: str                       # "gemini" | "upstream"
+    pcm: Optional[bytes] = None       # Gemini only: the dev WAV master
+    model: Optional[str] = None
+    style: Optional[str] = None
 
 
 async def _upstream_clip(url: str, text: str, lang: str, voice: Optional[str],
-                         instruct: str, fallback_voice: str) -> tuple:
-    """Fetch a miss from the upstream server -> (OGG, voice label). The voice
-    is forwarded as requested (None stays None), so upstream applies its own
-    default/any-banked rules; the clip is filed under the voice upstream
-    reports, as its plain label: "Kore" (an upstream on older code reports
-    its phrases as "gemini-Kore": filed as "Kore" too)."""
+                         instruct: str, fallback_voice: str) -> _Clip:
+    """A miss fetched from the upstream server, filed under the voice it
+    reports (voice_label: an older upstream's "gemini-Kore" -> "Kore")."""
     token = os.getenv("SPEAK_UPSTREAM_TOKEN")
     try:
         speech = await asyncio.get_running_loop().run_in_executor(
@@ -440,28 +442,27 @@ async def _upstream_clip(url: str, text: str, lang: str, voice: Optional[str],
                                        timeout=SPEAK_UPSTREAM_TIMEOUT))
     except UpstreamError as exc:
         raise HTTPException(exc.status, exc.detail) from exc
-    label = plain_voice_label(speech.voice) if speech.voice else None
-    if label and (label in (".", "..") or any(c in label for c in "/\\\0")):
-        # the label becomes a directory of the saved clip: one plain segment only
-        raise HTTPException(502, f"upstream reported an unusable voice label {label!r}")
-    return speech.ogg, label or fallback_voice
-
-
-def _save_phrase(text: str, lang: str, voice: str, ogg: bytes,
-                 pcm: Optional[bytes] = None, billed_chars: Optional[int] = None,
-                 model: Optional[str] = None, style: Optional[str] = None) -> None:
-    """Persist a /v1/speak clip into the phrase bank under its voice label
-    ("Kore", as words are), filed in the voice's directory like a word,
-    `<lang>/gemini-<voice>/`, in its own `phrases/` subtree: phrase and word
-    ids are separate sequences, so `<lang>/gemini-<voice>/<n>/<id>_<slug>`
-    alone could collide with a word clip of the same id, voice, and slug."""
-    from wordbank.manifest import DONE, Manifest
-    from wordbank.paths import safe_filename
-    from wordbank.paths import path_under
-    clip_dir = os.path.join(lang, f"gemini-{voice}", "phrases")
+    label = voice_label(speech.voice) if speech.voice else fallback_voice
     try:
-        # lang and the voice label are checked on the way in; this is the last
-        # line of defence, run before the row exists so a refusal leaves nothing.
+        check_segment(label)            # it names the saved clip's directory
+    except ValueError as exc:
+        raise HTTPException(502, f"upstream reported an unusable voice label: {exc}") from exc
+    return _Clip(speech.ogg, label, "upstream")
+
+
+def _write(path: str, data: bytes) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(data)
+
+
+def _save_phrase(text: str, lang: str, clip: _Clip) -> None:
+    """Save a /v1/speak clip to the phrase bank, under its voice's directory
+    in a `phrases/` subtree (phrase and word ids are separate sequences)."""
+    from wordbank.manifest import DONE, Manifest
+    from wordbank.paths import path_under, safe_filename
+    clip_dir = os.path.join(lang, f"gemini-{clip.voice}", "phrases")
+    try:   # last line of defence, before the row exists
         for root in (app.state.ogg_root, app.state.wav_root):
             path_under(root, clip_dir)
     except ValueError as exc:
@@ -470,28 +471,26 @@ def _save_phrase(text: str, lang: str, voice: str, ogg: bytes,
     os.makedirs(os.path.dirname(db) or ".", exist_ok=True)   # bank-less deploy: first write creates it
     m = Manifest(db, table="phrases", text_col="text")
     try:
-        m.add_words([text], lang, voice=voice)
-        row = m.get_entry(text, lang, voice)
-        rel = os.path.join(clip_dir, str(row["id"] // 1000),
-                           f"{row['id']}_{safe_filename(text)}.wav")
-        ogg_path = _ogg_abs(rel)
-        os.makedirs(os.path.dirname(ogg_path), exist_ok=True)
-        with open(ogg_path, "wb") as f:
-            f.write(ogg)
-        if pcm is not None and os.path.isdir(app.state.wav_root):   # dev-only WAV master
+        m.add_words([text], lang, voice=clip.voice)
+        row = m.get_entry(text, lang, clip.voice)
+        rel = os.path.join(clip_dir, str(row["id"] // 1000), f"{row['id']}_{safe_filename(text)}.wav")
+        _write(_ogg_abs(rel), clip.ogg)
+        if clip.pcm is not None and os.path.isdir(app.state.wav_root):   # dev-only WAV master
+            from wordbank.gemini_tts import pcm_to_wav_bytes
             try:
-                from wordbank.gemini_tts import pcm_to_wav_bytes
-                wav_path = _wav_abs(rel)
-                os.makedirs(os.path.dirname(wav_path), exist_ok=True)
-                with open(wav_path, "wb") as f:
-                    f.write(pcm_to_wav_bytes(pcm))
+                _write(_wav_abs(rel), pcm_to_wav_bytes(clip.pcm))
             except OSError:
                 pass
-        m.set_status(row["id"], DONE, file_path=rel, billed_chars=billed_chars, voice=voice,
-                     model=model, style=style)
+        m.set_status(row["id"], DONE, file_path=rel, voice=clip.voice, model=clip.model,
+                     style=clip.style, billed_chars=len(text) if clip.source == "gemini" else None)
     finally:
         m.close()
     app.state.bank.close()   # drop the memoized read conn so the new row is visible
+
+
+def _clip_response(clip: _Clip) -> Response:
+    return Response(content=clip.ogg, media_type="audio/ogg",
+                    headers=_bank_voice_headers(clip.source, clip.voice))
 
 
 @app.post("/v1/speak", dependencies=[Depends(require_auth)])
@@ -501,38 +500,12 @@ async def speak(
     voice: Annotated[Optional[str], Form()] = None,
     instruct: Annotated[Optional[str], Form()] = None,
 ):
-    """Get-or-generate: serve `text` from the bank (word or phrase) if it's
-    already there, otherwise generate it and persist it into the phrase bank so
-    subsequent requests are served from disk. This is the only route that
-    writes the bank.
-
-    A miss is synthesized with Gemini, or — in edge mode (SPEAK_UPSTREAM_URL
-    set) — fetched from the upstream server's /v1/speak, so an edge needs no
-    Gemini key. Concurrent misses for the same clip are generated once.
-    With SPEAK_STORE=0 nothing is saved: misses are generated and returned
-    only (the stateless upstream that edges cache from).
-
-    `voice` is a classic Gemini voice name or a curated locale voice id
-    (/v1/gemini/languages), case-insensitive. When given, only a recording in
-    that voice is served — words and phrases match the same label ("Kore",
-    "en-gb-tutor-11") — and a miss is generated in it. When omitted, any
-    banked recording serves (the default GEMINI_TTS_VOICE first) and a miss is
-    generated in the default voice. A locale voice needs a 3.8
-    GEMINI_TTS_MODEL: on another model a miss is a 400 (bank hits still serve).
-
-    `instruct` (style direction) makes the request a one-off: the bank has no
-    key for style, so it is neither looked up nor saved. How it reaches Gemini
-    depends on GEMINI_TTS_MODEL: the 3.8 models get it as the speech_metadata
-    style (they would speak an inline prefix), 3.1/2.5 as the inline prefix.
-    Every other miss is generated with GEMINI_TTS_STYLE (when set) and saved
-    with it as provenance (`model`, `style` columns).
-
-    `lang` is a language code like `en-us` (case-insensitive, filed lowercase);
-    anything else is a 400 before the bank, Gemini, or upstream is touched.
-
-    Response headers: `X-Source: bank|gemini|upstream`, `X-Voice: <voice label>`
-    (the plain label, the same for a word or a phrase).
-    """
+    """Get-or-generate: serve `text` from the word or phrase bank, else
+    generate it (Gemini, or the upstream in edge mode), save it to the phrase
+    bank (not with SPEAK_STORE=0) and serve it. `voice` pins the recording;
+    omitted, any banked voice serves and a miss uses GEMINI_TTS_VOICE.
+    `instruct` makes a one-off: no lookup, no save. Headers: X-Source
+    (bank|gemini|upstream), X-Voice. See README for the full contract."""
     text = text.strip()
     if not text:
         raise HTTPException(400, "text must not be empty")
@@ -544,37 +517,28 @@ async def speak(
     eff_voice = voice or _default_voice()
     upstream = _upstream_url()
 
-    async def _generate():
-        """-> (ogg, voice label, source, pcm, billed chars, provenance kwargs)."""
+    async def generate() -> _Clip:
         if upstream:
-            ogg, label = await _upstream_clip(upstream, text, lang, voice, instruct, eff_voice)
-            return ogg, label, "upstream", None, None, {}
+            return await _upstream_clip(upstream, text, lang, voice, instruct, eff_voice)
         _check_voice(eff_voice, GEMINI_TTS_MODEL, server_default=not voice)
         style = None if instruct else _tts_style()   # a one-off's instruct replaces it
-        ogg, pcm = await _gemini_clip(text, eff_voice, instruct, style)
-        return ogg, eff_voice, "gemini", pcm, len(text), {"model": GEMINI_TTS_MODEL,
-                                                          "style": style}
+        pcm = await _synthesize(text, eff_voice, instruct, GEMINI_TTS_MODEL, style,
+                                server_style=True)
+        return _Clip(_encode_ogg(pcm), eff_voice, "gemini", pcm, GEMINI_TTS_MODEL, style)
 
     if instruct:
-        ogg, label, source, *_ = await _generate()
-        return Response(content=ogg, media_type="audio/ogg",
-                        headers=_bank_voice_headers(source, label))
-
-    hit = _speak_bank_hit(text, lang, voice, eff_voice)
-    if hit is not None:
+        return _clip_response(await generate())
+    if (hit := _speak_bank_hit(text, lang, voice, eff_voice)) is not None:
         return hit
+    key = (text.lower(), lang, eff_voice)
     if not _speak_store():
-        ogg, label, source, *_ = await _coalesced((text.lower(), lang, eff_voice), _generate)
-        return Response(content=ogg, media_type="audio/ogg",
-                        headers=_bank_voice_headers(source, label))
-    async with _single_flight((text.lower(), lang, eff_voice)):
-        hit = _speak_bank_hit(text, lang, voice, eff_voice)   # a queued twin may have saved it
-        if hit is not None:
-            return hit
-        ogg, label, source, pcm, billed, provenance = await _generate()
-        _save_phrase(text, lang, label, ogg, pcm, billed, **provenance)
-    return Response(content=ogg, media_type="audio/ogg",
-                    headers=_bank_voice_headers(source, label))
+        return _clip_response(await _coalesced(key, generate))
+    async with _single_flight(key):
+        if (hit := _speak_bank_hit(text, lang, voice, eff_voice)) is not None:
+            return hit                  # a queued twin saved it
+        clip = await generate()
+        _save_phrase(text, lang, clip)
+    return _clip_response(clip)
 
 
 # --- Voice studio: preview Gemini prebuilt voices ---
@@ -587,33 +551,16 @@ async def gemini_tts(
     model: Annotated[str, Form()] = GEMINI_TTS_MODEL,
     style: Annotated[Optional[str], Form()] = None,
 ):
-    """Generate a phrase with Gemini (a prebuilt voice) → WAV, to preview a
-    voice. Nothing is saved. Needs GEMINI_API_KEY on the server.
-    `voice` takes what /v1/speak's does; a locale voice with a non-3.8
-    `model` is a 400. `instruct` is routed like /v1/speak's (the style on 3.8
-    models, an inline prefix on 3.1/2.5); `style` is a speech_metadata style,
-    3.8 models only (400 otherwise). GEMINI_TTS_STYLE does not apply here."""
+    """Preview a phrase in a Gemini voice -> WAV; nothing saved. `voice`,
+    `instruct` as for /v1/speak; `style` (3.8 models only) as speech metadata.
+    GEMINI_TTS_STYLE does not apply."""
     if len(text) > MAX_TEXT_LEN:
         raise HTTPException(400, f"text exceeds {MAX_TEXT_LEN} characters")
     voice = _gemini_voice(voice) or GEMINI_TTS_VOICE
     _check_voice(voice, model)
-
-    def _gen():
-        from wordbank.gemini_tts import pcm_to_wav_bytes, synthesize_pcm  # lazy: genai
-        pcm = synthesize_pcm(text, voice=voice, instruct=instruct or "", model=model,
-                             style=style)
-        return pcm_to_wav_bytes(pcm)
-
-    try:
-        loop = asyncio.get_running_loop()
-        wav = await loop.run_in_executor(None, _gen)
-    except GeminiStyleUnsupportedError as exc:
-        raise HTTPException(400, str(exc)) from exc
-    except (ImportError, ModuleNotFoundError) as exc:
-        raise HTTPException(503, f"google-genai not installed: {exc}") from exc
-    except Exception as exc:
-        raise HTTPException(502, f"Gemini TTS failed: {exc}") from exc
-    return Response(content=wav, media_type="audio/wav")
+    from wordbank.gemini_tts import pcm_to_wav_bytes
+    pcm = await _synthesize(text, voice, instruct or "", model, style)
+    return Response(content=pcm_to_wav_bytes(pcm), media_type="audio/wav")
 
 
 @app.get("/v1/gemini/voices")

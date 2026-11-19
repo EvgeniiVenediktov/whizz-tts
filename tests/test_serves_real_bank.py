@@ -30,7 +30,7 @@ def _pick_servable_word():
     try:
         rows = conn.execute(
             "SELECT word, lang, file_path FROM words "
-            "WHERE status IN ('done','verified') LIMIT 500"
+            "WHERE status = 'done' LIMIT 500"
         ).fetchall()
     finally:
         conn.close()

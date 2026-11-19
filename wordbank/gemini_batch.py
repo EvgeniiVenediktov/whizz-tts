@@ -40,13 +40,11 @@ import os
 import pathlib
 import tempfile
 import time
-import wave
 from typing import Callable, Iterable, List, Optional
 
 from . import qc
-from .constants import SAMPLE_RATE
 from .gemini_tts import (GeminiAudioFormatError, check_voice, new_client,
-                         pcm_from_payload, route_direction)
+                         pcm_from_payload, pcm_to_wav_bytes, route_direction)
 from .manifest import DONE, FAILED, RETAKE, SUBMITTED, Manifest
 from .paths import safe_filename
 
@@ -118,13 +116,8 @@ def audio_from_line(line: dict) -> Optional[bytes]:
     return None
 
 
-def write_wav_from_pcm_bytes(path: pathlib.Path, pcm: bytes, sample_rate: int = SAMPLE_RATE) -> None:
-    """Wrap raw 16-bit mono PCM in a WAV container — no ffmpeg, lossless."""
-    with wave.open(str(path), "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sample_rate)
-        wf.writeframes(pcm)
+def write_wav_from_pcm_bytes(path: pathlib.Path, pcm: bytes) -> None:
+    pathlib.Path(path).write_bytes(pcm_to_wav_bytes(pcm))
 
 
 # --- batch client wrapper (google-genai lazily imported) -------------------
@@ -228,9 +221,6 @@ class GeminiBatch:
             if line:
                 yield json.loads(line)
 
-    def delete(self, job_name: str) -> None:
-        self._get_client().batches.delete(name=job_name)
-
 
 # --- pipeline --------------------------------------------------------------
 
@@ -261,13 +251,13 @@ def _write_and_mark(manifest: Manifest, out_dir: pathlib.Path, lang: str,
 
 
 def _settle_take(manifest: Manifest, out_dir: pathlib.Path, row, pcm: Optional[bytes],
-                 *, voice: str, qc_retries: int) -> Optional[str]:
+                 *, qc_retries: int) -> Optional[str]:
     """QC a collected take (`pcm`; None when the request produced none) against
     the row's best take so far, if it is a re-take, and file the outcome:
     "passed" / "resolved" (passed on a re-take) / "flagged" (re-takes used up,
     the best take filed with its flag) / "requeued" (status RETAKE). None when
     there is no take at all: the caller fails the row as before QC."""
-    lang, voice = row["lang"], row["voice"] or voice
+    lang, voice = row["lang"], row["voice"]
     held = qc.retake_path(manifest.path, row["id"])
     takes = []
     if row["qc_takes"] and held.is_file():
@@ -293,9 +283,8 @@ def _settle_take(manifest: Manifest, out_dir: pathlib.Path, row, pcm: Optional[b
 
 
 def _collect(manifest: Manifest, batch: GeminiBatch, job_name: str,
-             out_dir: pathlib.Path, lang: str, voice: str,
-             poll_interval: float, sleep: Callable, log: Callable,
-             delete_after: bool = False, qc_retries: int = qc.DEFAULT_RETRIES) -> None:
+             out_dir: pathlib.Path, poll_interval: float, sleep: Callable, log: Callable,
+             qc_retries: int = qc.DEFAULT_RETRIES) -> None:
     while True:
         job = batch.poll(job_name)
         if batch.is_done(job):
@@ -310,7 +299,7 @@ def _collect(manifest: Manifest, batch: GeminiBatch, job_name: str,
 
     def settle(row, pcm=None, error=None):
         # A re-take that produced nothing falls back to the take it was to replace.
-        outcome = _settle_take(manifest, out_dir, row, pcm, voice=voice, qc_retries=qc_retries)
+        outcome = _settle_take(manifest, out_dir, row, pcm, qc_retries=qc_retries)
         if outcome is None:
             manifest.set_status(row["id"], FAILED, error=error[:500])
             outcome = "failed"
@@ -349,17 +338,6 @@ def _collect(manifest: Manifest, batch: GeminiBatch, job_name: str,
         if key not in seen:
             settle(row, error="missing from batch result")
     log(f"{job_name}: {_tally(outcomes)}")
-
-    # Results are saved — delete the job as CLEANUP. The enqueued-token quota
-    # counts "active" (non-terminal) jobs, so it already frees when the job
-    # completes; deleting just clears the finished job + its output server-side so
-    # dead jobs don't pile up until the 48h auto-expiry. Best-effort.
-    if delete_after:
-        try:
-            batch.delete(job_name)
-            log(f"deleted {job_name} (cleanup)")
-        except Exception as e:  # noqa: BLE001 - cleanup is best-effort
-            log(f"could not delete {job_name}: {e} (clean up later with gemini_batch_cleanup.py)")
 
 
 def _pending(manifest: Manifest, batch: GeminiBatch, lang: str, limit: int):
@@ -401,7 +379,7 @@ def submit_pending(manifest: Manifest, batch: GeminiBatch, *, lang: str = "en",
                 break
             raise
         # rows stay 'pending' until this commits, so a crash never half-submits
-        manifest.mark_submitted([r["id"] for r in rows], job_name,
+        manifest.mark_submitted([r["id"] for r in rows], job_name, voice=batch.voice,
                                 model=batch.model, style=batch.direction)
         log(f"submitted {len(rows)} words as {job_name}")
         jobs.append(job_name)
@@ -409,46 +387,28 @@ def submit_pending(manifest: Manifest, batch: GeminiBatch, *, lang: str = "en",
 
 
 def collect_active(manifest: Manifest, batch: GeminiBatch, out_dir: str, *,
-                   lang: str = "en", voice: Optional[str] = None,
                    poll_interval: float = 60, sleep: Callable = time.sleep,
-                   log: Callable = print, delete_after: bool = False,
-                   qc_retries: int = qc.DEFAULT_RETRIES) -> dict:
+                   log: Callable = print, qc_retries: int = qc.DEFAULT_RETRIES) -> dict:
     """Poll every in-flight batch (from the manifest) and write completed clips.
 
     Safe to run in a fresh process after a reboot — reconnects by job id.
-    Clips are filed under each row's own language and voice (`voice` only for
-    rows from before the voice key). A clip flagged by QC is re-queued (status
-    RETAKE) while it has re-takes left of `qc_retries`.
-    `delete_after` (off by default) deletes each job after collecting; it's only
-    cleanup — the enqueued-token quota frees when a job completes regardless.
-    Clean up jobs on request with scripts/gemini_batch_cleanup.py.
+    Clips are filed under each row's own language and voice. A clip flagged by QC is re-queued (status
+    RETAKE) while it has re-takes left of `qc_retries`. Jobs are never deleted
+    (scripts/gemini_batch_cleanup.py, on request).
     """
     out = pathlib.Path(out_dir)
-    voice = voice or batch.voice
     active = manifest.active_batch_ids()
     if not active:
         log("no in-flight batches to collect")
     for job_name in active:
         log(f"collecting batch {job_name}")
-        _collect(manifest, batch, job_name, out, lang, voice, poll_interval, sleep,
-                 log, delete_after, qc_retries)
+        _collect(manifest, batch, job_name, out, poll_interval, sleep,
+                 log, qc_retries)
     return manifest.counts()
 
 
-def run_batch(manifest: Manifest, batch: GeminiBatch, out_dir: str, *,
-              lang: str = "en", voice: Optional[str] = None, chunk: int = 2000,
-              poll_interval: float = 60, sleep: Callable = time.sleep,
-              log: Callable = print, qc_retries: int = qc.DEFAULT_RETRIES) -> dict:
-    """Blocking convenience: submit all pending, then poll+collect in one process.
-    QC re-takes it queues wait for the next submission (run_in_waves loops)."""
-    submit_pending(manifest, batch, lang=lang, chunk=chunk, log=log)
-    return collect_active(manifest, batch, out_dir, lang=lang, voice=voice,
-                          poll_interval=poll_interval, sleep=sleep, log=log,
-                          qc_retries=qc_retries)
-
-
 def run_in_waves(manifest: Manifest, batch: GeminiBatch, out_dir: str, *,
-                 lang: str = "en", voice: Optional[str] = None, chunk: int = 2000,
+                 lang: str = "en", chunk: int = 2000,
                  poll_interval: float = 60, sleep: Callable = time.sleep,
                  log: Callable = print, max_waves: int = 10_000,
                  qc_retries: int = qc.DEFAULT_RETRIES) -> dict:
@@ -459,10 +419,8 @@ def run_in_waves(manifest: Manifest, batch: GeminiBatch, out_dir: str, *,
     Needs the process to stay alive (collection waits for jobs to finish), so run
     it with the laptop on. Fully resumable — picks up whatever the manifest holds.
     """
-    voice = voice or batch.voice
     for wave_num in range(1, max_waves + 1):
-        collect_active(manifest, batch, out_dir, lang=lang, voice=voice,
-                       poll_interval=poll_interval, sleep=sleep, log=log,
+        collect_active(manifest, batch, out_dir, poll_interval=poll_interval, sleep=sleep, log=log,
                        qc_retries=qc_retries)
         if not _pending(manifest, batch, lang, 1):
             log("all words processed")

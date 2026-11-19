@@ -34,6 +34,7 @@ from . import gemini_tts, qc
 from .gemini_batch import _write_and_mark
 from .gemini_tts import GeminiNetworkError, route_direction
 from .manifest import FAILED, Manifest
+from .paths import check_segment
 from .ratelimit import RateLimiter
 
 _TRANSIENT_BACKOFF_S = 5.0     # sleep before in-row retry n is this * 2**(n-1), capped
@@ -49,12 +50,6 @@ def is_transient(exc: BaseException) -> bool:
     return isinstance(exc, (GeminiNetworkError, TimeoutError, ConnectionError))
 
 
-def check_voice_name(voice: str) -> None:
-    # the voice names a directory of every clip: one plain path segment only
-    if not voice or voice in (".", "..") or any(c in voice for c in "/\\\0"):
-        raise ValueError(f"unusable voice name {voice!r}")
-
-
 def sync_session(*, model: str, instruction: str = "", style: Optional[str] = None,
                  rpm: float = 10, synth: Optional[Callable] = None,
                  clock: Callable[[], float] = time.monotonic,
@@ -65,7 +60,7 @@ def sync_session(*, model: str, instruction: str = "", style: Optional[str] = No
     A style for a model that takes none raises GeminiStyleUnsupportedError here."""
     sent_style, inline = route_direction(model, instruction, style)
     synth = synth or gemini_tts.synthesize_pcm
-    limiter = RateLimiter(rpm, burst=1, clock=clock, sleep=sleep)
+    limiter = RateLimiter(rpm, clock=clock, sleep=sleep)
 
     def take(word: str, voice: str) -> bytes:
         return synth(word, voice=voice, instruct=instruction, model=model, style=style,
@@ -111,7 +106,7 @@ def run_sync(manifest: Manifest, out_dir: str, *, lang: str, voice: str, model: 
     GeminiStyleUnsupportedError before any row is touched, as does a locale
     voice on a model not verified with it (GeminiVoiceUnsupportedError).
     """
-    check_voice_name(voice)
+    check_segment(voice)
     gemini_tts.check_voice(voice, model)
     take, sent_style, inline = sync_session(model=model, instruction=instruction, style=style,
                                             rpm=rpm, synth=synth, clock=clock, sleep=sleep)

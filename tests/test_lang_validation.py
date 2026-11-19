@@ -212,9 +212,9 @@ def test_path_under(tmp_path):
 def test_save_phrase_refuses_a_path_outside_the_bank(client, tmp_path):
     """Called directly, past the request validation: the writer's own check
     (a bad lang, an absolute lang, and a bad voice label)."""
-    from src.server import _save_phrase
+    from src.server import _Clip, _save_phrase
     for lang, voice in [("../../escaped", "Kore"), ("{out}", "Kore"), ("en-us", "x/../../../escaped")]:
         with _nothing_written(tmp_path, client.paths.db):
             with pytest.raises(HTTPException) as exc:
-                _save_phrase("hello there", _bad(lang, tmp_path), voice, b"OggS", pcm=b"\0\0")
+                _save_phrase("hello there", _bad(lang, tmp_path), _Clip(b"OggS", voice, "gemini", b"\0\0"))
         assert exc.value.status_code == 500 and "outside" in exc.value.detail, (lang, voice)

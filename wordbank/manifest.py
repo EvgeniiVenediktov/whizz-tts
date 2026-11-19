@@ -29,15 +29,12 @@ import threading
 import time
 from typing import Iterable, Optional
 
-from .gemini_tts import plain_voice_label
 from .paths import voice_from_path
 
 PENDING = "pending"
 SUBMITTED = "submitted"   # enqueued in an async batch job, awaiting results
-DONE = "done"            # audio written to disk (batch path; not STT-verified)
-VERIFIED = "verified"    # audio written AND confirmed by STT (sync path)
+DONE = "done"            # audio written to disk
 FAILED = "failed"
-QUARANTINED = "quarantined"
 # A batch take flagged by QC (wordbank/qc.py), queued for a re-take: its best
 # take so far waits at qc.retake_path, outside the bank tree, until a take
 # passes or the re-takes run out. Not served. Re-taken only by a batch with the
@@ -60,11 +57,7 @@ CREATE TABLE IF NOT EXISTS words (
     status       TEXT NOT NULL DEFAULT 'pending',
     attempts     INTEGER NOT NULL DEFAULT 0,
     file_path    TEXT,
-    transcript   TEXT,
     billed_chars INTEGER,
-    seed         INTEGER,
-    ref_audio    TEXT,
-    ref_text     TEXT,
     model        TEXT,
     style        TEXT,
     error        TEXT,
@@ -92,11 +85,7 @@ CREATE TABLE IF NOT EXISTS phrases (
     status       TEXT NOT NULL DEFAULT 'pending',
     attempts     INTEGER NOT NULL DEFAULT 0,
     file_path    TEXT,
-    transcript   TEXT,
     billed_chars INTEGER,
-    seed         INTEGER,
-    ref_audio    TEXT,
-    ref_text     TEXT,
     model        TEXT,
     style        TEXT,
     error        TEXT,
@@ -124,12 +113,9 @@ CREATE INDEX IF NOT EXISTS idx_phrases_lang_text ON phrases(lang, text);
 CREATE TRIGGER IF NOT EXISTS words_add_dedup BEFORE INSERT ON words
 WHEN EXISTS (SELECT 1 FROM words WHERE lang = NEW.lang AND word = NEW.word
              AND (NEW.voice IS NULL OR voice = NEW.voice
-                  OR (voice IS NULL AND status NOT IN ('done', 'verified'))))
+                  OR (voice IS NULL AND status != 'done')))
 BEGIN SELECT RAISE(IGNORE); END;
 """
-
-# A content row holding a clip (_migrate_phrase_voices).
-_CLIP_SQL = f"status IN ('{DONE}', '{VERIFIED}') AND file_path IS NOT NULL"
 
 # QC columns (see qc.Check); NULL measurements = never checked. qc_accepted = 1:
 # a person listened and kept the clip despite its flag, so `qc` skips it.
@@ -150,9 +136,7 @@ class Manifest:
         self._conn.executescript(_SCHEMA)
         # Forward-compat: add columns to manifests created before they existed.
         for tbl in ("words", "phrases"):
-            for col, decl in (("batch_id", "TEXT"), ("voice", "TEXT"),
-                              ("seed", "INTEGER"), ("ref_audio", "TEXT"),
-                              ("ref_text", "TEXT"), ("model", "TEXT"),
+            for col, decl in (("batch_id", "TEXT"), ("voice", "TEXT"), ("model", "TEXT"),
                               ("style", "TEXT"), *_QC_COLUMNS):
                 try:
                     self._conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {decl}")
@@ -167,7 +151,6 @@ class Manifest:
         # a second voice's take of a banked word was dropped the same way.
         if ["lang", "word", "voice"] not in self._unique_keys("words"):
             self._rebuild("words", self._migrate_word_rows)
-        self._migrate_phrase_voices()
         self._conn.executescript(_POST_SCHEMA)
 
     def _unique_keys(self, table: str) -> list:
@@ -224,11 +207,7 @@ class Manifest:
           ingested it was for, since the old key held one voice per word. Left
           NULL, a second voice's run could claim it. What stays NULL (no or
           several voices in its language, done clips whose path has none) is
-          unattributed — see the module docstring;
-        - the "review: <reasons>" notes data/bank-en-gb/flag.py wrote into
-          `error` on done rows move to `review` (the same reason texts as
-          qc.Check), so `error` only holds generation failures. Their
-          measurements stay NULL until `wordbank qc` re-checks them.
+          unattributed — see the module docstring.
         Under the old UNIQUE(word, lang) neither can collide with another row."""
         for row_id, file_path in self._conn.execute(
                 "SELECT id, file_path FROM words WHERE voice IS NULL "
@@ -241,69 +220,7 @@ class Manifest:
                 "GROUP BY lang HAVING COUNT(DISTINCT voice) = 1").fetchall():
             self._conn.execute(
                 "UPDATE words SET voice = ? WHERE lang = ? AND voice IS NULL "
-                "AND status NOT IN (?, ?)", (voice, lang, DONE, VERIFIED))
-        self._conn.execute(
-            "UPDATE words SET review = substr(error, 9), error = NULL "
-            "WHERE error LIKE 'review: %' AND status IN (?, ?)", (DONE, VERIFIED))
-
-    def _migrate_phrase_voices(self) -> None:
-        """Phrases were labelled "gemini-<label>" ("gemini-Kore") while words
-        were "Kore"; a phrase now takes its voice's word label. Rewritten once,
-        on open: the legacy spelling -> plain_voice_label ("gemini-puck" ->
-        "Puck"). Any other label (e.g. a removed local voice's "local-...") is
-        left as is. Clips don't move: phrases are still filed under
-        `<lang>/gemini-<label>/phrases/`, like words.
-
-        A rewrite may meet a row already keyed (text, lang, label): another
-        spelling of the same voice, or a row newer code wrote. Of the two, the
-        one with a clip (done/verified, with a file_path), then the lower id,
-        takes the label. The other is deleted if it has no clip (an unfinished
-        save: no audio is lost); one with a clip is kept under a legacy
-        spelling (its own, or the winner's old one if it held the label) and
-        stays so: BankLookup matches both spellings, oldest first, so it
-        serves the winner, and later opens leave the pair alone."""
-        select = (f"SELECT id, text, lang, voice, {_CLIP_SQL} AS clip FROM phrases "
-                  "WHERE voice GLOB 'gemini-?*' ORDER BY id")
-
-        def holder(row):        # the row keyed under row's plain label, if any
-            return self._conn.execute(
-                f"SELECT id, voice, {_CLIP_SQL} AS clip FROM phrases "
-                "WHERE text = ? AND lang = ? AND voice = ?",
-                (row["text"], row["lang"], plain_voice_label(row["voice"]))).fetchone()
-
-        def loser(row, held):   # no clip, else the higher id
-            return max((row, held), key=lambda r: (not r["clip"], r["id"]))
-
-        def kept(row):          # a duplicate with a clip, kept by an earlier open
-            held = holder(row)
-            return held is not None and row["clip"] and loser(row, held) is row
-
-        if all(kept(row) for row in self._conn.execute(select).fetchall()):
-            return              # nothing to rewrite: no write lock
-        with self._lock:
-            try:
-                self._conn.execute("BEGIN IMMEDIATE")
-                for row in self._conn.execute(select).fetchall():
-                    held = holder(row)
-                    if held is not None:
-                        other = loser(row, held)
-                        if not other["clip"]:
-                            self._conn.execute("DELETE FROM phrases WHERE id = ?", (other["id"],))
-                            if other is row:
-                                continue
-                        elif other is row:
-                            continue                    # keeps its legacy spelling
-                        else:                           # the holder takes row's spelling
-                            self._conn.execute("UPDATE phrases SET voice = NULL WHERE id = ?",
-                                               (row["id"],))
-                            self._conn.execute("UPDATE phrases SET voice = ? WHERE id = ?",
-                                               (row["voice"], held["id"]))
-                    self._conn.execute("UPDATE phrases SET voice = ? WHERE id = ?",
-                                       (plain_voice_label(row["voice"]), row["id"]))
-                self._conn.commit()
-            except Exception:
-                self._conn.rollback()
-                raise
+                "AND status != ?", (voice, lang, DONE))
 
     def close(self) -> None:
         with self._lock:
@@ -376,13 +293,11 @@ class Manifest:
             ).fetchone()[0]
 
     def set_status(self, row_id: int, status: str, *, error: Optional[str] = None,
-                   file_path: Optional[str] = None, transcript: Optional[str] = None,
-                   billed_chars: Optional[int] = None, voice: Optional[str] = None,
-                   seed: Optional[int] = None, ref_audio: Optional[str] = None,
-                   ref_text: Optional[str] = None, model: Optional[str] = None,
+                   file_path: Optional[str] = None, billed_chars: Optional[int] = None,
+                   voice: Optional[str] = None, model: Optional[str] = None,
                    style: Optional[str] = None, check=None,
                    qc_takes: Optional[int] = None) -> None:
-        # voice/seed/ref_* use COALESCE so a later status-only update (e.g. a
+        # voice uses COALESCE so a later status-only update (e.g. a
         # retry marking FAILED) never clobbers recorded provenance. model/style
         # are one record: passing `model` (a generation result) writes both,
         # style exactly as given — None means "no direction", so a re-take
@@ -399,12 +314,9 @@ class Manifest:
         with self._lock:
             self._conn.execute(
                 f"UPDATE {self.table} SET status = ?, error = ?, file_path = ?, "
-                "transcript = ?, billed_chars = ?, voice = COALESCE(?, voice), "
-                "seed = COALESCE(?, seed), ref_audio = COALESCE(?, ref_audio), "
-                "ref_text = COALESCE(?, ref_text), "
+                "billed_chars = ?, voice = COALESCE(?, voice), "
                 f"{_PROVENANCE_SQL}, {qc_sql}updated_at = ? WHERE id = ?",
-                (status, error, file_path, transcript, billed_chars, voice,
-                 seed, ref_audio, ref_text, model, model, style, *qc_params,
+                (status, error, file_path, billed_chars, voice, model, model, style, *qc_params,
                  time.time(), row_id),
             )
             self._conn.commit()
@@ -421,19 +333,20 @@ class Manifest:
             )
             self._conn.commit()
 
-    def mark_submitted(self, row_ids, batch_id: str, *, model: Optional[str] = None,
-                       style: Optional[str] = None) -> None:
+    def mark_submitted(self, row_ids, batch_id: str, *, voice: Optional[str] = None,
+                       model: Optional[str] = None, style: Optional[str] = None) -> None:
         """Mark entries as enqueued in an async batch job (counts as one attempt;
         a QC re-take doesn't: its row was generated, it counts in qc_takes).
-        `model`/`style` record the request's provenance now, since a later
-        collect (possibly another process) doesn't know them."""
+        `voice` (claiming an unattributed row) and `model`/`style` record the
+        request now, since a later collect (possibly another process) doesn't
+        know it."""
         now = time.time()
         with self._lock:
             self._conn.executemany(
-                f"UPDATE {self.table} SET status = ?, batch_id = ?, "
+                f"UPDATE {self.table} SET status = ?, batch_id = ?, voice = COALESCE(voice, ?), "
                 f"attempts = attempts + (status != '{RETAKE}'), {_PROVENANCE_SQL}, "
                 "updated_at = ? WHERE id = ?",
-                [(SUBMITTED, batch_id, model, model, style, now, wid) for wid in row_ids],
+                [(SUBMITTED, batch_id, voice, model, model, style, now, wid) for wid in row_ids],
             )
             self._conn.commit()
 
@@ -484,7 +397,7 @@ class Manifest:
         with self._lock:
             flagged, unchecked, accepted = self._conn.execute(
                 f"SELECT COUNT(review), SUM(qc_end_db IS NULL AND qc_accepted = 0), SUM(qc_accepted) "
-                f"FROM {self.table} WHERE status IN (?, ?, ?)", (DONE, VERIFIED, RETAKE)).fetchone()
+                f"FROM {self.table} WHERE status IN (?, ?)", (DONE, RETAKE)).fetchone()
         return {"flagged": flagged, "unchecked": unchecked or 0, "accepted": accepted or 0}
 
     def accept_qc(self, row_ids) -> None:

@@ -31,9 +31,9 @@ python3 -m venv .venv
 import sqlite3, pathlib
 db = sqlite3.connect("wordbank.db")
 db.execute("PRAGMA query_only = ON")
-w = db.execute("SELECT COUNT(*) FROM words WHERE status IN ('done','verified')").fetchone()[0]
+w = db.execute("SELECT COUNT(*) FROM words WHERE status = 'done'").fetchone()[0]
 try:
-    p = db.execute("SELECT COUNT(*) FROM phrases WHERE status IN ('done','verified')").fetchone()[0]
+    p = db.execute("SELECT COUNT(*) FROM phrases WHERE status = 'done'").fetchone()[0]
 except sqlite3.OperationalError:
     p = 0
 ogg = sum(1 for _ in pathlib.Path("output/words_ogg").rglob("*.ogg"))

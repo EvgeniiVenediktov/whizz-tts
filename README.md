@@ -44,11 +44,8 @@ Two content tables are the source of truth (and the text→file index), stored
 - **`phrases`** — the phrase bank, `UNIQUE(text, lang, voice)` (a phrase can
   exist in several voices). Written by `POST /v1/speak` on a miss. Its `voice`
   is the same label as a word's (`Kore`), so a voice's bank is its words plus
-  its phrases. Phrases saved before that say `gemini-Kore`: relabelled once
-  when the `wordbank` tools (or the server's first `/v1/speak` save) open the
-  bank, and read as `Kore` by lookups until then. A clash with a row already
-  labelled `Kore` for the same text keeps the one with a clip, then the older;
-  the other is deleted if it has no clip, else kept under the old spelling.
+  its phrases. Phrases saved by older code say `gemini-Kore`; lookups read
+  them as `Kore`.
 
 Both share the same columns:
 
@@ -57,16 +54,15 @@ Both share the same columns:
 | `id` | PK; also the filename prefix and shard key (`id // 1000`) |
 | `word` / `text`, `lang` | leading `(lang, …)` index → exact lookup is an O(log n) hit |
 | `voice` | the voice label the clip was generated with (`Kore`, `en-gb-tutor-11`; the same for words and phrases; surfaced in lookups) |
-| `status` | `pending → submitted → done` (or `verified` / `failed` / `quarantined`; `retake`: a batch take QC flagged, queued for a re-take, not served) |
+| `status` | `pending → submitted → done` (or `failed`; `retake`: a batch take QC flagged, queued for a re-take, not served) |
 | `file_path` | **relative to the bank root**, e.g. `en/gemini-Kore/1/1914_hello.wav` |
-| `seed`, `ref_audio`, `ref_text` | provenance of phrases made by the removed local OmniVoice pipeline; null for Gemini clips |
 | `model`, `style` | **provenance for Gemini clips** — the model and the delivery direction used (`style`: the speech-metadata style on 3.8 models, the inline prefix such as `VOICE_INSTRUCTION` on 3.1/2.5; NULL = none). NULL on rows generated before these columns existed. Shown by `wordbank export` |
 | `review` | why QC (`wordbank/qc.py`) flagged the clip, e.g. `ends on sound (-31 dB)`, `too long (3.40 s)`; NULL = passed or never checked |
 | `qc_seconds`, `qc_end_db`, `qc_takes` | QC measurements of the current clip (length, last-100 ms level in dBFS; NULL = never checked) and the re-takes it took |
-| `attempts`, `batch_id`, `transcript`, `billed_chars`, `error`, `created_at`, `updated_at` | bookkeeping + metadata (`error`: the last generation failure) |
+| `attempts`, `batch_id`, `billed_chars`, `error`, `created_at`, `updated_at` | bookkeeping + metadata (`error`: the last generation failure) |
 
 Banks created before the local pipeline was removed may also hold an unused
-`voices` table.
+`voices` table and `transcript`/`seed`/`ref_audio`/`ref_text` columns.
 
 Audio lives in two parallel trees; the server resolves `file_path` under the
 configured roots (so location is deployment config, not baked into the data):
@@ -88,7 +84,7 @@ the `UNIQUE` index; prefix autocomplete uses an index range scan.
 | `GET /v1/search?prefix=he` | **merged** word+phrase autocomplete; each result carries a `type` flag (`word`\|`phrase`) and its `voice`, one per voice banked (`kind=word\|phrase`, `voice` restrict) |
 | `GET /v1/bank?prefix=he` | word-only autocomplete (index range scan; optional `voice`) |
 | `GET /v1/bank/{word}` · `/info` | serve a word (OGG default; `wav` dev-only; optional `voice`) · sizes+type+voice |
-| `GET /v1/phrase?text=…` · `/info` | serve a phrase (by text, optional `voice`) · sizes+type+voice+provenance |
+| `GET /v1/phrase?text=…` · `/info` | serve a phrase (by text, optional `voice`) · sizes+type+voice |
 | `POST /v1/speak` | get-or-generate — `text` (required), `lang` (default `en-us`), `voice` (optional: a classic Gemini voice or a curated locale voice, case-insensitive; unknown → `400`), `instruct` (optional, one-off: not looked up or saved). Bank hit in that voice → stored OGG, `X-Source: bank`. Miss → Gemini synth in that voice, saved into the phrase bank under the voice's label, as words are (`Kore`, `en-gb-tutor-11`; filed in `<lang>/gemini-<label>/phrases/`), served with `X-Source: gemini`; `X-Voice` names the voice served (that label, for a word or a phrase). Needs `GEMINI_API_KEY` only on a miss |
 | voice studio | `GET /v1/gemini/voices` (the 30 classic voices), `GET /v1/gemini/languages` (the curated female + male voice per language), `POST /v1/gemini/tts` (preview a voice, nothing saved) |
 
@@ -135,9 +131,8 @@ bytes}, ogg: {...}}` for the compare UI.
 **`GET /v1/phrase`** — `text` (required) · `lang` · `voice` (optional — pin a
 specific voice by its label, `Kore`; the old `gemini-Kore` is accepted too;
 omitted = any) · `format`. The phrase's audio, or 404.
-**`GET /v1/phrase/info`** — same params, plus provenance in the response:
-`seed`, `ref_audio`, `ref_text` (set only on phrases from the removed local
-pipeline).
+**`GET /v1/phrase/info`** — same params; `{text, type, voice, wav: {exists,
+bytes}, ogg: {...}}`.
 
 **`GET /v1/gemini/voices`** — no params. The 30 classic Gemini voices
 `{name, style, gender}`. They are style presets, **not** language-bound —
@@ -440,8 +435,8 @@ generated.
 
 **Clip QC** (`wordbank/qc.py`, stdlib only). A clip is flagged when its last
 100 ms is louder than -40 dBFS (it ends on sound — usually cut off) or its
-length is outside 0.25–3.0 s. `gemini-run`, `batch`, `batch-collect` and
-`batch-run` check every clip and re-take a flagged one up to `--qc-retries`
+length is outside 0.25–3.0 s. `gemini-run`, `batch-collect` and `batch-run`
+check every clip and re-take a flagged one up to `--qc-retries`
 times (default 2; 0 = only flag), with the same model, voice and style: the
 first passing take is kept; if every take is flagged the best one is kept
 (plausible length first, then the quietest end) and its reason stays in

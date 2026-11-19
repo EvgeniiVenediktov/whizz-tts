@@ -105,20 +105,19 @@ class GeminiNetworkError(GeminiAPIError):
 @dataclass(frozen=True)
 class TTSModel:
     style: bool
-    inline: bool
     locale_voices: bool
 
 
 TTS_MODELS = {
-    "gemini-3.8-flash-tts": TTSModel(style=True, inline=False, locale_voices=True),
-    "gemini-3.8-flash-lite-tts": TTSModel(style=True, inline=False, locale_voices=True),
-    "gemini-3.1-flash-tts-preview": TTSModel(style=False, inline=True, locale_voices=False),
-    "gemini-2.5-flash-preview-tts": TTSModel(style=False, inline=True, locale_voices=False),
-    "gemini-2.5-pro-preview-tts": TTSModel(style=False, inline=True, locale_voices=False),
+    "gemini-3.8-flash-tts": TTSModel(style=True, locale_voices=True),
+    "gemini-3.8-flash-lite-tts": TTSModel(style=True, locale_voices=True),
+    "gemini-3.1-flash-tts-preview": TTSModel(style=False, locale_voices=False),
+    "gemini-2.5-flash-preview-tts": TTSModel(style=False, locale_voices=False),
+    "gemini-2.5-pro-preview-tts": TTSModel(style=False, locale_voices=False),
 }
 # An unlisted model keeps the pre-registry behaviour (inline prefix, no style,
 # classic voices only).
-_UNLISTED = TTSModel(style=False, inline=True, locale_voices=False)
+_UNLISTED = TTSModel(style=False, locale_voices=False)
 
 
 def model_caps(model: str) -> TTSModel:
@@ -167,9 +166,6 @@ def route_direction(model: str, instruct: Optional[str] = None,
         raise GeminiStyleUnsupportedError(
             f"model {model!r} does not accept a style direction (speech metadata); "
             f"style-capable models: {', '.join(style_models())}")
-    if instruct and not caps.inline:
-        raise GeminiStyleUnsupportedError(
-            f"model {model!r} takes no delivery direction (neither style nor inline)")
     return None, instruct
 
 # The 30 classic prebuilt Gemini TTS voices: (name, style descriptor, gender).
@@ -218,19 +214,11 @@ def canonical_voice(name: str) -> Optional[str]:
 
 
 def voice_label(name: str) -> str:
-    """The bank label for any voice name, curated or not: canonical_voice's,
-    else the lowercase id (voice-library ids are lowercase). Word rows key on
-    it, so `--voice kore` and `Kore` stay one voice."""
-    return canonical_voice(name) or name.strip().lower()
-
-
-def plain_voice_label(label: str) -> str:
-    """voice_label of a bank label, also in the spelling phrases had before
-    they took their voice's word label: "gemini-<voice>" ("gemini-Kore" ->
-    "Kore", "gemini-puck" -> "Puck"). Unmigrated banks and upstreams on older
-    code still use it."""
-    name = label.strip()
-    return voice_label(name[len("gemini-"):] if name.startswith("gemini-") else name)
+    """The bank label for any voice name: canonical_voice's, else the lowercase
+    id ("kore" -> "Kore"). Also reads the legacy phrase spelling "gemini-Kore"
+    (older banks and upstreams) as "Kore"."""
+    name = name.strip().removeprefix("gemini-")
+    return canonical_voice(name) or name.lower()
 
 
 def is_classic_voice(name: str) -> bool:

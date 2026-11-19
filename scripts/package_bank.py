@@ -67,7 +67,7 @@ def main() -> None:
     conn = sqlite3.connect(args.db)
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     ready = conn.execute(
-        "SELECT COUNT(*) FROM words WHERE status IN ('done','verified')"
+        "SELECT COUNT(*) FROM words WHERE status = 'done'"
     ).fetchone()[0]
     conn.close()
 

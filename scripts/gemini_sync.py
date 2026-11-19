@@ -29,7 +29,7 @@ def main() -> None:
     p.add_argument("--style", default=None, help="speech-metadata style (3.8 models only)")
     p.add_argument("--out", default="output/words_sync")
     args = p.parse_args()
-    instruct = VOICE_INSTRUCTION if model_caps(args.model).inline else ""
+    instruct = VOICE_INSTRUCTION if not model_caps(args.model).style else ""
 
     words = [w.strip() for w in open(args.words, encoding="utf-8")
              if w.strip() and not w.startswith("#")]

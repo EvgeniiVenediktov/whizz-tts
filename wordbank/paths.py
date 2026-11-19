@@ -38,6 +38,13 @@ def path_under(root: str, rel: str) -> str:
     return os.path.join(root, rel)
 
 
+def check_segment(name: str) -> None:
+    """ValueError unless `name` is one plain path segment (a voice names a
+    directory of every clip)."""
+    if not name or name in (".", "..") or any(c in name for c in "/\\\0"):
+        raise ValueError(f"unusable voice {name!r}: not one path segment")
+
+
 def voice_from_path(file_path: str) -> Optional[str]:
     """Recover the `voice` a manifest row was generated with from its stored
     `file_path`, whose directory segment encodes `<backend>-<voice>`:

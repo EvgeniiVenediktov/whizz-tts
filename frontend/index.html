@@ -241,14 +241,7 @@
     const p = bankWord.value.trim();
     clearTimeout(suggestTimer);
     if (!p) { bankList.innerHTML = ''; return; }
-    suggestTimer = setTimeout(async () => {
-      try {                                    // merged: words + phrases, tagged
-        const res = await fetch(`${SEARCH}?prefix=${encodeURIComponent(p)}&limit=10&${langQ()}`);
-        const { results } = await res.json();
-        bankList.innerHTML = results.map(r =>
-          `<option value="${esc(r.text)}" label="${r.type}${r.voice ? ' · ' + r.voice : ''}">`).join('');
-      } catch { /* ignore autocomplete errors */ }
-    }, 120);
+    suggestTimer = setTimeout(() => refreshSuggestions(p), 120);
   });
 
   // Resolve a text to its bank entry: try the word bank, then the phrase bank.
