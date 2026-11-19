@@ -236,6 +236,10 @@ scripts/docker-run.sh fat
 # bind-mounted when present, else bank-less via GEMINI_API_KEY from .env:
 scripts/docker-build-thin.sh && scripts/docker-run.sh thin   # DOCKER_DNS=8.8.8.8 if local DNS blocks Gemini
 
+# The image runs as uid 1000 (`app`); a /data volume written by an older, root-run
+# image needs one chown first:
+#   docker run --rm --user 0 -v <volume>:/data --entrypoint chown whizz-tts:thin -R 1000:1000 /data
+
 # Docker compose — dev-only convenience, mounts library.json/tts-bank.tar.gz as a volume:
 docker compose --profile bank up --build
 ```

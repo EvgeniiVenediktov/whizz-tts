@@ -33,7 +33,14 @@ COPY src/ ./src/
 COPY wordbank/ ./wordbank/
 COPY frontend/ ./frontend/
 COPY docker-entrypoint.sh ./
-RUN chmod +x docker-entrypoint.sh
+# Code stays root-owned (read-only to the server); only /data belongs to the
+# unprivileged `app` user (uid 1000) the server runs as. Bytecode is compiled
+# here because `app` can't write __pycache__ into /app.
+RUN chmod +x docker-entrypoint.sh && \
+    python -m compileall -q src wordbank && \
+    useradd --uid 1000 --no-create-home --shell /usr/sbin/nologin app && \
+    mkdir -p /data && chown app:app /data
+USER app
 
 ENV SERVE_FRONTEND=1 \
     BANK_DB=/data/wordbank.db \
@@ -69,7 +76,7 @@ CMD ["uvicorn", "src.server:app", "--host", "0.0.0.0", "--port", "8000"]
 # context. Everything else — verify, unpack, HEALTHCHECK, entrypoint — is
 # identical to `base`.
 FROM base AS runtime-fat
-COPY library.json tts-bank.tar.gz /data/
+COPY --chown=app:app library.json tts-bank.tar.gz /data/
 
 # `runtime` is a plain alias for `base`, kept as the LAST stage in this file
 # so it stays the implicit default target (`docker build .` with no --target)

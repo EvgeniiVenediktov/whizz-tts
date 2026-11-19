@@ -186,6 +186,10 @@ dev-only convenience: `docker compose --profile bank up --build`):
   finds the archive already there. For deploying before persistent storage
   exists — every rollout re-bakes the bank into the image. Requires
   `library.json`/`tts-bank.tar.gz` present at build time (`scripts/pack.sh`).
+- Both run as the unprivileged user `app` (uid 1000): code under `/app` is root-owned
+  and read-only to the server, `/data` belongs to `app`. A fresh named volume inherits
+  that; a volume written by an older (root) image needs a one-time
+  `docker run --rm --user 0 -v <volume>:/data --entrypoint chown whizz-tts:thin -R 1000:1000 /data`.
 
 `scripts/docker-build-thin.sh` / `scripts/docker-build-fat.sh` wrap the plain
 `docker build --target runtime` / `--target runtime-fat`. `scripts/docker-run.sh thin|fat`
