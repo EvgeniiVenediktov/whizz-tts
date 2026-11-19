@@ -17,7 +17,7 @@ from wordbank.constants import BANK_OGG_APPLICATION, BANK_OGG_BITRATE
 from wordbank.gemini_tts import (DEFAULT_MODEL as GEMINI_TTS_DEFAULT_MODEL,
                                  GeminiStyleUnsupportedError, GeminiVoiceUnsupportedError,
                                  canonical_voice, check_voice, is_classic_voice,
-                                 style_models, supports_style)
+                                 style_models, supports_style, voice_label)
 from wordbank.languages import normalize_lang
 from wordbank.lookup import BankLookup
 from wordbank.paths import voice_from_path
@@ -112,6 +112,18 @@ def _gemini_voice(voice: Optional[str]) -> Optional[str]:
         raise HTTPException(400, f"unknown Gemini voice {voice!r} "
                                  "(see /v1/gemini/voices and /v1/gemini/languages)")
     return canon
+
+
+def _bank_voice(voice: Optional[str]) -> Optional[str]:
+    """A lookup's `voice` as the word bank labels it (gemini_tts.voice_label:
+    "kore" -> "Kore"), None when omitted. Lenient, unlike _gemini_voice: a
+    read can't waste a Gemini call, and a bank may hold any library voice."""
+    return voice_label(voice) if voice and voice.strip() else None
+
+
+def _default_voice() -> str:
+    """GEMINI_TTS_VOICE as a bank label: preferred by lookups without a voice."""
+    return canonical_voice(GEMINI_TTS_VOICE) or GEMINI_TTS_VOICE
 
 
 def _check_voice(voice: str, model: str, server_default: bool = False) -> None:
@@ -232,17 +244,33 @@ def languages():
 
 @app.get("/v1/search")
 def search(prefix: str, lang: str = DEFAULT_LANG, limit: int = 10,
-           kind: Optional[str] = None):
+           kind: Optional[str] = None, voice: Optional[str] = None):
     """Merged prefix search over the word + phrase banks. Each result carries a
-    `type` flag ('word'|'phrase') and the `voice` it was generated with.
-    `kind=word|phrase` restricts to one bank."""
-    return {"results": app.state.bank.search(prefix, _lang(lang), min(limit, 50), kind)}
+    `type` flag ('word'|'phrase') and the `voice` it was generated with — one
+    result per voice a text is banked in. `kind=word|phrase` restricts to one
+    bank; `voice` to that voice (words by the bare label, phrases by
+    `gemini-<label>`, as /v1/speak matches them)."""
+    return {"results": app.state.bank.search(prefix, _lang(lang), min(limit, 50), kind,
+                                             _bank_voice(voice))}
 
 
 @app.get("/v1/bank")
-def bank_suggest(prefix: str, lang: str = DEFAULT_LANG, limit: int = 10):
-    """Prefix autocomplete over the word bank only (index-backed range scan)."""
-    return {"words": app.state.bank.suggest(prefix, _lang(lang), min(limit, 50))}
+def bank_suggest(prefix: str, lang: str = DEFAULT_LANG, limit: int = 10,
+                 voice: Optional[str] = None):
+    """Prefix autocomplete over the word bank only (index-backed range scan):
+    distinct words, optionally only those banked in `voice`."""
+    return {"words": app.state.bank.suggest(prefix, _lang(lang), min(limit, 50),
+                                            _bank_voice(voice))}
+
+
+def _bank_word(word: str, lang: str, voice: Optional[str]):
+    """The word's banked row: in `voice` when given, else the default voice's
+    clip if banked, else the earliest banked; 404 when there is none."""
+    row = app.state.bank.get(word, _lang(lang), voice=_bank_voice(voice),
+                             prefer=_default_voice())
+    if row is None:
+        raise HTTPException(404, "not in bank")
+    return row
 
 
 def _serve_audio(rel: str, format: str, headers: Optional[dict] = None):
@@ -260,23 +288,23 @@ def _serve_audio(rel: str, format: str, headers: Optional[dict] = None):
 
 
 @app.get("/v1/bank/{word}/info")
-def bank_info(word: str, lang: str = DEFAULT_LANG):
-    """Sizes/availability of the WAV master and OGG copy — for the compare UI."""
-    row = app.state.bank.get(word, _lang(lang))
-    if row is None:
-        raise HTTPException(404, "not in bank")
+def bank_info(word: str, lang: str = DEFAULT_LANG, voice: Optional[str] = None):
+    """Sizes/availability of the WAV master and OGG copy — for the compare UI.
+    `voice` picks one of the voices the word is banked in (see bank_get)."""
+    row = _bank_word(word, lang, voice)
     rel = row["file_path"]
     return {"word": row["word"], "type": "word", "voice": row["voice"],
             "wav": _file_info(_wav_abs(rel)), "ogg": _file_info(_ogg_abs(rel))}
 
 
 @app.get("/v1/bank/{word}")
-def bank_get(word: str, lang: str = DEFAULT_LANG, format: str = "ogg"):
-    """Serve a word's audio (OGG by default, WAV master in dev)."""
-    row = app.state.bank.get(word, _lang(lang))
-    if row is None:
-        raise HTTPException(404, "not in bank")
-    return _serve_audio(row["file_path"], format)
+def bank_get(word: str, lang: str = DEFAULT_LANG, format: str = "ogg",
+             voice: Optional[str] = None):
+    """Serve a word's audio (OGG by default, WAV master in dev). A word can be
+    banked in several voices: `voice` (case-insensitive label, "Kore",
+    "en-gb-tutor-14") pins one, else the default GEMINI_TTS_VOICE's clip is
+    served if banked, else the earliest banked."""
+    return _serve_audio(_bank_word(word, lang, voice)["file_path"], format)
 
 
 @app.get("/v1/phrase/info")
@@ -309,12 +337,14 @@ def _bank_voice_headers(source: str, voice: Optional[str]) -> dict:
     return {"X-Source": source, **({"X-Voice": voice} if voice and voice.isascii() else {})}
 
 
-def _speak_bank_hit(text: str, lang: str, voice: Optional[str], bank_voice: str):
+def _speak_bank_hit(text: str, lang: str, voice: Optional[str], eff_voice: str):
     """The banked recording /v1/speak should serve, or None. Single tokens may be
-    in the word bank; anything may be in the phrase bank. A manifest row whose
+    in the word bank; anything may be in the phrase bank. Without a `voice`,
+    the default voice (`eff_voice`) is preferred in both. A manifest row whose
     OGG is missing on disk is a MISS."""
+    bank_voice = f"gemini-{eff_voice}"
     if not any(c.isspace() for c in text):
-        row = app.state.bank.get(text, lang, voice=voice)
+        row = app.state.bank.get(text, lang, voice=voice, prefer=eff_voice)
         if row is not None and os.path.exists(_ogg_abs(row["file_path"])):
             row_voice = row["voice"] or voice_from_path(row["file_path"] or "")
             return _serve_audio(row["file_path"], "ogg",
@@ -508,7 +538,7 @@ async def speak(
     lang = _lang(lang)
     voice = _gemini_voice(voice)
     instruct = (instruct or "").strip()
-    eff_voice = voice or canonical_voice(GEMINI_TTS_VOICE) or GEMINI_TTS_VOICE
+    eff_voice = voice or _default_voice()
     bank_voice = f"gemini-{eff_voice}"
     upstream = _upstream_url()
 
@@ -528,7 +558,7 @@ async def speak(
         return Response(content=ogg, media_type="audio/ogg",
                         headers=_bank_voice_headers(source, label))
 
-    hit = _speak_bank_hit(text, lang, voice, bank_voice)
+    hit = _speak_bank_hit(text, lang, voice, eff_voice)
     if hit is not None:
         return hit
     if not _speak_store():
@@ -536,7 +566,7 @@ async def speak(
         return Response(content=ogg, media_type="audio/ogg",
                         headers=_bank_voice_headers(source, label))
     async with _single_flight((text.lower(), lang, bank_voice)):
-        hit = _speak_bank_hit(text, lang, voice, bank_voice)   # a queued twin may have saved it
+        hit = _speak_bank_hit(text, lang, voice, eff_voice)   # a queued twin may have saved it
         if hit is not None:
             return hit
         ogg, label, source, pcm, billed, provenance = await _generate()

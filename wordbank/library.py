@@ -2,7 +2,9 @@
 
 A **description file** (JSON) records what a provisioned bank should contain —
 languages, word/phrase counts, OGG file count, and the folders that must
-exist. At deploy time the container verifies the mounted volume against it and
+exist. Word counts are clips: a word banked in two voices counts twice
+(`languages.wordbank_voices` breaks them down per language and voice). At
+deploy time the container verifies the mounted volume against it and
 unpacks the library archive only if verification fails. Uses read-only
 `BankLookup` (never creates/mutates the DB) + the stdlib, so it runs in the
 bank-only image with no extra deps.
@@ -20,6 +22,7 @@ def describe(db: str, ogg_root: str) -> dict:
     bl = BankLookup(db)
     wb = bl.languages()
     pb = bl.phrase_languages()
+    wv = bl.word_voices()
     bl.close()
 
     ogg = pathlib.Path(ogg_root)
@@ -29,7 +32,7 @@ def describe(db: str, ogg_root: str) -> dict:
         "words": sum(l["words"] for l in wb),
         "phrases": sum(l["words"] for l in pb),
         "ogg_files": sum(1 for _ in ogg.rglob("*.ogg")) if ogg.is_dir() else 0,
-        "languages": {"wordbank": wb, "phrasebank": pb},
+        "languages": {"wordbank": wb, "phrasebank": pb, "wordbank_voices": wv},
     }
 
 
@@ -37,7 +40,7 @@ def verify(desc_path: str, root: Optional[str] = None, *, db: Optional[str] = No
            ogg_root: Optional[str] = None) -> List[str]:
     """Check a bank against the description. Returns a list of problems (empty = OK).
 
-    The word count must match exactly. Phrase and OGG counts are minimums: the
+    The word (clip) count must match exactly. Phrase and OGG counts are minimums: the
     running server adds phrases (and their OGGs) via /v1/speak, so a volume that
     has served traffic legitimately holds more than the packaged library. Exact
     matching there made every restart after a /v1/speak write fail verification

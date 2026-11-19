@@ -50,6 +50,25 @@ def test_describe_captures_bank(tmp_path):
     assert {"code": "en-us", "words": 1} in d["languages"]["phrasebank"]
 
 
+def test_describe_counts_clips_per_voice(tmp_path):
+    """A word banked in two voices is two clips; the breakdown says which."""
+    _seed_root(tmp_path)                                      # cat, dog in Kore
+    wm = Manifest(str(tmp_path / "wordbank.db"))
+    wm.add_words(["cat"], "en-us", voice="Iapetus")
+    rel = "en-us/gemini-Iapetus/0/3_cat.wav"
+    wm.set_status(wm.get_entry("cat", "en-us", "Iapetus")["id"], DONE, file_path=rel)
+    wm.close()
+    (tmp_path / "words_ogg" / "en-us" / "gemini-Iapetus" / "0").mkdir(parents=True)
+    (tmp_path / "words_ogg" / (rel[:-4] + ".ogg")).write_bytes(b"OggS")
+
+    desc = _describe(tmp_path)
+    assert (desc["words"], desc["ogg_files"]) == (3, 3)
+    assert desc["languages"]["wordbank_voices"] == [
+        {"code": "en-us", "voice": "Iapetus", "words": 1},
+        {"code": "en-us", "voice": "Kore", "words": 2}]
+    assert verify(str(tmp_path / "library.json"), str(tmp_path)) == []
+
+
 def test_verify_missing_description(tmp_path):
     problems = verify(str(tmp_path / "nope.json"), str(tmp_path))
     assert len(problems) == 1 and "no description file" in problems[0]

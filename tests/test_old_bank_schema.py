@@ -135,3 +135,62 @@ def test_manifest_adds_provenance_columns_to_an_old_bank(tmp_path):
     bank = BankLookup(db)                       # the reader still serves it
     assert bank.get_phrase("good morning", "en-us") is not None
     bank.close()
+
+
+# The words table as it was before voice joined its key (and before QC).
+_PRE_VOICE_KEY_WORDS = """
+CREATE TABLE words (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    word TEXT NOT NULL, lang TEXT NOT NULL, voice TEXT,
+    status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+    file_path TEXT, transcript TEXT, billed_chars INTEGER, seed INTEGER,
+    ref_audio TEXT, ref_text TEXT, model TEXT, style TEXT, error TEXT,
+    batch_id TEXT, created_at REAL, updated_at REAL,
+    UNIQUE(word, lang)
+);
+CREATE INDEX idx_words_lang_word ON words(lang, word);
+INSERT INTO words (id, word, lang, voice, status, file_path, error) VALUES
+  (1, 'cat', 'en-gb', 'en-gb-tutor-11', 'done', 'en-gb/gemini-en-gb-tutor-11/0/1_cat.wav',
+   'review: ends on sound (-31 dB)'),
+  (2, 'dog', 'en-us', NULL, 'done', 'en/gemini-Kore/0/2_dog.wav', NULL),
+  (3, 'emu', 'en-gb', NULL, 'submitted', NULL, NULL),
+  (4, 'gnu', 'fr-fr', NULL, 'pending', NULL, NULL),
+  (5, 'yak', 'fr-fr', NULL, 'pending', NULL, NULL);
+DELETE FROM words WHERE id = 5;
+"""
+
+
+def test_manifest_migrates_the_old_word_key_keeping_rows_and_ids(tmp_path):
+    """UNIQUE(word, lang) held one clip per word: rebuilt once with voice in
+    the key, every row and id kept, the AUTOINCREMENT mark too (ids name
+    files). A NULL voice is recovered from the clip's path; a row not
+    generated yet takes its language's only voice, else stays unattributed
+    and is claimed by the first voice to generate it."""
+    db = str(tmp_path / "old.db")
+    conn = sqlite3.connect(db)
+    conn.executescript(_PRE_VOICE_KEY_WORDS)
+    conn.close()
+
+    m = Manifest(db)
+    rows = {r["id"]: r for r in m.iter_rows()}
+    assert [(r["word"], r["voice"]) for r in rows.values()] == [
+        ("cat", "en-gb-tutor-11"), ("dog", "Kore"), ("emu", "en-gb-tutor-11"), ("gnu", None)]
+    assert (rows[1]["review"], rows[1]["error"], rows[1]["qc_end_db"]) == \
+        ("ends on sound (-31 dB)", None, None)                 # flag.py's note moved
+    before = [dict(r) for r in m.iter_rows()]
+
+    assert m.add_words(["cat", "emu"], "en-gb", voice="en-gb-tutor-14") == 2
+    assert m.get_entry("cat", "en-gb", "en-gb-tutor-14")["id"] == 6   # 5 is never reused
+    assert m.add_words(["gnu"], "fr-fr", voice="fr-fr-x") == 0        # claimed by generating
+    assert [r["word"] for r in m.pending(lang="fr-fr", voice="fr-fr-x")] == ["gnu"]
+    # voice-less, as code predating the key adds: still one row per word
+    assert m.add_words(["cat"], "en-gb") == m.add_words(["dog"], "en-us") == 0
+    m.close()
+
+    m = Manifest(db)                           # reopen: no second migration
+    assert [dict(r) for r in m.iter_rows()][:4] == before
+    assert len(m.iter_rows()) == 6
+    m.close()
+    bank = BankLookup(db)
+    assert bank.get("dog", "en-us", voice="Kore")["file_path"] == "en/gemini-Kore/0/2_dog.wav"
+    bank.close()

@@ -10,12 +10,14 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.conftest import clip_pcm16
 from tests.test_gemini_payload import gemini_lite_wav
+from wordbank import qc
 from wordbank.gemini_batch import (
     VOICE_INSTRUCTION, GeminiBatch, audio_from_line, build_request_body, collect_active, run_batch, run_in_waves, submit_pending,
     write_wav_from_pcm_bytes,
 )
-from wordbank.manifest import DONE, FAILED, PENDING, Manifest, SUBMITTED
+from wordbank.manifest import DONE, FAILED, PENDING, RETAKE, Manifest, SUBMITTED
 
 
 def quiet(*_):
@@ -23,8 +25,9 @@ def quiet(*_):
 
 
 def pcm_for(key) -> bytes:
-    """16-bit mono PCM whose frame count encodes the key (id) for assertions."""
-    return b"\x01\x00" * (100 + int(key))
+    """16-bit mono PCM whose frame count encodes the key (id) for assertions:
+    ~0.5 s, ending quiet, so it passes QC."""
+    return b"\x01\x00" * (12_000 + int(key))
 
 
 class FakeJob:
@@ -136,7 +139,7 @@ def test_keyed_one_to_one_correspondence(tmp_path):
         assert not r["file_path"].startswith("/")        # stored relative to bank root
         with wave.open(str(out / r["file_path"]), "rb") as wf:
             # frame count encodes the id → confirms the right audio landed here
-            assert wf.getnframes() == 100 + r["id"]
+            assert wf.getnframes() == 12_000 + r["id"]
     m.close()
 
 
@@ -230,7 +233,7 @@ def test_collect_writes_only_the_data_chunk_and_fails_unconvertible_audio(tmp_pa
         r = rows[word]
         assert r["status"] == DONE
         with wave.open(str(tmp_path / "out" / r["file_path"]), "rb") as wf:
-            assert wf.getnframes() == 100 + r["id"]     # no header / C2PA frames
+            assert wf.getnframes() == 12_000 + r["id"]     # no header / C2PA frames
     m.close()
 
 
@@ -409,3 +412,105 @@ def test_batch_run_on_a_38_model_needs_an_explicit_direction(tmp_path):
         main(["--db", str(db), "--out", str(tmp_path / "out"), "batch-run",
               "--words", str(words), "--model", "gemini-3.8-flash-tts"])
     assert not db.exists()                                  # refused before ingesting
+
+
+# --- voices: one row per (word, voice) -----------------------------------------
+
+def test_a_second_voice_is_submitted_without_touching_the_first(tmp_path):
+    m = Manifest(str(tmp_path / "wb.db"))
+    m.add_words(["cat", "dog"], "en", voice="Kore")
+    run_batch(m, FakeBatch(voice="Kore"), str(tmp_path / "out"), lang="en",
+              sleep=lambda *_: None, log=quiet)
+    assert m.add_words(["cat", "dog", "emu"], "en", voice="Puck") == 3
+
+    puck = RecordingBatch(voice="Puck")
+    run_batch(m, puck, str(tmp_path / "out"), lang="en", sleep=lambda *_: None, log=quiet)
+    assert [l["request"]["contents"][0]["parts"][0]["text"].split()[-1] for l in puck.lines] \
+        == ["cat", "dog", "emu"]
+    rows = {(r["word"], r["voice"]): r for r in m.iter_rows()}
+    assert len(rows) == 5 and {r["status"] for r in rows.values()} == {DONE}
+    assert rows[("cat", "Kore")]["file_path"].startswith("en/gemini-Kore/")
+    assert rows[("cat", "Puck")]["file_path"].startswith("en/gemini-Puck/")
+    m.close()
+
+
+# --- QC: flagged takes are re-queued for the next submission ------------------------
+
+class ScriptedBatch(FakeBatch):
+    """Answers a word's submissions from `takes[word]` in turn (PCM, or a dict
+    for an error line); other words, and words whose list ran out, get a
+    passing clip. `sent` lists the words of each submitted job."""
+    def __init__(self, takes, **kw):
+        super().__init__(**kw)
+        self.takes, self.sent, self._words = takes, [], {}
+
+    def submit_file(self, jsonl, display_name):
+        words = [json.loads(l)["request"]["contents"][0]["parts"][0]["text"].split()[-1]
+                 for l in jsonl.decode().splitlines() if l.strip()]
+        name = super().submit_file(jsonl, display_name)
+        self.sent.append(words)
+        self._words[name] = words
+        return name
+
+    def result_lines(self, job):
+        for key, word in zip(job.keys, self._words[job.name]):
+            take = (self.takes.get(word) or [clip_pcm16(seed=int(key))]).pop(0)
+            if isinstance(take, dict):
+                yield {"key": key, **take}
+                continue
+            yield {"key": key, "response": {"candidates": [{"content": {"parts": [{"inlineData": {
+                "data": base64.b64encode(take).decode(), "mimeType": "audio/L16"}}]}}]}}
+
+
+def test_waves_retake_flagged_clips_without_spending_generation_attempts(tmp_path):
+    """haha passes on its first re-take; russian's three takes are all flagged,
+    so the best (plausible length, quietest end) is filed with its flag."""
+    m = Manifest(str(tmp_path / "wb.db"))
+    m.add_words(["cat", "haha", "russian"], "en", voice="Kore")
+    best = clip_pcm16(end_db=-30)
+    batch = ScriptedBatch({"haha": [clip_pcm16(end_db=-25)],
+                           "russian": [clip_pcm16(end_db=-20), best, clip_pcm16(3.5)]})
+    run_in_waves(m, batch, str(tmp_path / "out"), lang="en", chunk=10,
+                 sleep=lambda *_: None, log=quiet)
+
+    assert batch.sent == [["cat", "haha", "russian"], ["haha", "russian"], ["russian"]]
+    rows = {r["word"]: r for r in m.iter_rows()}
+    assert [(rows[w]["status"], rows[w]["review"], rows[w]["qc_takes"], rows[w]["attempts"])
+            for w in ("cat", "haha", "russian")] == [
+        (DONE, None, 0, 1), (DONE, None, 1, 1), (DONE, "ends on sound (-30 dB)", 2, 1)]
+    assert qc.read_pcm(tmp_path / "out" / rows["russian"]["file_path"]) == best
+    assert not list((tmp_path / "takes").rglob("*.wav"))        # held takes cleaned up
+    m.close()
+
+
+def test_collect_alone_leaves_a_flagged_row_queued_for_its_own_batch(tmp_path):
+    """batch-collect without waves: the row is flagged and RETAKE (not served,
+    its take held outside the bank tree), and says so; only a batch with the
+    take's voice, model and direction re-takes it, and a re-take that fails
+    falls back to the held take instead of failing the row."""
+    m = Manifest(str(tmp_path / "wb.db"))
+    m.add_words(["haha"], "en", voice="Kore")
+    logs = []
+    batch = ScriptedBatch({"haha": [clip_pcm16(end_db=-25), {"error": {"code": 500}}]})
+    run_batch(m, batch, str(tmp_path / "out"), lang="en", sleep=lambda *_: None,
+              log=logs.append)
+    [row] = m.iter_rows()
+    assert (row["status"], row["review"], row["qc_takes"], row["attempts"]) == \
+        (RETAKE, "ends on sound (-25 dB)", 1, 1)
+    assert any("1 requeued" in line and "same voice, model and direction" in line
+               for line in logs)
+    assert not list((tmp_path / "out").rglob("*.wav"))
+    assert qc.retake_path(m.path, row["id"]).is_file()
+
+    other_direction = ScriptedBatch({})
+    other_direction.instruction = "Say it slowly:"
+    for other in (ScriptedBatch({}, voice="Puck"), other_direction):
+        assert submit_pending(m, other, lang="en", log=quiet) == []
+    run_batch(m, batch, str(tmp_path / "out"), lang="en", qc_retries=1,
+              sleep=lambda *_: None, log=quiet)
+    assert batch.sent == [["haha"], ["haha"]]
+    [row] = m.iter_rows()
+    assert (row["status"], row["review"], row["qc_takes"], row["attempts"]) == \
+        (DONE, "ends on sound (-25 dB)", 1, 1)
+    assert qc.read_pcm(tmp_path / "out" / row["file_path"]) == clip_pcm16(end_db=-25)
+    m.close()

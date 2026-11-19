@@ -111,6 +111,48 @@ def test_lookup_sees_rows_committed_after_open(tmp_path):
     bank.close()
 
 
+def _two_voice_cat(db, ogg_root=None):
+    """`cat` banked in Iapetus first, then Kore (the server's default voice)."""
+    m = Manifest(str(db))
+    for voice in ("Iapetus", "Kore"):
+        m.add_words(["cat"], "en-us", voice=voice)
+        row = m.get_entry("cat", "en-us", voice)
+        rel = f"en-us/gemini-{voice}/0/{row['id']}_cat.wav"
+        m.set_status(row["id"], DONE, file_path=rel, voice=voice)
+        if ogg_root is not None:
+            ogg = ogg_root / (rel[:-4] + ".ogg")
+            ogg.parent.mkdir(parents=True, exist_ok=True)
+            ogg.write_bytes(b"OggS-" + voice.encode())
+    m.close()
+
+
+def test_lookup_picks_among_voices_deterministically(tmp_path):
+    _two_voice_cat(tmp_path / "wb.db")
+    bank = BankLookup(str(tmp_path / "wb.db"))
+    assert bank.get("cat", "en-us", voice="Kore")["voice"] == "Kore"
+    assert bank.get("cat", "en-us", voice="Puck") is None
+    assert bank.get("cat", "en-us", prefer="Kore")["voice"] == "Kore"     # default voice first
+    assert bank.get("cat", "en-us", prefer="Puck")["voice"] == "Iapetus"  # else earliest banked
+    assert bank.get("cat", "en-us")["voice"] == "Iapetus"
+    assert bank.suggest("ca", "en-us") == ["cat"]                         # distinct words
+    assert [r["voice"] for r in bank.search("ca", "en-us")] == ["Iapetus", "Kore"]
+    assert [r["voice"] for r in bank.search("ca", "en-us", voice="Kore")] == ["Kore"]
+    assert bank.count() == 2                                              # clips
+    bank.close()
+
+
+def test_server_serves_the_requested_voice_else_the_default(client):
+    _two_voice_cat(client.paths.db, client.paths.ogg)
+    assert client.get("/v1/bank/cat").content == b"OggS-Kore"
+    assert client.get("/v1/bank/cat", params={"voice": "iapetus"}).content == b"OggS-Iapetus"
+    assert client.get("/v1/bank/cat/info", params={"voice": "Iapetus"}).json()["voice"] == "Iapetus"
+    assert client.get("/v1/bank/cat", params={"voice": "Puck"}).status_code == 404
+    for data, voice in (({}, "Kore"), ({"voice": "Iapetus"}, "Iapetus")):
+        r = client.post("/v1/speak", data={"text": "cat", **data})
+        assert r.headers["x-source"] == "bank" and r.content == b"OggS-" + voice.encode()
+    assert client.gemini.calls == []
+
+
 # --- server endpoints ---
 
 @pytest.fixture

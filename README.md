@@ -33,7 +33,14 @@ serving image needs **no ML stack at all**.
 Two content tables are the source of truth (and the text→file index), stored
 **separately so words and phrases never overlap**:
 
-- **`words`** — the Gemini single-word bank, `UNIQUE(word, lang)`.
+- **`words`** — the Gemini single-word bank, `UNIQUE(lang, word, voice)`: one
+  row per clip, so a word can be banked in several voices (e.g. a woman's and a
+  man's voice per language). Banks keyed `UNIQUE(word, lang)` are rebuilt once
+  when the `wordbank` tools (or the server's first `/v1/speak` save) open them:
+  rows and ids kept, a missing `voice` recovered from `file_path`, and words
+  not generated yet given their language's voice when it has exactly one. A
+  NULL `voice` left after that marks a word never generated: the first voice
+  to generate it claims the row.
 - **`phrases`** — the phrase bank, `UNIQUE(text, lang, voice)` (a phrase can
   exist in several voices). Written by `POST /v1/speak` on a miss.
 
@@ -43,12 +50,14 @@ Both share the same columns:
 |--------|-------|
 | `id` | PK; also the filename prefix and shard key (`id // 1000`) |
 | `word` / `text`, `lang` | leading `(lang, …)` index → exact lookup is an O(log n) hit |
-| `voice` | the voice/reference label the clip was generated with (surfaced in lookups) |
-| `status` | `pending → submitted → done` (or `verified` / `failed` / `quarantined`) |
+| `voice` | the voice label the clip was generated with (`Kore`, `en-gb-tutor-11`; surfaced in lookups) |
+| `status` | `pending → submitted → done` (or `verified` / `failed` / `quarantined`; `retake`: a batch take QC flagged, queued for a re-take, not served) |
 | `file_path` | **relative to the bank root**, e.g. `en/gemini-Kore/1/1914_hello.wav` |
 | `seed`, `ref_audio`, `ref_text` | provenance of phrases made by the removed local OmniVoice pipeline; null for Gemini clips |
 | `model`, `style` | **provenance for Gemini clips** — the model and the delivery direction used (`style`: the speech-metadata style on 3.8 models, the inline prefix such as `VOICE_INSTRUCTION` on 3.1/2.5; NULL = none). NULL on rows generated before these columns existed. Shown by `wordbank export` |
-| `attempts`, `batch_id`, `transcript`, `billed_chars`, `error`, `created_at`, `updated_at` | bookkeeping + metadata |
+| `review` | why QC (`wordbank/qc.py`) flagged the clip, e.g. `ends on sound (-31 dB)`, `too long (3.40 s)`; NULL = passed or never checked |
+| `qc_seconds`, `qc_end_db`, `qc_takes` | QC measurements of the current clip (length, last-100 ms level in dBFS; NULL = never checked) and the re-takes it took |
+| `attempts`, `batch_id`, `transcript`, `billed_chars`, `error`, `created_at`, `updated_at` | bookkeeping + metadata (`error`: the last generation failure) |
 
 Banks created before the local pipeline was removed may also hold an unused
 `voices` table.
@@ -70,9 +79,9 @@ the `UNIQUE` index; prefix autocomplete uses an index range scan.
 |----------|---------|
 | `GET /health` | status, bank path/word-count, Gemini/upstream/store flags |
 | `GET /v1/languages` | `wordbank` + `phrasebank` (data-driven langs + counts) **and** `generate` (curated, listen-verified list) |
-| `GET /v1/search?prefix=he` | **merged** word+phrase autocomplete; each result carries a `type` flag (`word`\|`phrase`) and its `voice` (`kind=word\|phrase` restricts) |
-| `GET /v1/bank?prefix=he` | word-only autocomplete (index range scan) |
-| `GET /v1/bank/{word}` · `/info` | serve a word (OGG default; `wav` dev-only) · sizes+type+voice |
+| `GET /v1/search?prefix=he` | **merged** word+phrase autocomplete; each result carries a `type` flag (`word`\|`phrase`) and its `voice`, one per voice banked (`kind=word\|phrase`, `voice` restrict) |
+| `GET /v1/bank?prefix=he` | word-only autocomplete (index range scan; optional `voice`) |
+| `GET /v1/bank/{word}` · `/info` | serve a word (OGG default; `wav` dev-only; optional `voice`) · sizes+type+voice |
 | `GET /v1/phrase?text=…` · `/info` | serve a phrase (by text, optional `voice`) · sizes+type+voice+provenance |
 | `POST /v1/speak` | get-or-generate — `text` (required), `lang` (default `en-us`), `voice` (optional: a classic Gemini voice or a curated locale voice, case-insensitive; unknown → `400`), `instruct` (optional, one-off: not looked up or saved). Bank hit in that voice → stored OGG, `X-Source: bank`. Miss → Gemini synth in that voice, saved into the phrase bank (`voice=gemini-<Voice>`, e.g. `gemini-Kore`, `gemini-en-gb-tutor-11`), served with `X-Source: gemini`; `X-Voice` names the voice served. Needs `GEMINI_API_KEY` only on a miss |
 | voice studio | `GET /v1/gemini/voices` (the 30 classic voices), `GET /v1/gemini/languages` (the curated female + male voice per language), `POST /v1/gemini/tts` (preview a voice, nothing saved) |
@@ -101,15 +110,19 @@ the first two are data-driven `{code, words}` counts from the bank; `generate`
 is the curated, listen-verified list generation supports.
 
 **`GET /v1/search`** — `prefix` (required) · `lang` (default `en-us`) ·
-`limit` (default 10, capped 50) · `kind` (`word`|`phrase`, optional filter).
-Merged prefix search; each result is `{text, type: word|phrase, voice}`.
+`limit` (default 10, capped 50) · `kind` (`word`|`phrase`, optional filter) ·
+`voice` (optional: words in that voice, phrases in `gemini-<voice>`).
+Merged prefix search; each result is `{text, type: word|phrase, voice}`, one
+per voice a text is banked in.
 
-**`GET /v1/bank`** — `prefix` · `lang` · `limit` (same defaults). Word-only
-autocomplete → `{words: [...]}`.
+**`GET /v1/bank`** — `prefix` · `lang` · `limit` (same defaults) · `voice`
+(optional). Word-only autocomplete → `{words: [...]}` (distinct words).
 
 **`GET /v1/bank/{word}`** — `lang` (default `en-us`) · `format` (`ogg` default;
-`wav` serves the dev master and 404s in production). The word's audio, or 404
-`not in bank`.
+`wav` serves the dev master and 404s in production) · `voice` (optional,
+case-insensitive label: `Kore`, `en-gb-tutor-14`). The word's audio in that
+voice; without `voice`, the default `GEMINI_TTS_VOICE`'s clip if banked, else
+the earliest banked one. 404 `not in bank` otherwise.
 **`GET /v1/bank/{word}/info`** — same params; `{word, type, voice, wav: {exists,
 bytes}, ogg: {...}}` for the compare UI.
 
@@ -254,7 +267,7 @@ the two data artifacts that ride alongside it:
 
 ```bash
 bash scripts/pack.sh
-# → library.json     description: languages, word/phrase counts, folders
+# → library.json     description: languages, word (clip) / phrase counts, per-voice word counts, folders
 # → tts-bank.tar.gz  library code + wordbank.db + served OGG (excludes WAV masters)
 ```
 
@@ -376,12 +389,27 @@ GEMINI_API_KEY=… python -m wordbank --lang en-gb batch-run --words words.txt \
 GEMINI_API_KEY=… python -m wordbank --lang en-gb gemini-run --words words.txt \
     --model gemini-3.8-flash-lite-tts --voice en-gb-tutor-11 --style "plain and neutral" --rpm 10
 
+# A second voice for the same words (a man's bank next to a woman's): new rows,
+# filed under gemini-en-gb-tutor-14; the en-gb-tutor-11 clips are untouched:
+GEMINI_API_KEY=… python -m wordbank --lang en-gb batch-run --words words.txt \
+    --model gemini-3.8-flash-lite-tts --voice en-gb-tutor-14 --style "plain and neutral"
+
 # Redo some words: move their current take to <db dir>/takes/<UTC>/{wav,ogg}/
-# (+ words.json), reset them to pending, generate again, re-encode:
+# (+ words.json), reset them to pending, generate again, re-encode
+# (--voice: only that voice's rows; default: every voice the word is banked in):
 python -m wordbank --lang en-gb regenerate --words-file redo.txt --ogg-root output/words_ogg
 GEMINI_API_KEY=… python -m wordbank --lang en-gb gemini-run --model gemini-3.8-flash-tts \
     --voice Kore --style "plain and neutral"
 python scripts/encode_wavs.py output/words output/words_ogg
+
+# QC an existing bank (reads the WAV masters): record flags, list them for a listen,
+# then re-take the flagged words until they pass (2 extra takes each, the best kept):
+python -m wordbank --lang en-gb qc --voice en-gb-tutor-11 --csv review.csv
+GEMINI_API_KEY=… python -m wordbank --lang en-gb qc --voice en-gb-tutor-11 --retry \
+    --model gemini-3.8-flash-lite-tts --style "plain and neutral" --ogg-root output/words_ogg \
+    --csv review.csv
+python scripts/encode_wavs.py output/words output/words_ogg
+python -m wordbank status                                     # flag / never-checked counts
 ```
 The phrase bank fills itself: every `/v1/speak` miss is generated and saved.
 
@@ -396,6 +424,31 @@ with a non-3.8 `--model` (the batch default is 3.1) exits before anything is
 ingested or sent. `gemini-run` takes `--rpm` (default 10, Tier 1),
 `--max-attempts` (3) and `--limit`; it retries 429/5xx with backoff and stops if
 they persist, or after 5 rows in a row fail otherwise.
+
+Every command ingests `--words` for its `--voice` (case-insensitive, stored as
+the bank label: `Kore`, `en-gb-tutor-11`), so the same word list in a second
+voice makes new rows instead of being skipped, and only that voice's rows are
+generated.
+
+**Clip QC** (`wordbank/qc.py`, stdlib only). A clip is flagged when its last
+100 ms is louder than -40 dBFS (it ends on sound — usually cut off) or its
+length is outside 0.25–3.0 s. `gemini-run`, `batch`, `batch-collect` and
+`batch-run` check every clip and re-take a flagged one up to `--qc-retries`
+times (default 2; 0 = only flag), with the same model, voice and style: the
+first passing take is kept; if every take is flagged the best one is kept
+(plausible length first, then the quietest end) and its reason stays in
+`review` for a listen. `gemini-run` re-takes inline (within `--rpm`); a batch
+re-queues the row (status `retake`, its best take held in `<db dir>/takes/qc/`,
+outside the bank tree) for the next submission with the same `--voice`,
+`--model` and `--style` — the next wave of `batch-run`, or the next
+`batch-submit`/`batch-run`. Re-takes don't count toward `--max-attempts`.
+`wordbank qc` checks an existing bank (`--voice`, `--all-langs`, `--csv`) and
+with `--retry` re-takes flagged words synchronously (`--model`, `--style`,
+`--rpm`, `--qc-retries`; `--ogg-root` moves a replaced clip's OGG aside so it
+gets re-encoded). `--accept-file keep.txt` records words a person listened to and
+kept despite a flag (`qc_accepted`): their flag is cleared and later `qc` runs skip
+them, until a `regenerate` gives the word a new take. Phrases made by `/v1/speak`
+are not checked.
 
 ## Tests
 

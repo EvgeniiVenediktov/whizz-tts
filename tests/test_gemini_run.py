@@ -5,12 +5,15 @@ are checked against a fake clock (no real waiting) and no request leaves the
 process. One test runs the real synthesize_pcm (faked transports) to show a
 3.8 model never gets an inline instruction.
 """
+import csv
 import json
 import types
 import wave
 
 import pytest
 
+from tests.conftest import clip_pcm16
+from wordbank import qc
 from wordbank.gemini_run import run_sync
 from wordbank.gemini_tts import GeminiAPIError, GeminiNetworkError, GeminiNoAudioError
 from wordbank.manifest import DONE, FAILED, PENDING, Manifest
@@ -42,8 +45,9 @@ class FakeTime:
 class FakeSynth:
     """synthesize_pcm stand-in: calls on_request (the rate limiter) like the
     real one, records (word, clock time, kwargs), and answers from `script`
-    per word (an Exception to raise, or a list consumed one call at a time);
-    otherwise PCM whose length encodes the word."""
+    per word (an Exception to raise, a list consumed one call at a time, or
+    PCM to return); otherwise a QC-passing ~0.5 s clip whose length encodes
+    the word."""
     def __init__(self, t, script=None):
         self.t, self.script, self.calls = t, script or {}, []
 
@@ -56,7 +60,9 @@ class FakeSynth:
             outcome = outcome.pop(0) if outcome else None
         if isinstance(outcome, BaseException):
             raise outcome
-        return b"\x01\x00" * (100 + len(text))
+        if isinstance(outcome, bytes):
+            return outcome
+        return b"\x01\x00" * (12_000 + len(text))
 
 
 @pytest.fixture
@@ -80,15 +86,16 @@ def _rows(bank):
 
 def test_writes_the_batch_layout_with_provenance(bank):
     result = _run(bank, FakeSynth(bank.t))
-    assert result == {"done": 5, "failed": 0, "stopped": None}
+    assert result == {"done": 5, "failed": 0, "flagged": 0, "resolved": 0, "stopped": None}
     rows = _rows(bank)
     for word in WORDS:
         r = rows[word]
         assert r["file_path"] == f"en-gb/gemini-en-gb-tutor-11/0/{r['id']}_{word}.wav"
         assert (r["status"], r["voice"], r["model"], r["style"], r["attempts"]) == \
             (DONE, "en-gb-tutor-11", LITE, STYLE, 1)
+        assert (r["review"], r["qc_takes"]) == (None, 0) and r["qc_end_db"] is not None
         with wave.open(str(bank.out / r["file_path"]), "rb") as wf:
-            assert wf.getframerate() == 24_000 and wf.getnframes() == 100 + len(word)
+            assert wf.getframerate() == 24_000 and wf.getnframes() == 12_000 + len(word)
     assert rows["bonjour"]["status"] == PENDING                    # --lang scoped
 
 
@@ -108,7 +115,7 @@ def test_a_rerun_resumes_where_the_last_run_stopped(bank):
     again = FakeSynth(bank.t)
     assert _run(bank, again)["done"] == 3
     assert [w for w, _, _ in again.calls] == ["russian", "calling", "moscow"]
-    assert _run(bank, FakeSynth(bank.t)) == {"done": 0, "failed": 0, "stopped": None}
+    assert _run(bank, FakeSynth(bank.t))["done"] == 0
 
 
 def test_a_transient_error_is_retried_with_backoff(bank):
@@ -135,7 +142,8 @@ def test_persistent_transient_errors_stop_the_run_at_max_attempts(bank):
 
 def test_a_permanent_error_fails_the_row_and_moves_on(bank):
     synth = FakeSynth(bank.t, {"haha": GeminiNoAudioError("no audio (status=failed)")})
-    assert _run(bank, synth) == {"done": 4, "failed": 1, "stopped": None}
+    assert _run(bank, synth) == {"done": 4, "failed": 1, "flagged": 0, "resolved": 0,
+                                 "stopped": None}
     r = _rows(bank)["haha"]
     assert (r["status"], r["attempts"]) == (FAILED, 1) and "status=failed" in r["error"]
     assert [w for w, _, _ in synth.calls].count("haha") == 1    # not retried in-run
@@ -147,6 +155,30 @@ def test_consecutive_failures_stop_the_run(bank):
     result = _run(bank, synth, stop_after=3)
     assert result["failed"] == 3 and "3 consecutive" in result["stopped"]
     assert len(synth.calls) == 3
+
+
+def test_a_flagged_take_is_retaken_until_one_passes(bank):
+    """Same model, voice and style, through the rate limiter; the passing take
+    is filed and the flag cleared, without spending generation attempts."""
+    synth = FakeSynth(bank.t, {"haha": [clip_pcm16(end_db=-25), clip_pcm16(3.5), clip_pcm16(seed=1)]})
+    assert _run(bank, synth, limit=2) == {"done": 2, "failed": 0, "flagged": 0, "resolved": 1,
+                                          "stopped": None}
+    r = _rows(bank)["haha"]
+    assert (r["status"], r["review"], r["qc_takes"], r["attempts"]) == (DONE, None, 2, 1)
+    assert qc.read_pcm(bank.out / r["file_path"]) == clip_pcm16(seed=1)
+    haha = [kw for word, _, kw in synth.calls if word == "haha"]
+    assert len(haha) == 3 and haha.count(haha[0]) == 3
+    starts = [t for _, t, _ in synth.calls]
+    assert starts == pytest.approx([i * 6.0 for i in range(4)])
+
+
+def test_when_every_take_is_flagged_the_best_is_kept_with_its_flag(bank):
+    takes = [clip_pcm16(end_db=-20), clip_pcm16(end_db=-30), clip_pcm16(3.5)]
+    assert _run(bank, FakeSynth(bank.t, {"haha": list(takes)}), limit=2)["flagged"] == 1
+    r = _rows(bank)["haha"]
+    assert (r["status"], r["review"], r["qc_takes"], r["attempts"]) == \
+        (DONE, "ends on sound (-30 dB)", 2, 1)
+    assert qc.read_pcm(bank.out / r["file_path"]) == takes[1]
 
 
 def test_a_voice_that_is_not_one_path_segment_is_refused(bank):
@@ -246,6 +278,29 @@ def test_regenerate_then_gemini_run_makes_a_new_take(tmp_path, gemini_api):
         ("gemini-3.1-flash-tts-preview", "old")
 
 
+def test_gemini_run_for_a_second_voice_adds_rows_next_to_the_first(tmp_path, gemini_api):
+    """A woman's and a man's bank side by side: the man's run generates every
+    word, even those the woman's already has, and leaves hers alone."""
+    _done_bank(tmp_path, ["laughing", "haha"])                  # en-gb-tutor-11
+    words = tmp_path / "words.txt"
+    words.write_text("laughing\nhaha\n")
+    _cli(tmp_path, "gemini-run", "--words", str(words), "--voice", "EN-GB-Tutor-14",
+         "--model", LITE, "--style", STYLE, "--rpm", "6000")
+
+    assert [(b["input"][0]["content"][0]["text"], b["generation_config"]["speech_config"])
+            for b in gemini_api.bodies] == [(w, [{"voice": "en-gb-tutor-14"}])
+                                            for w in ("laughing", "haha")]
+    m = Manifest(str(tmp_path / "wb.db"))
+    rows = {(r["word"], r["voice"]): r for r in m.iter_rows()}
+    m.close()
+    assert len(rows) == 4
+    for word in ("laughing", "haha"):
+        assert rows[(word, "en-gb-tutor-11")]["model"] == "gemini-3.1-flash-tts-preview"
+        new = rows[(word, "en-gb-tutor-14")]
+        assert (new["status"], new["model"]) == (DONE, LITE)
+        assert new["file_path"].startswith("en-gb/gemini-en-gb-tutor-14/")
+
+
 def test_gemini_run_on_a_38_model_needs_an_explicit_direction(tmp_path, gemini_api):
     """No --style/--instruction on 3.8: refused before any request (the batch
     default VOICE_INSTRUCTION would be read aloud)."""
@@ -263,6 +318,6 @@ def test_export_includes_provenance(tmp_path):
     _done_bank(tmp_path, ["laughing"])
     out = tmp_path / "export.csv"
     _cli(tmp_path, "export", "--output", str(out))
-    header, row = out.read_text().splitlines()
-    assert header.endswith(",model,style")
-    assert row.endswith(",gemini-3.1-flash-tts-preview,old")
+    [row] = csv.DictReader(out.read_text().splitlines())
+    assert (row["voice"], row["model"], row["style"]) == \
+        ("en-gb-tutor-11", "gemini-3.1-flash-tts-preview", "old")

@@ -1,12 +1,22 @@
 """SQLite manifest tracking per-entry generation status. Enables resume + dedup.
 
 Two content tables with identical shape:
-  - `words`   — the Gemini single-word bank   (UNIQUE(word, lang))
+  - `words`   — the Gemini single-word bank   (UNIQUE(lang, word, voice))
   - `phrases` — the /v1/speak phrase bank      (UNIQUE(text, lang, voice))
 They are stored separately so words and phrases never overlap. One `Manifest`
 instance targets one table (pass `table=`/`text_col=`); both tables are always
 created. Banks made before clone references were removed may also hold an
 unused `voices` table.
+
+A word is banked once per voice (a woman's and a man's en-gb bank side by
+side). A NULL `voice` marks an unattributed row: a word ingested by code that
+predated the voice key and not generated yet, in a language without exactly
+one voice to give it (the key migration attributes the rest, see
+_migrate_word_rows). The first voice to generate such a row claims it:
+pending(voice=V) includes it, and adding the word for V doesn't create a
+second row (the `words_add_dedup` trigger, which also keeps a voice-less add to
+one row per word, as UNIQUE(word, lang) did, for any writer — older code
+included).
 
 Thread-safe: a single connection (check_same_thread=False) guarded by a lock.
 DB writes are tiny; the real bottleneck is the TTS call, so lock contention is
@@ -17,12 +27,20 @@ import threading
 import time
 from typing import Iterable, Optional
 
+from .paths import voice_from_path
+
 PENDING = "pending"
 SUBMITTED = "submitted"   # enqueued in an async batch job, awaiting results
 DONE = "done"            # audio written to disk (batch path; not STT-verified)
 VERIFIED = "verified"    # audio written AND confirmed by STT (sync path)
 FAILED = "failed"
 QUARANTINED = "quarantined"
+# A batch take flagged by QC (wordbank/qc.py), queued for a re-take: its best
+# take so far waits at qc.retake_path, outside the bank tree, until a take
+# passes or the re-takes run out. Not served. Re-taken only by a batch with the
+# row's own model and direction (Manifest.pending's `retake`), or `wordbank qc
+# --retry`.
+RETAKE = "retake"
 
 # SET clause for the generation provenance (params: model, model, style): with a
 # model, both columns take the given values (style None = "no direction");
@@ -47,14 +65,19 @@ CREATE TABLE IF NOT EXISTS words (
     model        TEXT,
     style        TEXT,
     error        TEXT,
+    review       TEXT,
+    qc_seconds   REAL,
+    qc_end_db    REAL,
+    qc_takes     INTEGER NOT NULL DEFAULT 0,
+    qc_accepted  INTEGER NOT NULL DEFAULT 0,
     batch_id     TEXT,
     created_at   REAL,
     updated_at   REAL,
-    UNIQUE(word, lang)
+    -- lang leading: the key's index is also the lookup index — per-language
+    -- exact lookup and prefix range scan seek straight into one language
+    -- (and one voice), and it serves `GROUP BY lang` for /v1/languages.
+    UNIQUE(lang, word, voice)
 );
--- (lang, word) leading index → per-language exact lookup AND prefix range scan
--- seek straight into one language; also serves `GROUP BY lang` for /v1/languages.
-CREATE INDEX IF NOT EXISTS idx_words_lang_word ON words(lang, word);
 
 -- Phrases: the /v1/speak phrase bank. Separate from `words` so the two
 -- never collide. A phrase may exist in several voices, hence voice is in the key.
@@ -74,13 +97,39 @@ CREATE TABLE IF NOT EXISTS phrases (
     model        TEXT,
     style        TEXT,
     error        TEXT,
+    review       TEXT,
+    qc_seconds   REAL,
+    qc_end_db    REAL,
+    qc_takes     INTEGER NOT NULL DEFAULT 0,
+    qc_accepted  INTEGER NOT NULL DEFAULT 0,
     batch_id     TEXT,
     created_at   REAL,
     updated_at   REAL,
     UNIQUE(text, lang, voice)
 );
-CREATE INDEX IF NOT EXISTS idx_phrases_lang_text ON phrases(lang, text);
 """
+
+# After the key migrations (a rebuilt table loses its indexes and triggers).
+_POST_SCHEMA = """
+CREATE INDEX IF NOT EXISTS idx_phrases_lang_text ON phrases(lang, text);
+
+-- Manifest.add_words for words: a word is added for a voice unless that voice
+-- already has it or an unattributed row still to generate covers it (the
+-- first voice to generate claims that row); a voice-less add is one row per
+-- word, as under the old UNIQUE(word, lang), which NULL-distinct UNIQUE can't
+-- give. A trigger, so writers that predate the voice key keep that behaviour.
+CREATE TRIGGER IF NOT EXISTS words_add_dedup BEFORE INSERT ON words
+WHEN EXISTS (SELECT 1 FROM words WHERE lang = NEW.lang AND word = NEW.word
+             AND (NEW.voice IS NULL OR voice = NEW.voice
+                  OR (voice IS NULL AND status NOT IN ('done', 'verified'))))
+BEGIN SELECT RAISE(IGNORE); END;
+"""
+
+# QC columns (see qc.Check); NULL measurements = never checked. qc_accepted = 1:
+# a person listened and kept the clip despite its flag, so `qc` skips it.
+_QC_COLUMNS = (("review", "TEXT"), ("qc_seconds", "REAL"), ("qc_end_db", "REAL"),
+               ("qc_takes", "INTEGER NOT NULL DEFAULT 0"),
+               ("qc_accepted", "INTEGER NOT NULL DEFAULT 0"))
 
 
 class Manifest:
@@ -98,41 +147,97 @@ class Manifest:
             for col, decl in (("batch_id", "TEXT"), ("voice", "TEXT"),
                               ("seed", "INTEGER"), ("ref_audio", "TEXT"),
                               ("ref_text", "TEXT"), ("model", "TEXT"),
-                              ("style", "TEXT")):
+                              ("style", "TEXT"), *_QC_COLUMNS):
                 try:
                     self._conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {decl}")
                 except sqlite3.OperationalError:
                     pass  # column already exists
-        self._migrate_phrase_key()
+        # `phrases` tables created before `voice` existed carry UNIQUE(text, lang),
+        # which ALTER can't widen: the same text in a second voice was silently
+        # dropped by INSERT OR IGNORE (and /v1/speak then failed to find its row).
+        if ["text", "lang"] in self._unique_keys("phrases"):
+            self._rebuild("phrases")
+        # `words` keyed UNIQUE(word, lang) held one clip per word and language:
+        # a second voice's take of a banked word was dropped the same way.
+        if ["lang", "word", "voice"] not in self._unique_keys("words"):
+            self._rebuild("words", self._migrate_word_rows)
+        self._conn.executescript(_POST_SCHEMA)
 
-    def _migrate_phrase_key(self) -> None:
-        """`phrases` tables created before `voice` existed carry UNIQUE(text, lang),
-        which ALTER can't widen: the same text in a second voice was silently
-        dropped by INSERT OR IGNORE (and /v1/speak then failed to find its row).
-        Rebuild such a table once with the current UNIQUE(text, lang, voice)."""
-        keys = [
+    def _unique_keys(self, table: str) -> list:
+        """Column lists of the table's UNIQUE constraints."""
+        return [
             [c[2] for c in self._conn.execute(f'PRAGMA index_info("{idx[1]}")')]
-            for idx in self._conn.execute("PRAGMA index_list(phrases)")
+            for idx in self._conn.execute(f"PRAGMA index_list({table})")
             if idx[2] and idx[3] == "u"
         ]
-        if ["text", "lang"] not in keys:
-            return
-        cols = ", ".join(r[1] for r in self._conn.execute("PRAGMA table_info(phrases)"))
-        start = _SCHEMA.index("CREATE TABLE IF NOT EXISTS phrases")
+
+    def _rebuild(self, table: str, migrate_rows=None) -> None:
+        """Recreate `table` from _SCHEMA once (a UNIQUE key can't be ALTERed),
+        keeping every row, column and id, and the AUTOINCREMENT high-water mark:
+        file names embed the id, so an id is never handed out twice.
+        `migrate_rows` runs on the new table in the same transaction."""
+        old_cols = [(r[1], r[2]) for r in self._conn.execute(f"PRAGMA table_info({table})")]
+        start = _SCHEMA.index(f"CREATE TABLE IF NOT EXISTS {table} ")
         create = _SCHEMA[start:_SCHEMA.index(");", start) + 2]
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
-                self._conn.execute("ALTER TABLE phrases RENAME TO phrases_old")
+                seq = self._conn.execute("SELECT seq FROM sqlite_sequence WHERE name = ?",
+                                         (table,)).fetchone()
+                self._conn.execute(f"ALTER TABLE {table} RENAME TO {table}_old")
                 self._conn.execute(create)
-                self._conn.execute(f"INSERT INTO phrases ({cols}) SELECT {cols} FROM phrases_old")
-                self._conn.execute("DROP TABLE phrases_old")
-                self._conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_phrases_lang_text ON phrases(lang, text)")
+                new_cols = {r[1] for r in self._conn.execute(f"PRAGMA table_info({table})")}
+                for name, decl in old_cols:
+                    if name not in new_cols:        # a column _SCHEMA doesn't know: kept
+                        self._conn.execute(f'ALTER TABLE {table} ADD COLUMN "{name}" {decl}')
+                cols = ", ".join(f'"{name}"' for name, _ in old_cols)
+                self._conn.execute(f"INSERT INTO {table} ({cols}) SELECT {cols} FROM {table}_old")
+                self._conn.execute(f"DROP TABLE {table}_old")
+                if seq:
+                    if not self._conn.execute(
+                            "UPDATE sqlite_sequence SET seq = MAX(seq, ?) WHERE name = ?",
+                            (seq[0], table)).rowcount:
+                        self._conn.execute("INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)",
+                                           (table, seq[0]))
+                if migrate_rows is not None:
+                    migrate_rows()
                 self._conn.commit()
             except Exception:
                 self._conn.rollback()
                 raise
+
+    def _migrate_word_rows(self) -> None:
+        """One-time data moves of the words key migration:
+        - a NULL voice on a row with a clip is recovered from its file_path
+          (`<lang>/gemini-<voice>/…`, as scripts/backfill_voice.py does), so the
+          old clip keys under its voice and generating that voice skips it;
+        - a row not generated yet (ingested without a voice: pending, failed,
+          or in flight in a batch) takes its language's voice when that
+          language's clips are all in one voice — the voice the run that
+          ingested it was for, since the old key held one voice per word. Left
+          NULL, a second voice's run could claim it. What stays NULL (no or
+          several voices in its language, done clips whose path has none) is
+          unattributed — see the module docstring;
+        - the "review: <reasons>" notes data/bank-en-gb/flag.py wrote into
+          `error` on done rows move to `review` (the same reason texts as
+          qc.Check), so `error` only holds generation failures. Their
+          measurements stay NULL until `wordbank qc` re-checks them.
+        Under the old UNIQUE(word, lang) neither can collide with another row."""
+        for row_id, file_path in self._conn.execute(
+                "SELECT id, file_path FROM words WHERE voice IS NULL "
+                "AND file_path IS NOT NULL").fetchall():
+            voice = voice_from_path(file_path)
+            if voice:
+                self._conn.execute("UPDATE words SET voice = ? WHERE id = ?", (voice, row_id))
+        for lang, voice in self._conn.execute(
+                "SELECT lang, MIN(voice) FROM words WHERE voice IS NOT NULL "
+                "GROUP BY lang HAVING COUNT(DISTINCT voice) = 1").fetchall():
+            self._conn.execute(
+                "UPDATE words SET voice = ? WHERE lang = ? AND voice IS NULL "
+                "AND status NOT IN (?, ?)", (voice, lang, DONE, VERIFIED))
+        self._conn.execute(
+            "UPDATE words SET review = substr(error, 9), error = NULL "
+            "WHERE error LIKE 'review: %' AND status IN (?, ?)", (DONE, VERIFIED))
 
     def close(self) -> None:
         with self._lock:
@@ -142,8 +247,10 @@ class Manifest:
                   voice: Optional[str] = None) -> int:
         """Insert entries (deduped by the table's UNIQUE key). Returns count added.
 
-        `voice` is part of the key for phrases (so the same phrase can be added
-        in multiple voices); for words it is just recorded.
+        `voice` is part of the key of both tables, so the same text can be
+        added in several voices. For words, a word with an unattributed row
+        still to generate isn't added again for a voice, and a voice-less add
+        dedupes on (word, lang) alone (the `words_add_dedup` trigger).
         """
         now = time.time()
         with self._lock:
@@ -160,14 +267,28 @@ class Manifest:
         return after - before
 
     def pending(self, limit: Optional[int] = None, max_attempts: int = 3,
-                lang: Optional[str] = None):
+                lang: Optional[str] = None, voice: Optional[str] = None,
+                retake: Optional[tuple] = None):
         """Rows still to generate (pending, or failed under max_attempts), in id
-        order; `lang` restricts them to one language."""
-        sql = f"SELECT * FROM {self.table} WHERE status IN (?, ?) AND attempts < ? "
+        order. `lang` restricts them to one language. `voice` to one voice's
+        rows, plus the unattributed ones (voice NULL) that voice has no row
+        for: the first voice to generate such a row claims it. `retake=(model,
+        style)` adds the RETAKE rows recorded with exactly that provenance, so
+        a QC re-take uses the take's own model and direction."""
+        t, col = self.table, self.text_col
+        sql = f"SELECT * FROM {t} WHERE ((status IN (?, ?) AND attempts < ?)"
         params = [PENDING, FAILED, max_attempts]
+        if retake is not None:
+            sql += " OR (status = ? AND model IS ? AND style IS ?)"
+            params += [RETAKE, *retake]
+        sql += ") "
         if lang is not None:
             sql += "AND lang = ? "
             params.append(lang)
+        if voice is not None:
+            sql += (f"AND (voice = ? OR (voice IS NULL AND NOT EXISTS (SELECT 1 FROM {t} o "
+                    f"WHERE o.lang = {t}.lang AND o.{col} = {t}.{col} AND o.voice = ?))) ")
+            params += [voice, voice]
         sql += "ORDER BY id"
         if limit is not None:
             sql += " LIMIT ?"
@@ -193,49 +314,73 @@ class Manifest:
                    billed_chars: Optional[int] = None, voice: Optional[str] = None,
                    seed: Optional[int] = None, ref_audio: Optional[str] = None,
                    ref_text: Optional[str] = None, model: Optional[str] = None,
-                   style: Optional[str] = None) -> None:
+                   style: Optional[str] = None, check=None,
+                   qc_takes: Optional[int] = None) -> None:
         # voice/seed/ref_* use COALESCE so a later status-only update (e.g. a
         # retry marking FAILED) never clobbers recorded provenance. model/style
         # are one record: passing `model` (a generation result) writes both,
         # style exactly as given — None means "no direction", so a re-take
         # without one doesn't inherit the old take's style; without `model`
-        # both are kept.
+        # both are kept. `check` (a qc.Check of the clip) writes review and the
+        # measurements, `qc_takes` the re-take count; omitted, both are kept.
+        qc_sql, qc_params = "", []
+        if check is not None:
+            qc_sql += "review = ?, qc_seconds = ?, qc_end_db = ?, "
+            qc_params += [check.review, check.seconds, check.end_db]
+        if qc_takes is not None:
+            qc_sql += "qc_takes = ?, "
+            qc_params.append(qc_takes)
         with self._lock:
             self._conn.execute(
                 f"UPDATE {self.table} SET status = ?, error = ?, file_path = ?, "
                 "transcript = ?, billed_chars = ?, voice = COALESCE(?, voice), "
                 "seed = COALESCE(?, seed), ref_audio = COALESCE(?, ref_audio), "
                 "ref_text = COALESCE(?, ref_text), "
-                f"{_PROVENANCE_SQL}, updated_at = ? WHERE id = ?",
+                f"{_PROVENANCE_SQL}, {qc_sql}updated_at = ? WHERE id = ?",
                 (status, error, file_path, transcript, billed_chars, voice,
-                 seed, ref_audio, ref_text, model, model, style,
+                 seed, ref_audio, ref_text, model, model, style, *qc_params,
                  time.time(), row_id),
+            )
+            self._conn.commit()
+
+    def record_qc(self, results) -> None:
+        """Store QC results [(row_id, qc.Check, qc_takes or None), ...] in one
+        transaction (`wordbank qc` checks a whole bank); None keeps qc_takes."""
+        now = time.time()
+        with self._lock:
+            self._conn.executemany(
+                f"UPDATE {self.table} SET review = ?, qc_seconds = ?, qc_end_db = ?, "
+                "qc_takes = COALESCE(?, qc_takes), updated_at = ? WHERE id = ?",
+                [(c.review, c.seconds, c.end_db, takes, now, rid) for rid, c, takes in results],
             )
             self._conn.commit()
 
     def mark_submitted(self, row_ids, batch_id: str, *, model: Optional[str] = None,
                        style: Optional[str] = None) -> None:
-        """Mark entries as enqueued in an async batch job (counts as one attempt).
+        """Mark entries as enqueued in an async batch job (counts as one attempt;
+        a QC re-take doesn't: its row was generated, it counts in qc_takes).
         `model`/`style` record the request's provenance now, since a later
         collect (possibly another process) doesn't know them."""
         now = time.time()
         with self._lock:
             self._conn.executemany(
                 f"UPDATE {self.table} SET status = ?, batch_id = ?, "
-                f"attempts = attempts + 1, {_PROVENANCE_SQL}, "
+                f"attempts = attempts + (status != '{RETAKE}'), {_PROVENANCE_SQL}, "
                 "updated_at = ? WHERE id = ?",
                 [(SUBMITTED, batch_id, model, model, style, now, wid) for wid in row_ids],
             )
             self._conn.commit()
 
     def reset(self, row_ids) -> None:
-        """Back to a fresh pending row (attempts 0, no error, no batch job), for
-        a regenerate. file_path and provenance stay until the next take."""
+        """Back to a fresh pending row (attempts 0, no error, no batch job, no
+        QC result), for a regenerate. file_path and provenance stay until the
+        next take."""
         now = time.time()
         with self._lock:
             self._conn.executemany(
                 f"UPDATE {self.table} SET status = ?, attempts = 0, error = NULL, "
-                "batch_id = NULL, updated_at = ? WHERE id = ?",
+                "batch_id = NULL, review = NULL, qc_seconds = NULL, qc_end_db = NULL, "
+                "qc_takes = 0, qc_accepted = 0, updated_at = ? WHERE id = ?",
                 [(PENDING, now, rid) for rid in row_ids],
             )
             self._conn.commit()
@@ -265,20 +410,46 @@ class Manifest:
             ).fetchall()
         return {r[0]: r[1] for r in rows}
 
+    def qc_counts(self) -> dict:
+        """{"flagged": clips with a QC flag (ready or queued for a re-take),
+        "unchecked": ready clips never QC-checked (e.g. generated before QC),
+        "accepted": clips a person kept despite a flag}. A RETAKE row always
+        carries its take's measurements."""
+        with self._lock:
+            flagged, unchecked, accepted = self._conn.execute(
+                f"SELECT COUNT(review), SUM(qc_end_db IS NULL AND qc_accepted = 0), SUM(qc_accepted) "
+                f"FROM {self.table} WHERE status IN (?, ?, ?)", (DONE, VERIFIED, RETAKE)).fetchone()
+        return {"flagged": flagged, "unchecked": unchecked or 0, "accepted": accepted or 0}
+
+    def accept_qc(self, row_ids) -> None:
+        """A person listened and kept these clips: clear their flag and mark them
+        so `wordbank qc` neither re-flags nor re-takes them (reset() undoes it)."""
+        now = time.time()
+        with self._lock:
+            self._conn.executemany(
+                f"UPDATE {self.table} SET review = NULL, qc_accepted = 1, updated_at = ? WHERE id = ?",
+                [(now, rid) for rid in row_ids])
+            self._conn.commit()
+
     def iter_rows(self):
         with self._lock:
             return self._conn.execute(
                 f"SELECT * FROM {self.table} ORDER BY id"
             ).fetchall()
 
-    def get_entry(self, text: str, lang: str, voice: Optional[str] = None):
-        """Fetch one row from this manifest's table by (text_col, lang), optionally
-        pinned to a voice. Returns the row or None. Unlike BankLookup.get*, this is
-        not status-scoped (used by writers to find a row they just inserted)."""
+    def entries(self, text: str, lang: str, voice: Optional[str] = None) -> list:
+        """Every row of (text_col, lang), in id order; `voice` pins one voice.
+        Not status-scoped, unlike BankLookup.get*."""
         sql = f"SELECT * FROM {self.table} WHERE {self.text_col} = ? AND lang = ?"
         params = [text, lang]
         if voice is not None:
             sql += " AND voice = ?"
             params.append(voice)
         with self._lock:
-            return self._conn.execute(sql, params).fetchone()
+            return self._conn.execute(sql + " ORDER BY id", params).fetchall()
+
+    def get_entry(self, text: str, lang: str, voice: Optional[str] = None):
+        """The first of entries() (lowest id), or None. Used by writers to find
+        a row they just inserted (pass the voice: a text may have several)."""
+        rows = self.entries(text, lang, voice)
+        return rows[0] if rows else None

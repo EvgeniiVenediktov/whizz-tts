@@ -1,8 +1,15 @@
 """Read-only word→file lookup over the manifest. Stdlib sqlite3 only.
 
-Exact lookup is an index hit on the manifest's UNIQUE(word, lang) B-tree —
-O(log n), no extra service. Prefix autocomplete uses the same index via a range
-scan (word >= prefix AND word < prefix++), so it stays index-backed too.
+Exact lookup is an index hit on the manifest's UNIQUE(lang, word, voice) B-tree
+(UNIQUE(word, lang) + idx_words_lang_word on banks the key migration hasn't
+touched) — O(log n), no extra service. Prefix autocomplete uses the same index
+via a range scan (word >= prefix AND word < prefix++), so it stays index-backed
+too.
+
+A word may be banked in several voices (one row each). With a voice, lookups
+match that voice only; without one, get() serves the caller's preferred voice
+if banked, else the earliest banked clip (lowest id), and searches list one
+result per voice.
 """
 import os
 import sqlite3
@@ -69,8 +76,9 @@ class BankLookup:
         return os.path.abspath(self._db_path) if self._db_path else None
 
     def count(self) -> int:
-        """Number of words ready to serve (done/verified). Memoized — the served
-        bank is read-only and static per process, so /health stays cheap."""
+        """Number of word clips ready to serve (done/verified; a word in two
+        voices counts twice). Memoized — the served bank is read-only and
+        static per process, so /health stays cheap."""
         with self._lock:
             if self._ready_count is not None:
                 return self._ready_count
@@ -83,7 +91,8 @@ class BankLookup:
             return self._ready_count
 
     def languages(self) -> List[dict]:
-        """Languages the bank can serve: distinct `lang` codes with ready counts."""
+        """Languages the bank can serve: distinct `lang` codes with ready counts
+        (clips: a word in two voices counts twice)."""
         with self._lock:
             self._open()
             if self._conn is None:
@@ -94,13 +103,26 @@ class BankLookup:
             ).fetchall()
         return [{"code": r[0], "words": r[1]} for r in rows]
 
-    def get(self, word: str, lang: str = "en",
-            voice: Optional[str] = None) -> Optional[sqlite3.Row]:
+    def _word_voice_sql(self, voice: str):
+        """WHERE fragment + params for words banked in `voice`. Rows without a
+        recorded voice (banks predating the column, or not yet migrated) match
+        on the voice in their file_path (`<lang>/gemini-<voice>/…`)."""
+        segment = f"gemini-{voice}/"
+        by_path = "substr(file_path, instr(file_path, '/') + 1, ?) = ?"
+        if not self._words_has_voice:
+            return by_path, [len(segment), segment]
+        return f"(voice = ? OR (voice IS NULL AND {by_path}))", [voice, len(segment), segment]
+
+    def get(self, word: str, lang: str = "en", voice: Optional[str] = None,
+            prefer: Optional[str] = None) -> Optional[sqlite3.Row]:
         """Exact word match (case-insensitive). Returns the row or None.
 
-        If `voice` (a bare Gemini name, e.g. "Kore") is given, the word must have
-        been generated with it. Rows without a recorded voice (banks predating the
-        column, or not yet backfilled) fall back to the voice in their file_path.
+        If `voice` (a bank label, e.g. "Kore", "en-gb-tutor-11") is given, the
+        word must have been generated with it. Rows without a recorded voice
+        (banks predating the column, or not yet backfilled) fall back to the
+        voice in their file_path. Without `voice`, the clip in `prefer` (the
+        server's default voice) if there is one, else the earliest banked
+        (lowest id), so the choice is stable.
         """
         w = word.strip().lower()
         with self._lock:
@@ -108,16 +130,18 @@ class BankLookup:
             if self._conn is None:
                 return None
             cols = "voice" if self._words_has_voice else "NULL AS voice"
-            row = self._conn.execute(
+            rows = self._conn.execute(
                 f"SELECT word, lang, file_path, status, {cols} FROM words "
-                f"WHERE word = ? AND lang = ? AND {_READY_SQL}",
+                f"WHERE word = ? AND lang = ? AND {_READY_SQL} ORDER BY id",
                 (w, lang),
-            ).fetchone()
-        if row is not None and voice is not None:
-            row_voice = row["voice"] or voice_from_path(row["file_path"] or "")
-            if row_voice != voice:
-                return None
-        return row
+            ).fetchall()
+
+        def voiced(label):
+            return next((r for r in rows
+                         if (r["voice"] or voice_from_path(r["file_path"] or "")) == label), None)
+        if voice is not None:
+            return voiced(voice)
+        return (voiced(prefer) if prefer else None) or (rows[0] if rows else None)
 
     def get_phrase(self, text: str, lang: str = "en",
                    voice: Optional[str] = None) -> Optional[sqlite3.Row]:
@@ -143,9 +167,12 @@ class BankLookup:
             return self._conn.execute(sql + " ORDER BY id LIMIT 1", params).fetchone()
 
     def search(self, prefix: str, lang: str = "en", limit: int = 10,
-               kind: Optional[str] = None) -> List[dict]:
+               kind: Optional[str] = None, voice: Optional[str] = None) -> List[dict]:
         """Merged prefix search over words + phrases. Each result is tagged with
-        its `type` ('word'|'phrase') and `voice`. `kind` optionally restricts to one."""
+        its `type` ('word'|'phrase') and `voice`, one per voice a text is banked
+        in. `kind` optionally restricts to one; `voice` (a bare label, "Kore")
+        to words in that voice and phrases in `gemini-<voice>`, as /v1/speak
+        matches them."""
         p = prefix.strip().lower()
         if not p:
             return []
@@ -156,19 +183,27 @@ class BankLookup:
             parts, params = [], []
             if kind in (None, "word"):
                 vw = "voice" if self._words_has_voice else "NULL"
-                parts.append(
-                    f"SELECT word AS text, 'word' AS type, {vw} AS voice FROM words "
-                    f"WHERE lang = ? AND word >= ? AND word < ? AND {_READY_SQL}")
+                sql = (f"SELECT word AS text, 'word' AS type, {vw} AS voice FROM words "
+                       f"WHERE lang = ? AND word >= ? AND word < ? AND {_READY_SQL}")
                 params += [lang, p, _prefix_upper(p)]
-            if kind in (None, "phrase") and self._has_phrases:
+                if voice is not None:
+                    where, more = self._word_voice_sql(voice)
+                    sql += f" AND {where}"
+                    params += more
+                parts.append(sql)
+            if kind in (None, "phrase") and self._has_phrases and (
+                    voice is None or "voice" in self._phrase_cols):
                 vp = "voice" if "voice" in self._phrase_cols else "NULL"
-                parts.append(
-                    f"SELECT text, 'phrase' AS type, {vp} AS voice FROM phrases "
-                    f"WHERE lang = ? AND LOWER(text) LIKE ? AND {_READY_SQL}")
+                sql = (f"SELECT text, 'phrase' AS type, {vp} AS voice FROM phrases "
+                       f"WHERE lang = ? AND LOWER(text) LIKE ? AND {_READY_SQL}")
                 params += [lang, p + "%"]
+                if voice is not None:
+                    sql += " AND voice = ?"
+                    params.append(f"gemini-{voice}")
+                parts.append(sql)
             if not parts:
                 return []
-            sql = " UNION ALL ".join(parts) + " ORDER BY text LIMIT ?"
+            sql = " UNION ALL ".join(parts) + " ORDER BY text, voice LIMIT ?"
             params.append(limit)
             return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
 
@@ -184,8 +219,10 @@ class BankLookup:
             ).fetchall()
         return [{"code": r[0], "words": r[1]} for r in rows]
 
-    def suggest(self, prefix: str, lang: str = "en", limit: int = 10) -> List[str]:
-        """Index-backed prefix autocomplete; returns up to `limit` words."""
+    def suggest(self, prefix: str, lang: str = "en", limit: int = 10,
+                voice: Optional[str] = None) -> List[str]:
+        """Index-backed prefix autocomplete; returns up to `limit` distinct
+        words (any voice, or banked in `voice`)."""
         p = prefix.strip().lower()
         if not p:
             return []
@@ -193,12 +230,28 @@ class BankLookup:
             self._open()
             if self._conn is None:
                 return []
-            rows = self._conn.execute(
-                f"SELECT word FROM words WHERE lang = ? AND word >= ? AND word < ? "
-                f"AND {_READY_SQL} ORDER BY word LIMIT ?",
-                (lang, p, _prefix_upper(p), limit),
-            ).fetchall()
+            sql = (f"SELECT DISTINCT word FROM words WHERE lang = ? AND word >= ? AND word < ? "
+                   f"AND {_READY_SQL}")
+            params = [lang, p, _prefix_upper(p)]
+            if voice is not None:
+                where, more = self._word_voice_sql(voice)
+                sql += f" AND {where}"
+                params += more
+            rows = self._conn.execute(sql + " ORDER BY word LIMIT ?", params + [limit]).fetchall()
         return [r[0] for r in rows]
+
+    def word_voices(self) -> List[dict]:
+        """Ready word clips per language and voice (NULL: not recorded)."""
+        with self._lock:
+            self._open()
+            if self._conn is None:
+                return []
+            vw = "voice" if self._words_has_voice else "NULL"
+            rows = self._conn.execute(
+                f"SELECT lang, {vw} AS v, COUNT(*) FROM words WHERE {_READY_SQL} "
+                "GROUP BY lang, v ORDER BY lang, v"
+            ).fetchall()
+        return [{"code": r[0], "voice": r[1], "words": r[2]} for r in rows]
 
     def close(self) -> None:
         with self._lock:

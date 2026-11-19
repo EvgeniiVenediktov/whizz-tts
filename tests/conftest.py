@@ -1,5 +1,6 @@
 import base64
 import copy
+import struct
 import types
 import zlib
 
@@ -26,6 +27,14 @@ def noise_pcm16(duration_s: float = 1.0, sample_rate: int = 24_000, seed: int = 
     a tone, so Opus actually spends its bitrate and file size reflects it."""
     rng = np.random.RandomState(seed)
     return (rng.uniform(-0.5, 0.5, int(duration_s * sample_rate)) * 32767).astype("<i2").tobytes()
+
+
+def clip_pcm16(seconds: float = 0.5, end_db=None, seed: int = 0) -> bytes:
+    """A word-like clip for QC (wordbank/qc.py): noise, then a 150 ms tail at
+    `end_db` dBFS RMS. The default (None: silence) at 0.5 s passes QC."""
+    tail = int(0.15 * 24_000)
+    level = 0 if end_db is None else round(32768 * 10 ** (end_db / 20))
+    return noise_pcm16(seconds, seed=seed)[:-tail * 2] + struct.pack("<h", level) * tail
 
 
 @pytest.fixture
@@ -87,12 +96,13 @@ def gemini_api(monkeypatch):
     what each request path would send. `bodies` records every Interactions
     request body (the style path), `prompts` every generateContent call as
     (model, contents). Interactions answers come from `interactions` (the
-    last repeats; an Exception in it is raised), by default 0.5 s of noise as
-    a WAV; generateContent answers bare PCM. No network, no retry backoff."""
+    last repeats; an Exception in it is raised), by default a QC-passing
+    0.5 s clip (clip_pcm16) as a WAV; generateContent answers bare PCM. No
+    network, no retry backoff."""
     import wordbank.gemini_tts as gemini_tts_mod
     from wordbank.gemini_tts import pcm_to_wav_bytes
 
-    pcm = noise_pcm16(0.5, seed=7)
+    pcm = clip_pcm16(0.5, seed=7)
     state = types.SimpleNamespace(pcm=pcm, bodies=[], prompts=[],
                                   interactions=[interaction_resp(pcm_to_wav_bytes(pcm))])
 

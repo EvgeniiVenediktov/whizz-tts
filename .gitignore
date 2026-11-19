@@ -15,6 +15,8 @@ dist/
 data/
 wordbank.db
 wordbank.db-*
+# regenerate / qc --retry move replaced takes here (dev layout: next to wordbank.db)
+/takes/
 
 # Audio artifacts (never committed)
 *.wav

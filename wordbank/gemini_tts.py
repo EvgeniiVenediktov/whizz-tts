@@ -217,6 +217,13 @@ def canonical_voice(name: str) -> Optional[str]:
     return _VOICE_NAMES.get(key) or (key if key in LOCALE_VOICES else None)
 
 
+def voice_label(name: str) -> str:
+    """The bank label for any voice name, curated or not: canonical_voice's,
+    else the lowercase id (voice-library ids are lowercase). Word rows key on
+    it, so `--voice kore` and `Kore` stay one voice."""
+    return canonical_voice(name) or name.strip().lower()
+
+
 def is_classic_voice(name: str) -> bool:
     return name.strip().lower() in _VOICE_NAMES
 

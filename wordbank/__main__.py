@@ -2,11 +2,13 @@
 
 Commands: batch / batch-submit / batch-collect / batch-run (Gemini async) ·
 gemini-run (Gemini sync, rate-limited) · regenerate (back up + reset words) ·
-describe / verify (deployment library description) · status · export.
+qc (check clips, re-take flagged ones) · describe / verify (deployment library
+description) · status · export.
 
   python -m wordbank batch-run --words words.txt --voice Kore
   python -m wordbank --lang en-gb gemini-run --model gemini-3.8-flash-tts \
       --voice Kore --style "plain and neutral"
+  python -m wordbank --lang en-gb qc --csv review.csv
   python -m wordbank status
 """
 import argparse
@@ -19,7 +21,8 @@ from typing import List, Optional, Tuple
 from .config import Config
 from .gemini_tts import DEFAULT_MODEL as GEMINI_TTS_DEFAULT_MODEL   # stdlib-only import
 from .languages import normalize_lang
-from .manifest import Manifest
+from .manifest import RETAKE, Manifest
+from .qc import DEFAULT_RETRIES as QC_DEFAULT_RETRIES
 
 
 def _load_words(path: str) -> List[str]:
@@ -34,13 +37,21 @@ def _load_words(path: str) -> List[str]:
     return words
 
 
-def _ingest(cfg: Config, words_path: str) -> Manifest:
-    """Load a word file into the manifest (deduped) and report what's new."""
+def _ingest(cfg: Config, words_path: str, voice: str) -> Manifest:
+    """Load a word file into the manifest for one voice (deduped per voice:
+    a word already banked in another voice gets a row of its own) and report
+    what's new."""
     words = _load_words(words_path)
     m = Manifest(cfg.db)
-    added = m.add_words(words, cfg.lang)
-    print(f"{len(words)} words in file; {added} newly added to manifest")
+    added = m.add_words(words, cfg.lang, voice=voice)
+    print(f"{len(words)} words in file; {added} newly added to manifest for voice {voice}")
     return m
+
+
+def _add_qc_arg(p) -> None:
+    p.add_argument("--qc-retries", type=int, default=QC_DEFAULT_RETRIES, dest="qc_retries",
+                   help="extra takes for a clip QC flags (wordbank/qc.py: ends on sound, "
+                        f"or an implausible length); 0 = only flag (default {QC_DEFAULT_RETRIES})")
 
 
 def _add_direction_args(p) -> None:
@@ -54,12 +65,18 @@ def _add_direction_args(p) -> None:
                         "verbatim; 3.8 models only (see gemini_tts.TTS_MODELS)")
 
 
+def _add_rpm_arg(p) -> None:
+    p.add_argument("--rpm", type=float, default=10,
+                   help="requests per minute (default 10 = Tier 1), retries included")
+
+
 _VOICE_HELP = ("Gemini voice: a classic name (Kore), or a library id like en-gb-tutor-11 "
                "(3.8 models only), filed as gemini-<voice>")
 
 
 def _add_gemini_args(p, *, words=True, instruction=True, chunk=True, poll=True):
-    """Common args for the Gemini batch subcommands (which differ only slightly)."""
+    """Common args for the Gemini batch subcommands (which differ only slightly).
+    Collecting commands (poll) also take --qc-retries."""
     if words:
         p.add_argument("--words", required=True, help="text file, one word per line")
     p.add_argument("--voice", default="Kore", help=_VOICE_HELP)
@@ -70,6 +87,7 @@ def _add_gemini_args(p, *, words=True, instruction=True, chunk=True, poll=True):
         p.add_argument("--chunk", type=int, default=2000, help="words per batch job")
     if poll:
         p.add_argument("--poll-interval", type=int, default=60, dest="poll_interval")
+        _add_qc_arg(p)
 
 
 def _direction_args(args) -> Tuple[str, Optional[str]]:
@@ -97,21 +115,38 @@ def _direction_args(args) -> Tuple[str, Optional[str]]:
 
 
 def _check_voice_args(args) -> None:
-    """Exit before anything is ingested or sent when --voice is a locale voice
-    (not one of the 30 classic) and --model isn't verified with those: only the
-    3.8 models are (gemini_tts.TTS_MODELS)."""
-    from .gemini_tts import GeminiVoiceUnsupportedError, check_voice
+    """Canonicalize --voice to its bank label (gemini_tts.voice_label: rows key
+    on it) and exit before anything is ingested or sent when it isn't one path
+    segment, or is a locale voice (not one of the 30 classic) and --model isn't
+    verified with those: only the 3.8 models are (gemini_tts.TTS_MODELS)."""
+    from .gemini_run import check_voice_name
+    from .gemini_tts import check_voice, voice_label
+    args.voice = voice_label(args.voice)
     try:
+        check_voice_name(args.voice)
         check_voice(args.voice, args.model)
-    except GeminiVoiceUnsupportedError as exc:
+    except ValueError as exc:               # GeminiVoiceUnsupportedError included
         sys.exit(f"--voice: {exc}")
+
+
+def _print_totals(m: Manifest) -> None:
+    """Status counts, QC flags, and what to do about rows queued for a re-take."""
+    counts, qcc = m.counts(), m.qc_counts()
+    print(f"totals: {counts}")
+    print(f"QC: {qcc['flagged']} clip(s) flagged for review, {qcc['unchecked']} never checked")
+    if counts.get(RETAKE):
+        print(f"{counts[RETAKE]} row(s) flagged by QC are queued for a re-take (status "
+              f"{RETAKE}): run batch-submit or batch-run again with the same --voice, --model "
+              "and --style/--instruction, or re-take them now with `qc --retry`")
 
 
 def _make_batch(args, *, submit: bool = True):
     """The GeminiBatch for a command; `submit=False` (collect only) needs no
     direction or voice check, since no request is built."""
     from .gemini_batch import GeminiBatch
+    from .gemini_tts import voice_label
     if not submit:
+        args.voice = voice_label(args.voice)
         return GeminiBatch(model=args.model, voice=args.voice, instruction="")
     _check_voice_args(args)
     instruction, style = _direction_args(args)
@@ -124,7 +159,7 @@ def cmd_batch_submit(args, cfg: Config) -> None:
     from .gemini_batch import submit_pending
 
     batch = _make_batch(args)              # refuses a bad direction before ingesting
-    m = _ingest(cfg, args.words)
+    m = _ingest(cfg, args.words, args.voice)
     jobs = submit_pending(m, batch, lang=cfg.lang, chunk=args.chunk)
     print(f"\nsubmitted {len(jobs)} batch job(s): {jobs}")
     print("job ids saved in the manifest. Collect later (jobs expire after 48h) with:")
@@ -138,11 +173,11 @@ def cmd_batch_collect(args, cfg: Config) -> None:
     from .gemini_batch import collect_active
 
     m = Manifest(cfg.db)
-    counts = collect_active(
+    collect_active(
         m, _make_batch(args, submit=False), cfg.out_dir, lang=cfg.lang, voice=args.voice,
-        poll_interval=args.poll_interval,
+        poll_interval=args.poll_interval, qc_retries=args.qc_retries,
     )
-    print(f"totals: {counts}")
+    _print_totals(m)
     m.close()
 
 
@@ -151,12 +186,12 @@ def cmd_batch(args, cfg: Config) -> None:
     from .gemini_batch import run_batch
 
     batch = _make_batch(args)
-    m = _ingest(cfg, args.words)
-    counts = run_batch(
+    m = _ingest(cfg, args.words, args.voice)
+    run_batch(
         m, batch, cfg.out_dir, lang=cfg.lang, voice=args.voice,
-        chunk=args.chunk, poll_interval=args.poll_interval,
+        chunk=args.chunk, poll_interval=args.poll_interval, qc_retries=args.qc_retries,
     )
-    print(f"totals: {counts}")
+    _print_totals(m)
     m.close()
 
 
@@ -165,12 +200,12 @@ def cmd_batch_run(args, cfg: Config) -> None:
     from .gemini_batch import run_in_waves
 
     batch = _make_batch(args)
-    m = _ingest(cfg, args.words)
-    counts = run_in_waves(
+    m = _ingest(cfg, args.words, args.voice)
+    run_in_waves(
         m, batch, cfg.out_dir, lang=cfg.lang, voice=args.voice,
-        chunk=args.chunk, poll_interval=args.poll_interval,
+        chunk=args.chunk, poll_interval=args.poll_interval, qc_retries=args.qc_retries,
     )
-    print(f"totals: {counts}")
+    _print_totals(m)
     m.close()
 
 
@@ -180,88 +215,245 @@ def cmd_gemini_run(args, cfg: Config) -> None:
 
     _check_voice_args(args)
     instruction, style = _direction_args(args)
-    m = _ingest(cfg, args.words) if args.words else Manifest(cfg.db)
+    m = _ingest(cfg, args.words, args.voice) if args.words else Manifest(cfg.db)
     try:
         result = run_sync(m, cfg.out_dir, lang=cfg.lang, voice=args.voice,
                           model=args.model, instruction=instruction, style=style,
-                          rpm=args.rpm, max_attempts=args.max_attempts, limit=args.limit)
-    except ValueError as exc:               # an unusable --voice
-        sys.exit(str(exc))
+                          rpm=args.rpm, max_attempts=args.max_attempts, limit=args.limit,
+                          qc_retries=args.qc_retries)
+        print(f"this run: {result}")
+        _print_totals(m)
     finally:
-        totals = m.counts()
         m.close()
-    print(f"this run: {result}")
-    print(f"totals: {totals}")
     if result["stopped"]:
         sys.exit(1)
 
 
-def cmd_regenerate(args, cfg: Config) -> None:
-    """Move the current take of each listed word to <db dir>/takes/<UTC>/ and
-    reset its row to pending, for gemini-run / batch-run to generate again."""
+def _take_dir(cfg: Config) -> pathlib.Path:
+    """<db dir>/takes/<UTC>/: where replaced takes are moved, with a words.json."""
     import datetime
-    import json
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return pathlib.Path(cfg.db).resolve().parent / "takes" / stamp
+
+
+def _take_roots(cfg: Config, ogg_root: Optional[str]) -> list:
+    return [("wav", cfg.out_dir, ".wav")] + ([("ogg", ogg_root, ".ogg")] if ogg_root else [])
+
+
+def _archive_take(cfg: Config, row, take_dir: pathlib.Path, roots) -> dict:
+    """Move a row's current take out of the bank trees into take_dir/{wav,ogg}/
+    -> its words.json entry. Moved, not copied: encode_wavs.py skips existing
+    OGGs, so a stale copy left in place would never be re-encoded. A row queued
+    for a QC re-take holds its take outside the bank (qc.retake_path)."""
     import shutil
     from .paths import safe_filename
+    from .qc import retake_path
 
+    entry = {k: row[k] for k in ("id", "word", "status", "voice", "model", "style",
+                                 "file_path", "review")}
+    for kind, root, ext in roots:
+        entry[kind] = None
+        if kind == "wav" and row["status"] == RETAKE:
+            src = retake_path(cfg.db, row["id"])
+        elif row["file_path"]:
+            src = pathlib.Path(root) / (os.path.splitext(row["file_path"])[0] + ext)
+        else:
+            continue
+        if src.is_file():
+            dest = take_dir / kind / f"{row['id']}_{safe_filename(row['word'])}{ext}"
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dest))
+            entry[kind] = str(dest.relative_to(take_dir))
+    return entry
+
+
+def _write_listing(take_dir: pathlib.Path, listing: list) -> None:
+    import json
+    take_dir.mkdir(parents=True, exist_ok=True)
+    (take_dir / "words.json").write_text(json.dumps(listing, indent=1) + "\n",
+                                         encoding="utf-8")
+
+
+def cmd_regenerate(args, cfg: Config) -> None:
+    """Move the current take of each listed word to <db dir>/takes/<UTC>/ and
+    reset its row to pending, for gemini-run / batch-run to generate again.
+    --voice limits it to that voice's rows; without it, every voice's."""
     words = _load_words(args.words_file)
     if not os.path.isfile(cfg.db):
         sys.exit(f"no word bank at {cfg.db} (pass --db)")
+    voice = None
+    if args.voice:
+        from .gemini_tts import voice_label
+        voice = voice_label(args.voice)
+    bank = f"{cfg.lang} word bank" + (f" in voice {voice}" if voice else "")
     m = Manifest(cfg.db)
     try:
         rows, unknown = [], []
         for w in words:
-            row = m.get_entry(w, cfg.lang)
-            if row is None:
+            found = m.entries(w, cfg.lang, voice)
+            rows += found
+            if not found:
                 unknown.append(w)
-            else:
-                rows.append(row)
         for w in unknown:
-            print(f"unknown (not in the {cfg.lang} word bank, not created): {w}")
+            print(f"unknown (not in the {bank}, not created): {w}")
         if not rows:
-            sys.exit(f"none of the {len(words)} word(s) in {args.words_file} is in the "
-                     f"{cfg.lang} word bank")
+            sys.exit(f"none of the {len(words)} word(s) in {args.words_file} is in the {bank}")
 
-        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        take_dir = pathlib.Path(cfg.db).resolve().parent / "takes" / stamp
-        roots = [("wav", cfg.out_dir, ".wav")]
-        if args.ogg_root:
-            roots.append(("ogg", args.ogg_root, ".ogg"))
-        listing = []
-        for row in rows:
-            entry = {k: row[k] for k in ("id", "word", "status", "voice", "model",
-                                         "style", "file_path")}
-            for kind, root, ext in roots:
-                entry[kind] = None
-                if not row["file_path"]:
-                    continue
-                src = pathlib.Path(root) / (os.path.splitext(row["file_path"])[0] + ext)
-                if src.is_file():
-                    # moved, not copied: encode_wavs.py skips existing OGGs, so
-                    # a stale copy left in place would never be re-encoded
-                    dest = take_dir / kind / f"{row['id']}_{safe_filename(row['word'])}{ext}"
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(src), str(dest))
-                    entry[kind] = str(dest.relative_to(take_dir))
-            listing.append(entry)
+        take_dir = _take_dir(cfg)
+        roots = _take_roots(cfg, args.ogg_root)
+        listing = [_archive_take(cfg, row, take_dir, roots) for row in rows]
         m.reset([r["id"] for r in rows])
-        take_dir.mkdir(parents=True, exist_ok=True)
-        (take_dir / "words.json").write_text(json.dumps(listing, indent=1) + "\n",
-                                             encoding="utf-8")
+        _write_listing(take_dir, listing)
     finally:
         m.close()
 
     moved = {kind: sum(1 for e in listing if e.get(kind)) for kind, _, _ in roots}
-    print(f"reset {len(rows)} word(s) to pending; {len(unknown)} unknown")
+    print(f"reset {len(words) - len(unknown)} word(s) to pending ({len(rows)} row(s), one per "
+          f"voice); {len(unknown)} unknown")
     print(f"previous take: {take_dir} ({', '.join(f'{n} {k}' for k, n in moved.items())} "
           "moved, listing in words.json)")
-    voices = sorted({r["voice"] for r in rows if r["voice"]})
     print("generate them again, e.g.:")
-    print(f"  python -m wordbank --db {cfg.db} --out {cfg.out_dir} --lang {cfg.lang} "
-          f"gemini-run --voice {voices[0] if len(voices) == 1 else '<voice>'} "
-          "--model <model> [--style \"...\"]")
+    for v in sorted({r["voice"] or "<voice>" for r in rows}):
+        print(f"  python -m wordbank --db {cfg.db} --out {cfg.out_dir} --lang {cfg.lang} "
+              f"gemini-run --voice {v} --model <model> [--style \"...\"]")
     if args.ogg_root:
         print(f"  python scripts/encode_wavs.py {cfg.out_dir} {args.ogg_root}")
+
+
+def cmd_qc(args, cfg: Config) -> None:
+    """Check the bank's clips (wordbank/qc.py) and record the result in
+    `review` / qc_seconds / qc_end_db. With --retry, re-take each flagged word
+    synchronously (gemini-run's rate-limited machinery, the row's own voice)
+    until a take passes or --qc-retries run out; the best take is kept, a
+    replaced one moved to <db dir>/takes/<UTC>/."""
+    import wave
+    from . import qc
+    from .manifest import DONE, VERIFIED
+
+    if not os.path.isfile(cfg.db):
+        sys.exit(f"no word bank at {cfg.db} (pass --db)")
+    voice = None
+    if args.voice:
+        from .gemini_tts import voice_label
+        voice = voice_label(args.voice)
+    lang = None if args.all_langs else cfg.lang
+    scope = f"{lang or 'every language'}, {f'voice {voice}' if voice else 'every voice'}"
+    out = pathlib.Path(cfg.out_dir)
+
+    def clip(row) -> pathlib.Path:          # where the row's current take is
+        if row["status"] == RETAKE:
+            return qc.retake_path(cfg.db, row["id"])
+        return out / row["file_path"]
+
+    m = Manifest(cfg.db)
+    try:
+        in_scope = [r for r in m.iter_rows()
+                    if r["status"] in (DONE, VERIFIED, RETAKE) and r["file_path"]
+                    and (lang is None or r["lang"] == lang) and (voice is None or r["voice"] == voice)]
+        if args.accept_file:
+            keep = set(_load_words(args.accept_file))
+            accept = [r for r in in_scope if r["word"] in keep]
+            m.accept_qc([r["id"] for r in accept])
+            print(f"accepted {len(accept)} clip(s) ({scope}); "
+                  f"{len(keep - {r['word'] for r in accept})} listed word(s) not in scope")
+            in_scope = [dict(r) | {"qc_accepted": 1} if r["word"] in keep else r for r in in_scope]
+        rows = [r for r in in_scope if not r["qc_accepted"]]
+        checks, missing = {}, []
+        for row in rows:
+            try:
+                checks[row["id"]] = qc.check_wav(clip(row))
+            except (OSError, EOFError, wave.Error, ValueError) as exc:
+                missing.append((row, exc))
+        m.record_qc([(rid, check, None) for rid, check in checks.items()])
+        flagged = [r for r in rows if r["id"] in checks and checks[r["id"]].flagged]
+        final = {r["id"]: checks[r["id"]] for r in flagged}
+        take_dir, replaced = None, 0
+        if args.retry and flagged:
+            take_dir, replaced = _qc_retakes(args, cfg, m, flagged, checks, final, clip)
+        still = [r for r in flagged if final[r["id"]].flagged]
+        if args.csv:
+            now = {r["id"]: r for r in m.iter_rows()}     # file_path may have moved
+            with open(args.csv, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["id", "word", "voice", "seconds", "end_db", "reason", "file_path"])
+                for r in still:
+                    c, row = final[r["id"]], now[r["id"]]
+                    writer.writerow([row["id"], row["word"], row["voice"], f"{c.seconds:.2f}",
+                                     f"{c.end_db:.1f}", c.review, row["file_path"]])
+    finally:
+        m.close()
+
+    for row, exc in missing[:10]:           # a volume without WAV masters misses them all
+        print(f"  no readable clip for {row['word']!r} (id {row['id']}): {exc}")
+    if len(missing) > 10:
+        print(f"  ... and {len(missing) - 10} more (qc reads the WAV masters under --out)")
+    resolved = len(flagged) - len(still)
+    print(f"checked {len(checks)} clip(s) ({scope}): {len(flagged)} flagged"
+          + (f", {resolved} resolved by a re-take" if args.retry else "")
+          + f", {len(still)} still flagged" + (f"; {len(missing)} unreadable" if missing else ""))
+    if args.csv:
+        print(f"wrote {args.csv} ({len(still)} still flagged)")
+    if replaced:
+        print(f"replaced {replaced} clip(s); previous takes in {take_dir}")
+        if not args.ogg_root:
+            print("  no --ogg-root: their old OGG copies are still in place and encode_wavs.py "
+                  "skips existing OGGs - delete the .ogg of each file_path in words.json first")
+        print(f"  python scripts/encode_wavs.py {cfg.out_dir} {args.ogg_root or '<ogg root>'}")
+    elif flagged and not args.retry:
+        print("re-take them: add --retry --model <model> [--style \"...\"]")
+
+
+def _qc_retakes(args, cfg: Config, m: Manifest, flagged, checks, final, clip) -> tuple:
+    """`qc --retry`: re-take each flagged row in its own voice; updates `final`
+    (row id -> Check). -> (take dir, number of bank clips it replaced)."""
+    from . import qc
+    from .gemini_batch import _write_and_mark
+    from .gemini_run import best_of_takes, check_voice_name, sync_session
+    from .gemini_tts import check_voice
+    from .paths import voice_from_path
+
+    instruction, style = _direction_args(args)
+    voice_of = {r["id"]: r["voice"] or voice_from_path(r["file_path"]) for r in flagged}
+    for v in sorted({v for v in voice_of.values() if v}):
+        try:
+            check_voice_name(v)
+            check_voice(v, args.model)
+        except ValueError as exc:
+            sys.exit(f"--retry: {exc}")
+    take, sent_style, inline = sync_session(model=args.model, instruction=instruction,
+                                            style=style, rpm=args.rpm)
+    direction = sent_style or inline or None
+    take_dir, roots, listing = _take_dir(cfg), _take_roots(cfg, args.ogg_root), []
+    out = pathlib.Path(cfg.out_dir)
+    print(f"re-taking {len(flagged)} flagged clip(s) with {args.model}, up to "
+          f"{args.qc_retries} take(s) each, {args.rpm:g} rpm")
+    for row in flagged:
+        word, voice = row["word"], voice_of[row["id"]]
+        if not voice:
+            print(f"  {word!r}: no voice recorded or in its path, skipped")
+            continue
+        held = clip(row)
+        current = (qc.read_pcm(held), checks[row["id"]])
+        pcm, check, made = best_of_takes(word, current, lambda: take(word, voice),
+                                         args.qc_retries, print)
+        takes = row["qc_takes"] + made
+        if pcm is current[0]:               # no re-take beat the current clip
+            if row["status"] == RETAKE:     # its re-takes end here: file it
+                _write_and_mark(m, out, row["lang"], voice, row, pcm, check=check, qc_takes=takes)
+                held.unlink()
+            else:
+                m.record_qc([(row["id"], check, takes)])
+        else:
+            if row["status"] == RETAKE:
+                held.unlink()               # a held take never reached the bank
+            else:
+                listing.append(_archive_take(cfg, row, take_dir, roots))
+            _write_and_mark(m, out, row["lang"], voice, row, pcm, model=args.model,
+                            style=direction, check=check, qc_takes=takes)
+        final[row["id"]] = check
+    if listing:
+        _write_listing(take_dir, listing)
+    return take_dir, len(listing)
 
 
 def cmd_describe(args, cfg: Config) -> None:
@@ -297,7 +489,10 @@ def cmd_verify(args, cfg: Config) -> None:
 def cmd_status(args, cfg: Config) -> None:
     words = Manifest(cfg.db)
     phrases = Manifest(cfg.db, table="phrases", text_col="text")
+    qcc = words.qc_counts()
     print(f"words:   {words.counts()}")
+    print(f"         QC: {qcc['flagged']} flagged for review, {qcc['unchecked']} never checked, "
+          f"{qcc['accepted']} accepted" + (" (python -m wordbank qc)" if qcc["unchecked"] else ""))
     print(f"phrases: {phrases.counts()}")
     words.close()
     phrases.close()
@@ -308,12 +503,12 @@ def cmd_export(args, cfg: Config) -> None:
     rows = m.iter_rows()
     out = open(args.output, "w", newline="", encoding="utf-8") if args.output else sys.stdout
     writer = csv.writer(out)
-    writer.writerow(["id", "word", "lang", "status", "attempts", "file_path",
-                     "transcript", "billed_chars", "error", "model", "style"])
+    cols = ["id", "word", "lang", "voice", "status", "attempts", "file_path", "transcript",
+            "billed_chars", "error", "model", "style", "review", "qc_seconds", "qc_end_db",
+            "qc_takes"]
+    writer.writerow(cols)
     for r in rows:
-        writer.writerow([r["id"], r["word"], r["lang"], r["status"], r["attempts"],
-                         r["file_path"], r["transcript"], r["billed_chars"], r["error"],
-                         r["model"], r["style"]])
+        writer.writerow([r[c] for c in cols])
     if args.output:
         out.close()
         print(f"wrote {args.output}")
@@ -357,11 +552,11 @@ def main(argv=None) -> None:
     gr.add_argument("--model", default=GEMINI_TTS_DEFAULT_MODEL,
                     help=f"Gemini TTS model (default {GEMINI_TTS_DEFAULT_MODEL})")
     _add_direction_args(gr)
-    gr.add_argument("--rpm", type=float, default=10,
-                    help="requests per minute (default 10 = Tier 1), retries included")
+    _add_rpm_arg(gr)
     gr.add_argument("--max-attempts", type=int, default=3, dest="max_attempts",
-                    help="attempts per word across runs (default 3)")
+                    help="attempts per word across runs (default 3; QC re-takes don't count)")
     gr.add_argument("--limit", type=int, default=None, help="cap words this run")
+    _add_qc_arg(gr)
     gr.set_defaults(func=cmd_gemini_run)
 
     rg = sub.add_parser("regenerate",
@@ -369,9 +564,36 @@ def main(argv=None) -> None:
                              "and reset them to pending")
     rg.add_argument("--words-file", required=True, dest="words_file",
                     help="text file, one word per line (words not in the bank are reported)")
+    rg.add_argument("--voice", default=None,
+                    help="only this voice's rows (default: every voice the word is banked in)")
     rg.add_argument("--ogg-root", default=None, dest="ogg_root",
                     help="OGG tree to take the encoded copies from too, e.g. output/words_ogg")
     rg.set_defaults(func=cmd_regenerate)
+
+    q = sub.add_parser("qc",
+                       help="check the clips (ends on sound, implausible length), record "
+                            "flags; --retry re-takes flagged words until they pass")
+    q.add_argument("--voice", default=None, help="only this voice's clips (default: every voice)")
+    q.add_argument("--all-langs", action="store_true", dest="all_langs",
+                   help="every language, not just --lang")
+    q.add_argument("--csv", default=None,
+                   help="write the clips still flagged (id, word, voice, seconds, end_db, "
+                        "reason, file_path) here, for listening")
+    q.add_argument("--accept-file", default=None, dest="accept_file",
+                   help="words (one per line) a person listened to and kept despite a flag: "
+                        "their flag is cleared and qc skips them from now on (regenerate undoes it)")
+    q.add_argument("--retry", action="store_true",
+                   help="re-take flagged words with Gemini (sync, rate-limited), each in its "
+                        "own voice, with --model and --style/--instruction")
+    q.add_argument("--model", default=GEMINI_TTS_DEFAULT_MODEL,
+                   help=f"Gemini TTS model for --retry (default {GEMINI_TTS_DEFAULT_MODEL})")
+    _add_direction_args(q)
+    _add_rpm_arg(q)
+    _add_qc_arg(q)
+    q.add_argument("--ogg-root", default=None, dest="ogg_root",
+                   help="OGG tree of the bank: a replaced clip's OGG copy is moved aside too, "
+                        "so encode_wavs.py encodes the new take")
+    q.set_defaults(func=cmd_qc)
 
     de = sub.add_parser("describe",
                         help="write a library description (langs/counts) as JSON")
