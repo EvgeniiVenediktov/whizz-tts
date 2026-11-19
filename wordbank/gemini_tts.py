@@ -1,12 +1,8 @@
-"""Synchronous single-phrase Gemini TTS → raw PCM. Used by /v1/speak, the voice
-studio, the `gemini-voice` CLI and the sync bank runner (`gemini_run.py`).
-Distinct from `gemini_batch.py`, which builds the large async word bank.
-
-Two request paths, picked per model by the capability registry (TTS_MODELS):
-generateContent through google-genai (lazily imported) for plain text and for
-inline directions, and the Interactions API (raw REST, stdlib) for a `style`
-direction, which only the 3.8 models accept. Needs GEMINI_API_KEY (or
-GOOGLE_API_KEY) in the environment.
+"""Synchronous single-phrase Gemini TTS -> raw PCM, for /v1/speak, the studio
+and `gemini-run` (gemini_batch.py builds the async word bank). Per model
+(TTS_MODELS): generateContent via google-genai (lazy) for plain text and inline
+directions, the Interactions API (stdlib REST) for a `style` (3.8 only).
+Needs GEMINI_API_KEY (or GOOGLE_API_KEY).
 """
 import base64
 import io
@@ -24,29 +20,19 @@ from typing import Callable, Optional, Tuple
 
 from .constants import SAMPLE_RATE  # Gemini TTS emits 24 kHz / 16-bit mono PCM
 from .languages import VOICE_LANGUAGES
-# 3.8 Flash: with a speech_metadata style it said the words 3.8 Lite acted out
-# ("laughing", "haha", "russian"), at 1.5x Lite's price. A 3.x model because the
-# 2.5 TTS models answer imperative text ("Read this one slowly please.") with
-# 400 "Model tried to generate text" and drop audio far more often on digit
-# runs. The 3.8 models return a whole WAV file (with a C2PA provenance chunk),
-# not bare PCM — pcm_from_payload unwraps it. NOT the word bank's model
-# (gemini_batch.BATCH_DEFAULT_MODEL), so /v1/speak phrases can sound slightly
-# different from the banked words.
+# Not the word bank's model (gemini_batch.BATCH_DEFAULT_MODEL); 2.5 rejects
+# imperative text and drops audio on digit runs (AGENTS.md, batch notes).
 DEFAULT_MODEL = "gemini-3.8-flash-tts"
 
-# TTS (speechConfig), batches and file uploads are v1beta-only. google-genai 3.x
-# defaults to v1, which rejects speechConfig with 400 INVALID_ARGUMENT, so every
-# client pins the version explicitly (via new_client) instead of trusting the SDK.
+# TTS, batches and uploads are v1beta-only; google-genai 3.x defaults to v1
+# (400 on speechConfig), so new_client pins it.
 GEMINI_API_VERSION = "v1beta"
 _HTTP_TIMEOUT_S = 120     # every Gemini request (a server thread waits on it)
 
 log = logging.getLogger(__name__)
 
-# Gemini TTS sometimes returns a candidate with no content and finish_reason
-# OTHER (no block reason, prompt-only usage) — non-deterministic, more often
-# for text with long digit runs; the same call usually succeeds on a repeat.
-# Only these reasons are retried; SAFETY/PROHIBITED_CONTENT/BLOCKLIST/SPII etc.
-# and any prompt_feedback.block_reason fail on the first response.
+# An empty candidate with finish_reason OTHER is transient (a repeat usually
+# works); blocks (SAFETY, PROHIBITED_CONTENT, a block_reason ...) are not retried.
 _RETRYABLE_FINISH = {None, "FINISH_REASON_UNSPECIFIED", "OTHER"}
 _RETRY_BACKOFF_S = 0.5   # sleep before retry n is n * this
 
@@ -84,25 +70,11 @@ class GeminiNetworkError(GeminiAPIError):
     """No HTTP response: the connection failed or timed out (transient)."""
 
 
-# --- model capabilities: how a delivery direction reaches each TTS model -------
-# Every caller (synthesize_pcm, the batch request builder, the CLI, the server)
-# routes directions through this registry, so it's the one place to add a model.
-#
-# - style:  accepts a `style` direction as structured speech metadata (the
-#           Interactions `speech_metadata` annotation, or `speechMetadata` on a
-#           generateContent part). The text stays a verbatim transcript.
-# - inline: treats a leading "<direction>: " in the text as direction, not as
-#           words to speak (today's `instruct` prefix).
-# Verified live (2026-11): both 3.8 models take a style and read any inline
-# prefix ALOUD ("Say …: word" came back as the whole prompt spoken); both reject
-# generateContent system_instruction ("Developer instruction is not enabled").
-# 3.1 rejects speech metadata (400 "Speech metadata is not supported for this
-# model."). 2.5 was not probed for style; it is treated like 3.1.
-#
-# - locale_voices: takes the voice library's locale voices (`en-gb-tutor-11`),
-#           not just the 30 classic ones. Verified (2026-11) on both 3.8 models
-#           with en-gb-tutor-11; UNVERIFIED on 3.1/2.5 (never tried), so refused
-#           there before any request (check_voice). Classic voices work on all.
+# --- model capabilities: the one place a TTS model is described ---------------
+# style: takes a direction as speech metadata, the text verbatim; such a model
+#   reads an inline prefix ALOUD, so it never gets one (the others get only the
+#   inline prefix). locale_voices: verified with the library's locale voices
+#   (`en-gb-tutor-11`); refused elsewhere before any request (check_voice).
 @dataclass(frozen=True)
 class TTSModel:
     style: bool
@@ -116,8 +88,6 @@ TTS_MODELS = {
     "gemini-2.5-flash-preview-tts": TTSModel(style=False, locale_voices=False),
     "gemini-2.5-pro-preview-tts": TTSModel(style=False, locale_voices=False),
 }
-# An unlisted model keeps the pre-registry behaviour (inline prefix, no style,
-# classic voices only).
 _UNLISTED = TTSModel(style=False, locale_voices=False)
 
 
@@ -169,13 +139,9 @@ def route_direction(model: str, instruct: Optional[str] = None,
             f"style-capable models: {', '.join(style_models())}")
     return None, instruct
 
-# The 30 classic prebuilt Gemini TTS voices: (name, style descriptor, gender).
-# Voices are NOT language-specific — the model auto-detects language from the
-# input text, so any voice speaks any supported language. Every TTS model takes
-# them. Gender is the community-perceived one, kept for /v1/gemini/voices
-# (14 female / 16 male); the voice library (GET /v1beta/voices) now lists a
-# gender too and agrees except Pulcherrima ("neutral" there).
-# Source: https://ai.google.dev/gemini-api/docs/speech-generation
+
+# The 30 classic voices (name, style, gender), on every model and in any
+# language (detected from the text). ai.google.dev/gemini-api/docs/speech-generation
 VOICES = [
     ("Zephyr", "Bright", "female"), ("Puck", "Upbeat", "male"),
     ("Charon", "Informative", "male"), ("Kore", "Firm", "female"),
@@ -196,10 +162,8 @@ VOICES = [
 
 _VOICE_NAMES = {name.lower(): name for name, _, _ in VOICES}
 
-# Locale voices the server accepts beyond the classic ones: the curated
-# per-language picks (languages.VOICE_LANGUAGES; its en-us picks are classic).
-# Labelled by their lowercase library id ("en-gb-tutor-11"), as the batch path
-# files them (`<lang>/gemini-<id>/…`). 3.8 models only (check_voice).
+# The curated locale voices (languages.VOICE_LANGUAGES), labelled by their
+# lowercase library id ("en-gb-tutor-11"). 3.8 models only (check_voice).
 LOCALE_VOICES = frozenset(v["id"] for lang in VOICE_LANGUAGES
                           for v in lang["voices"]) - _VOICE_NAMES.keys()
 
@@ -351,15 +315,11 @@ def _empty_retries() -> int:
 
 
 # --- Interactions API (style directions) --------------------------------------
-# Raw REST over urllib rather than google-genai's client.interactions: the
-# request/response below is the wire format verified live, while the SDK's
-# generated Interactions surface has changed between the releases this project
-# runs (2.31 in the dev venv, 3.x in the images). The URL carries
-# GEMINI_API_VERSION like every google-genai client from new_client().
+# Raw REST, not client.interactions: this wire format is verified live, the
+# SDK's surface changed between releases.
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com"
-# A completed interaction with no audio is the Interactions analogue of an
-# empty generateContent candidate (finish_reason OTHER) and is retried; a
-# failed / cancelled / incomplete one, or one carrying errors, is not.
+# "completed" without audio is retried like finish_reason OTHER; failed /
+# cancelled / incomplete, or with errors, is not.
 _RETRYABLE_STATUS = {None, "completed"}
 
 
@@ -436,29 +396,14 @@ def _interaction_audio_or_reason(resp: dict):
 def synthesize_pcm(text: str, voice: str = "Kore", instruct: str = "",
                    model: str = DEFAULT_MODEL, style: Optional[str] = None,
                    on_request: Optional[Callable[[], None]] = None) -> bytes:
-    """Speak `text` with a Gemini voice; return raw 24 kHz PCM bytes (a WAV
-    payload is unwrapped — see pcm_from_payload).
-
-    Directions are routed per model (route_direction):
-    - `style` (delivery direction): only for style-capable models (3.8), sent as
-      a speech_metadata annotation through the Interactions API with `text`
-      verbatim. Any other model raises GeminiStyleUnsupportedError before a
-      request is made.
-    - `instruct` (style/accent direction, e.g. "British accent"): on
-      style-capable models it is sent as the style (after `style` when both are
-      given, see combine_style) — never inline, since 3.8 reads inline text
-      aloud. On other models it is prepended to the text as today.
-    - neither: generateContent with the bare text, as before.
-
-    A response with no audio and a transient reason (generateContent
-    finish_reason OTHER/unset; an Interactions status "completed") is retried
-    up to GEMINI_TTS_EMPTY_RETRIES times (default 2); a block or failure is not.
-    Raises GeminiNoAudioError, naming the reason, if no audio comes back, and
-    GeminiAudioFormatError (not retried) for audio in another format.
-    `on_request` is called before every request, retries included (the sync
-    bank runner passes its rate limiter). A locale voice on a model not
-    verified with it raises GeminiVoiceUnsupportedError first (check_voice).
-    """
+    """Speak `text` in a Gemini voice -> raw 24 kHz PCM (pcm_from_payload).
+    `instruct`/`style` are routed per model (route_direction): a style-capable
+    model gets them as the Interactions speech_metadata style, `text` verbatim;
+    another gets `instruct` as an inline prefix, and a `style` raises
+    GeminiStyleUnsupportedError before any request. No audio for a transient
+    reason is retried GEMINI_TTS_EMPTY_RETRIES times (default 2), then
+    GeminiNoAudioError names the reason. `on_request` runs before every request
+    (gemini-run's rate limiter)."""
     check_voice(voice, model)
     style, inline = route_direction(model, instruct, style)
     if style:

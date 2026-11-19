@@ -22,15 +22,9 @@ SUPPORTED_LANGUAGES = [
     # {"code": "es",    "name": "Spanish"},
 ]
 
-# Curated Gemini voices per language: one female + one male prebuilt voice for
-# each bank `lang` in gemini_voices.json, picked by accent from Gemini's voice
-# library (GET /v1beta/voices: 2,140 voices in 2026-11; only these picks are
-# kept). A separate fact from SUPPORTED_LANGUAGES: a language here has voices
-# /v1/speak and the studio accept (GET /v1/gemini/languages), not a verified
-# bank. Picks are edited by hand in the JSON; scripts/fetch_gemini_voices.py
-# refreshes their catalog metadata and lists candidates for a new pick. en-us
-# uses two classic voices (Kore, Iapetus); the others are locale voices, which
-# only the 3.8 models take (gemini_tts.check_voice).
+# One female + one male Gemini voice per bank `lang` (gemini_voices.json, picked
+# by hand; scripts/fetch_gemini_voices.py refreshes their metadata). Voices
+# /v1/speak accepts, not a verified bank: unrelated to SUPPORTED_LANGUAGES.
 VOICE_LANGUAGES_FILE = pathlib.Path(__file__).with_name("gemini_voices.json")
 VOICE_LANGUAGES = json.loads(VOICE_LANGUAGES_FILE.read_text(encoding="utf-8"))["languages"]
 

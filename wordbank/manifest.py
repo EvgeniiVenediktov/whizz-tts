@@ -1,28 +1,13 @@
-"""SQLite manifest tracking per-entry generation status. Enables resume + dedup.
+"""SQLite manifest of generation status (resume + dedup), two tables of one
+shape: `words` (UNIQUE(lang, word, voice)) and `phrases`, the /v1/speak bank
+(UNIQUE(text, lang, voice)), kept apart but sharing voice labels ("Kore").
+A Manifest targets one (`table=`/`text_col=`); both are always created.
 
-Two content tables with identical shape:
-  - `words`   — the Gemini single-word bank   (UNIQUE(lang, word, voice))
-  - `phrases` — the /v1/speak phrase bank      (UNIQUE(text, lang, voice))
-They are stored separately so words and phrases never overlap, but share
-their voice labels (gemini_tts.voice_label: "Kore", "en-gb-tutor-11"): a
-voice's bank is its words plus its phrases. One `Manifest` instance targets
-one table (pass `table=`/`text_col=`); both tables are always created. Banks
-made before clone references were removed may also hold an unused `voices`
-table.
+A NULL word `voice` is unattributed (ingested by code before the voice key,
+not generated yet): the first voice to generate it claims it, and the
+`words_add_dedup` trigger keeps adding that word from creating a second row.
 
-A word is banked once per voice (a woman's and a man's en-gb bank side by
-side). A NULL `voice` marks an unattributed row: a word ingested by code that
-predated the voice key and not generated yet, in a language without exactly
-one voice to give it (the key migration attributes the rest, see
-_migrate_word_rows). The first voice to generate such a row claims it:
-pending(voice=V) includes it, and adding the word for V doesn't create a
-second row (the `words_add_dedup` trigger, which also keeps a voice-less add to
-one row per word, as UNIQUE(word, lang) did, for any writer — older code
-included).
-
-Thread-safe: a single connection (check_same_thread=False) guarded by a lock.
-DB writes are tiny; the real bottleneck is the TTS call, so lock contention is
-negligible even with many worker threads.
+Thread-safe: one connection (check_same_thread=False) behind a lock.
 """
 import sqlite3
 import threading
@@ -35,11 +20,8 @@ PENDING = "pending"
 SUBMITTED = "submitted"   # enqueued in an async batch job, awaiting results
 DONE = "done"            # audio written to disk
 FAILED = "failed"
-# A batch take flagged by QC (wordbank/qc.py), queued for a re-take: its best
-# take so far waits at qc.retake_path, outside the bank tree, until a take
-# passes or the re-takes run out. Not served. Re-taken only by a batch with the
-# row's own model and direction (Manifest.pending's `retake`), or `wordbank qc
-# --retry`.
+# A batch take QC flagged, queued for a re-take (best take at qc.retake_path).
+# Not served; re-taken only with the row's own model and direction.
 RETAKE = "retake"
 
 # SET clause for the generation provenance (params: model, model, style): with a
@@ -105,11 +87,9 @@ CREATE TABLE IF NOT EXISTS phrases (
 _POST_SCHEMA = """
 CREATE INDEX IF NOT EXISTS idx_phrases_lang_text ON phrases(lang, text);
 
--- Manifest.add_words for words: a word is added for a voice unless that voice
--- already has it or an unattributed row still to generate covers it (the
--- first voice to generate claims that row); a voice-less add is one row per
--- word, as under the old UNIQUE(word, lang), which NULL-distinct UNIQUE can't
--- give. A trigger, so writers that predate the voice key keep that behaviour.
+-- A word is added for a voice unless that voice has it or an unattributed row
+-- still to generate covers it; a voice-less add is one row per word (NULL-
+-- distinct UNIQUE can't say so). A trigger, so older writers obey it too.
 CREATE TRIGGER IF NOT EXISTS words_add_dedup BEFORE INSERT ON words
 WHEN EXISTS (SELECT 1 FROM words WHERE lang = NEW.lang AND word = NEW.word
              AND (NEW.voice IS NULL OR voice = NEW.voice
@@ -142,13 +122,10 @@ class Manifest:
                     self._conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {decl}")
                 except sqlite3.OperationalError:
                     pass  # column already exists
-        # `phrases` tables created before `voice` existed carry UNIQUE(text, lang),
-        # which ALTER can't widen: the same text in a second voice was silently
-        # dropped by INSERT OR IGNORE (and /v1/speak then failed to find its row).
+        # A key without `voice` silently dropped a second voice's row, and
+        # ALTER can't widen a UNIQUE key: rebuilt once.
         if ["text", "lang"] in self._unique_keys("phrases"):
             self._rebuild("phrases")
-        # `words` keyed UNIQUE(word, lang) held one clip per word and language:
-        # a second voice's take of a banked word was dropped the same way.
         if ["lang", "word", "voice"] not in self._unique_keys("words"):
             self._rebuild("words", self._migrate_word_rows)
         self._conn.executescript(_POST_SCHEMA)
@@ -197,19 +174,11 @@ class Manifest:
                 raise
 
     def _migrate_word_rows(self) -> None:
-        """One-time data moves of the words key migration:
-        - a NULL voice on a row with a clip is recovered from its file_path
-          (`<lang>/gemini-<voice>/…`, as scripts/backfill_voice.py does), so the
-          old clip keys under its voice and generating that voice skips it;
-        - a row not generated yet (ingested without a voice: pending, failed,
-          or in flight in a batch) takes its language's voice when that
-          language's clips are all in one voice — the voice the run that
-          ingested it was for, since the old key held one voice per word (a
-          row in flight keeps NULL: the batch it is in may be another's). Left
-          NULL, a second voice's run could claim it. What stays NULL (no or
-          several voices in its language, done clips whose path has none) is
-          unattributed — see the module docstring.
-        Under the old UNIQUE(word, lang) neither can collide with another row."""
+        """One-time data moves of the words key migration (no collisions under
+        the old UNIQUE(word, lang)): a clip's NULL voice is recovered from its
+        file_path (`<lang>/gemini-<voice>/…`); a pending or failed row takes its
+        language's voice when all its clips are in one (the voice its run was
+        for). A row in flight keeps NULL: its batch may be another voice's."""
         for row_id, file_path in self._conn.execute(
                 "SELECT id, file_path FROM words WHERE voice IS NULL "
                 "AND file_path IS NOT NULL").fetchall():
@@ -308,13 +277,9 @@ class Manifest:
                    voice: Optional[str] = None, model: Optional[str] = None,
                    style: Optional[str] = None, check=None,
                    qc_takes: Optional[int] = None) -> None:
-        # voice uses COALESCE so a later status-only update (e.g. a
-        # retry marking FAILED) never clobbers recorded provenance. model/style
-        # are one record: passing `model` (a generation result) writes both,
-        # style exactly as given — None means "no direction", so a re-take
-        # without one doesn't inherit the old take's style; without `model`
-        # both are kept. `check` (a qc.Check of the clip) writes review and the
-        # measurements, `qc_takes` the re-take count; omitted, both are kept.
+        # A status-only update keeps the voice. `model` (a generation result)
+        # writes model and style together, style as given (None: no direction);
+        # without it both are kept. `check` (qc.Check) and `qc_takes` likewise.
         qc_sql, qc_params = "", []
         if check is not None:
             qc_sql += "review = ?, qc_seconds = ?, qc_end_db = ?, "

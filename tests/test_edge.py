@@ -61,6 +61,10 @@ class FakeUpstream:
         self.url = f"http://127.0.0.1:{self.server.server_port}"
         threading.Thread(target=self.server.serve_forever, args=(0.05,), daemon=True).start()
 
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
     @staticmethod
     def _ok(fields):
         voice = fields.get("voice", "Kore")
@@ -72,7 +76,7 @@ class FakeUpstream:
 def upstream():
     up = FakeUpstream()
     yield up
-    up.server.shutdown()
+    up.close()
 
 
 @pytest.fixture
@@ -189,7 +193,7 @@ def test_upstream_redirects_are_not_followed(edge):
         assert _speak(edge, text="hello there").status_code == 502
         assert elsewhere.requests == [] and _phrases(edge.paths) == []
     finally:
-        elsewhere.server.shutdown()
+        elsewhere.close()
 
 
 def test_unreachable_upstream_is_502(edge, monkeypatch):

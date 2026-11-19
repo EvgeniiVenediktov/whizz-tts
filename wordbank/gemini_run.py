@@ -1,30 +1,10 @@
 """Synchronous Gemini word-bank generation (`wordbank gemini-run`): one
-gemini_tts.synthesize_pcm call per pending row, so each word can carry a
-`style` (Interactions speech_metadata, 3.8 models) and small sets — e.g. rows a
-`regenerate` reset — finish in minutes instead of a batch job's hours.
-
-Clips land exactly where the batch path puts them
-(`<lang>/gemini-<voice>/<id // 1000>/<id>_<word>.wav`, via
-gemini_batch._write_and_mark), with model/style provenance. Resumable: state
-lives in the manifest, so a re-run picks up whatever is still pending or failed
-under max_attempts. Requests are spaced by a RateLimiter (`rpm`, default 10 =
-Tier 1), empty-audio retries inside synthesize_pcm included.
-
-QC (wordbank/qc.py): each take is checked as it arrives; a flagged one is
-re-taken on the spot (same model, voice and direction, through the same rate
-limiter) up to `qc_retries` times. The first passing take is filed; if every
-take is flagged, the best one is filed with its flag in `review`. Re-takes
-count in qc_takes, never in the row's generation attempts; one that raises
-just ends the re-takes. `best_of_takes` and `sync_session` are shared with
-`wordbank qc --retry`.
-
-Failures:
-- transient (HTTP 429 / 5xx, no response): the row is retried with backoff
-  until it reaches max_attempts; if it still fails the run stops — quota or an
-  outage, which more rows would only burn attempts on. Re-run later.
-- anything else (400, no audio, a bad format): the row is marked failed and
-  the run moves on, stopping after `stop_after` consecutive failed rows (a bad
-  key, model or voice fails every row alike).
+synthesize_pcm call per pending row, rate-limited (`rpm`), filed where the
+batch path files clips (gemini_batch._write_and_mark). Resumable from the
+manifest. A QC-flagged take is re-taken on the spot up to `qc_retries` times
+(re-takes count in qc_takes, not attempts). A transient failure (429 / 5xx /
+no response) is retried with backoff up to max_attempts, then stops the run;
+any other fails the row, and `stop_after` failed rows in a row stop the run.
 """
 import pathlib
 import time

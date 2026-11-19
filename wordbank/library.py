@@ -1,13 +1,7 @@
-"""Library description + verification for deployment.
-
-A **description file** (JSON) records what a provisioned bank should contain —
-languages, word/phrase counts, OGG file count, and the folders that must
-exist. Word counts are clips: a word banked in two voices counts twice
-(`languages.wordbank_voices` breaks them down per language and voice). At
-deploy time the container verifies the mounted volume against it and
-unpacks the library archive only if verification fails. Uses read-only
-`BankLookup` (never creates/mutates the DB) + the stdlib, so it runs in the
-bank-only image with no extra deps.
+"""Library description (what a provisioned bank holds: counts per language
+and voice, OGG count, folders) and its verification at deploy time. Word
+counts are clips (a word in two voices counts twice). Read-only BankLookup +
+stdlib, so it runs in the serving image.
 """
 import json
 import os
@@ -38,23 +32,11 @@ def describe(db: str, ogg_root: str) -> dict:
 
 def verify(desc_path: str, root: Optional[str] = None, *, db: Optional[str] = None,
            ogg_root: Optional[str] = None) -> List[str]:
-    """Check a bank against the description. Returns a list of problems (empty = OK).
-
-    The word (clip) count must match exactly. Phrase and OGG counts are minimums: the
-    running server adds phrases (and their OGGs) via /v1/speak, so a volume that
-    has served traffic legitimately holds more than the packaged library. Exact
-    matching there made every restart after a /v1/speak write fail verification
-    and re-unpack the archive over the grown wordbank.db.
-
-    Layout resolution (db and ogg_root resolve independently):
-      - explicit `db=`/`ogg_root=` kwargs always win.
-      - else if `root` is given: the flat deploy layout — `root/desc["db"]`,
-        `root/"words_ogg"` (matches docker-entrypoint.sh).
-      - else: the same defaults the server uses — $BANK_DB (default
-        "wordbank.db"), $OGG_ROOT (default "output/words_ogg").
-    Only words_ogg is checked: older descriptions also list a "voices" folder,
-    which nothing serves any more.
-    """
+    """Problems of a bank against the description ([] = OK). The word count
+    must match; phrase and OGG counts are minimums (/v1/speak grows them on a
+    live volume). db and ogg_root resolve independently: explicit kwargs, else
+    the flat deploy layout under `root` (`root/desc["db"]`, `root/words_ogg`),
+    else the server's own defaults ($BANK_DB, $OGG_ROOT)."""
     dp = pathlib.Path(desc_path)
     if not dp.exists():
         return [f"no description file at {desc_path}"]

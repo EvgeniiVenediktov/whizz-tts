@@ -1,10 +1,8 @@
-"""List and (optionally) delete Gemini batch jobs to free the enqueued-token quota.
+"""List and (optionally) cancel / delete Gemini batch jobs.
 
-Finished jobs can keep counting against the batch enqueued-token quota until they
-are deleted (or auto-expire ~48h after creation). Once you've collected results,
-delete them to free the budget immediately.
-
-Requires GEMINI_API_KEY (the SAME key used to create the jobs).
+The enqueued-token quota counts non-terminal jobs: --cancel stops stuck ones;
+deleting finished jobs is tidy-up. Only delete jobs whose results were
+collected. Requires GEMINI_API_KEY (the key that created the jobs).
 
   python scripts/gemini_batch_cleanup.py                 # list jobs + states (no changes)
   python scripts/gemini_batch_cleanup.py --delete        # delete FINISHED wordbank-* jobs
@@ -17,14 +15,8 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 
+from wordbank.gemini_batch import is_terminal, job_state
 from wordbank.gemini_tts import new_client
-
-_TERMINAL = ("SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED")
-
-
-def _state(job) -> str:
-    s = getattr(job, "state", "")
-    return getattr(s, "name", None) or str(s)
 
 
 def main() -> None:
@@ -46,7 +38,7 @@ def main() -> None:
     print(f"{'STATE':<26} {'DISPLAY_NAME':<28} NAME")
     deleted = cancelled = skipped = 0
     for j in jobs:
-        st = _state(j)
+        st = job_state(j)
         dn = getattr(j, "display_name", "") or ""
         print(f"{st:<26} {dn:<28} {j.name}")
         if not args.delete:
@@ -54,8 +46,7 @@ def main() -> None:
         if not args.all and not dn.startswith(args.prefix):
             skipped += 1
             continue
-        terminal = st.endswith(_TERMINAL)
-        if not terminal:
+        if not is_terminal(j):
             if args.cancel:
                 client.batches.cancel(name=j.name)
                 cancelled += 1
@@ -70,7 +61,7 @@ def main() -> None:
         print(f"\ndeleted {deleted}, cancelled {cancelled}, skipped {skipped}")
     else:
         print(f"\n{len(jobs)} job(s). Re-run with --delete to remove finished ones "
-              "and free the enqueued-token quota.")
+              "(--cancel to stop running ones).")
 
 
 if __name__ == "__main__":

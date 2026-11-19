@@ -1,38 +1,14 @@
 #!/bin/sh
-# Deploy-time bank provisioning, then start the server.
-#
-#   1. Read the library description on the volume (LIBRARY_DESC, default
-#      /data/library.json) — languages, word/phrase counts, folders.
-#   2. Verify the volume against it (described folders exist + counts match).
-#   3. If the volume isn't provisioned, unpack the library archive if present
-#      (LIBRARY_ARCHIVE, default /data/tts-bank.tar.gz), then re-verify.
-#   4. exec the server.
-#
-# So the deployment package is: this image + library.json + tts-bank.tar.gz, with
-# the latter two placed on the (persistent) volume for the first deploy. On later
-# restarts the volume is already provisioned, so nothing is unpacked.
-#
-# A container that ends up with NO usable bank AND no synthesis path can serve
-# nothing, so it refuses to start (exit 1) rather than come up "healthy" and
-# 404 every lookup. Exceptions, both valid bank-less deployments:
-# GEMINI_API_KEY/GOOGLE_API_KEY set, or SPEAK_UPSTREAM_URL set (edge mode) — /v1/speak then generates misses and builds the phrase bank on
-# the volume. /health applies the same
-# rule (200, not 503), so the entrypoint mirrors it instead of hard-blocking.
-#
-# Bank sync: two ways to pull the bank into the volume before/instead of the
-# packaged archive.
-#   - SYNC_BUCKET + SYNC_PREFIX: structured, injection-free. Runs a fixed,
-#     properly-quoted `aws s3` sync — safe even if the values come from
-#     untrusted input, since they're passed as argv, never interpolated into
-#     a shell string.
-#   - BANK_SYNC_CMD: escape hatch — runs `sh -c "$BANK_SYNC_CMD"`, i.e. an
-#     ARBITRARY shell command. This is intentionally flexible (e.g. rclone,
-#     gsutil, a multi-step pull) but it means whoever sets this env var
-#     controls what the container executes. Only set it from trusted
-#     configuration (not from anything request-derived or user-supplied) —
-#     same trust boundary as the container's own command line.
-# If both are set, the structured SYNC_BUCKET/SYNC_PREFIX path runs and
-# BANK_SYNC_CMD is skipped (logged either way).
+# Provision the bank volume, then exec the server. In order:
+#   1. pull the bank (SYNC_BUCKET/SYNC_PREFIX, or BANK_SYNC_CMD) — first, since
+#      it provisions the volume the next step checks;
+#   2. verify the volume against LIBRARY_DESC (library.json);
+#   3. if invalid, unpack LIBRARY_ARCHIVE (tts-bank.tar.gz) once and re-verify;
+#   4. with no usable bank and no synthesis (GEMINI_API_KEY/GOOGLE_API_KEY, or
+#      SPEAK_UPSTREAM_URL), refuse to start — /health applies the same rule.
+# A replaced wordbank.db is moved aside with its -wal/-shm, never overwritten.
+# BANK_SYNC_CMD runs via `sh -c`: set it from trusted configuration only (the
+# same trust as the container's command line).
 set -e
 
 BANK_DB="${BANK_DB:-/data/wordbank.db}"
@@ -41,15 +17,11 @@ LIBRARY_DESC="${LIBRARY_DESC:-$DATA_DIR/library.json}"
 LIBRARY_ARCHIVE="${LIBRARY_ARCHIVE:-$DATA_DIR/tts-bank.tar.gz}"
 UNPACK_FAILED="$DATA_DIR/.unpack-failed"   # cksum of an archive that failed verification once unpacked
 
-# Mirrors src/server.py's /health rule: any synthesis path can serve with no bank
-# (Gemini, or an upstream server in edge mode).
 can_synthesize() {
     [ -n "${GEMINI_API_KEY:-}${GOOGLE_API_KEY:-}${SPEAK_UPSTREAM_URL:-}" ]
 }
 
-# Move the live DB, -wal/-shm included, aside before it is replaced: it is never
-# overwritten, and a stale -wal is never replayed onto another file.
-move_db_aside() {
+move_db_aside() {      # $1: why (unpack | sync)
     [ -f "$BANK_DB" ] || return 0
     backup="$(mktemp "$BANK_DB.pre-$1-$(date +%Y%m%d-%H%M%S)-XXXXXX")"
     for ext in "" -wal -shm; do
@@ -75,10 +47,6 @@ serving_nothing_msg() {
 EOF
 }
 
-# Bank sync runs FIRST — it is a way of *provisioning* the volume, so it has to
-# happen before verification decides whether the volume is usable. (Running it
-# after the check would make a sync-provisioned deployment exit 1 on an empty
-# volume before the sync ever got a chance to populate it.)
 if [ -n "$SYNC_BUCKET" ] && [ -n "$SYNC_PREFIX" ]; then
     if command -v aws >/dev/null 2>&1; then
         echo "[entrypoint] syncing bank via structured params: s3://$SYNC_BUCKET/$SYNC_PREFIX -> $DATA_DIR"
@@ -93,8 +61,6 @@ if [ -n "$SYNC_BUCKET" ] && [ -n "$SYNC_PREFIX" ]; then
         exit 1
     fi
 elif [ -n "$BANK_SYNC_CMD" ]; then
-    # Escape hatch: arbitrary shell command. Trusted-configuration only — see
-    # header comment. Prefer SYNC_BUCKET/SYNC_PREFIX above when possible.
     echo "[entrypoint] syncing bank via BANK_SYNC_CMD (trusted-config shell command)"
     sh -c "$BANK_SYNC_CMD"
 fi
@@ -121,8 +87,6 @@ elif [ -f "$LIBRARY_ARCHIVE" ] && [ "$(cksum < "$LIBRARY_ARCHIVE")" != "$(cat "$
         exit 1
     fi
 elif [ ! -f "$LIBRARY_DESC" ] && [ -f "$BANK_DB" ] && can_synthesize; then
-    # Synthesis-only deployment on a later boot: the bank here was built at
-    # runtime by /v1/speak, so there is no description to verify it against.
     echo "[entrypoint] no library description at $LIBRARY_DESC — serving the bank built at runtime ($BANK_DB) + synthesis for misses"
 else
     if [ -f "$LIBRARY_ARCHIVE" ]; then

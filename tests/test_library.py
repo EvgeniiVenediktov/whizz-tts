@@ -22,9 +22,9 @@ def _seed_root(root, db=None, ogg_root=None):
     for r in wm.iter_rows():
         wm.set_status(r["id"], DONE,
                       file_path=f"en-us/gemini-Kore/0/{r['id']}_{r['word']}.wav", voice="Kore")
-    pm.add_words(["hello world"], "en-us", voice="en-gb")
+    pm.add_words(["hello world"], "en-us", voice="en-gb-tutor-11")
     pm.set_status(pm.iter_rows()[0]["id"], DONE,
-                  file_path="en-us/local-en-gb/0/1_hello.wav", voice="en-gb")
+                  file_path="en-us/gemini-en-gb-tutor-11/phrases/0/1_hello.wav", voice="en-gb-tutor-11")
     wm.close()
     pm.close()
 

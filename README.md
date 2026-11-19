@@ -79,7 +79,7 @@ the `UNIQUE` index; prefix autocomplete uses an index range scan.
 
 | Endpoint | Purpose |
 |----------|---------|
-| `GET /health` | status, bank path/word-count, Gemini/upstream/store flags |
+| `GET /health` | status, bank flag/word count, Gemini/upstream/store flags |
 | `GET /v1/languages` | `wordbank` + `phrasebank` (data-driven langs + counts) **and** `generate` (curated, listen-verified list) |
 | `GET /v1/search?prefix=he` | **merged** word+phrase autocomplete; each result carries a `type` flag (`word`\|`phrase`) and its `voice`, one per voice banked (`kind=word\|phrase`, `voice` restrict) |
 | `GET /v1/bank?prefix=he` | word-only autocomplete (index range scan; optional `voice`) |
@@ -98,13 +98,13 @@ with it unset the whole API is open (dev mode).
 case-insensitive and stored lowercase (`EN-US` = `en-us`). Anything else
 (`../x`, an absolute path, `en_us`, non-ASCII, an empty query value) is a
 **400** `invalid lang '…'`; on `POST` routes an empty form field means the
-default. In edge mode, `/v1/speak` answers **502** if the upstream's `X-Voice`
-isn't a single path segment.
+default. Any request body over 64 KiB is a **413**, before anything parses it.
+`5xx` details are short; the cause is in the server log.
 
 #### Read-only (bank + status)
 
 **`GET /health`** — no params. `{status, healthy, gemini, upstream, store, bank,
-bank_path, bank_words}`. `200` if the service can serve *something* (a bank, a
+bank_words}`. `200` if the service can serve *something* (a bank, a
 Gemini key, or an upstream), else `503`.
 
 **`GET /v1/languages`** — no params. `{wordbank, phrasebank, generate}`:
@@ -112,10 +112,10 @@ the first two are data-driven `{code, words}` counts from the bank; `generate`
 is the curated, listen-verified list generation supports.
 
 **`GET /v1/search`** — `prefix` (required) · `lang` (default `en-us`) ·
-`limit` (default 10, capped 50) · `kind` (`word`|`phrase`, optional filter) ·
-`voice` (optional: words and phrases in that voice).
-Merged prefix search; each result is `{text, type: word|phrase, voice}`, one
-per voice a text is banked in.
+`limit` (default 10, clamped to 1..50) · `kind` (`word`|`phrase`, optional
+filter) · `voice` (optional: words and phrases in that voice). Merged prefix
+search (case-insensitive; `%`/`_` match themselves); each result is
+`{text, type: word|phrase, voice}`, one per voice a text is banked in.
 
 **`GET /v1/bank`** — `prefix` · `lang` · `limit` (same defaults) · `voice`
 (optional). Word-only autocomplete → `{words: [...]}` (distinct words).
@@ -171,7 +171,7 @@ or a curated locale voice from `/v1/gemini/languages`, case-insensitive; default
 `GEMINI_TTS_VOICE` = Kore; also pins the bank lookup: words and phrases by the
 same label, where a classic label keeps its capitals (`Kore`)
 and a locale voice is its lowercase id (`en-gb-tutor-11`); any language may use
-any of them) · `instruct` (delivery direction). Bank hit (words table for single tokens, phrases otherwise) → stored
+any of them) · `instruct` (delivery direction, ≤ 500 chars). Bank hit (words table for single tokens, phrases otherwise) → stored
 OGG with `X-Source: bank`; miss → Gemini synth, persisted into the phrase bank,
 returned with `X-Source: gemini`. A request with `instruct` is a **one-off**:
 never looked up or saved (the bank has no key for it). How `instruct` reaches
@@ -180,20 +180,23 @@ speech-metadata **style**, with `text` sent verbatim (they read an inline prefix
 aloud); 3.1/2.5 get it as an inline prefix (`"<instruct>: <text>"`). Misses
 without `instruct` are generated with `GEMINI_TTS_STYLE` when set and saved with
 it (`model`/`style` columns); the one-off's `instruct` replaces it rather than
-adding to it. Errors: `400` empty/oversize text, unknown `voice`, or a locale
+adding to it. Phrase text matches case-insensitively (Unicode case folding). A clip whose
+save fails after it was generated is still served (the failure is logged).
+Errors: `400` empty/oversize text or `instruct`, unknown `voice`, or a locale
 `voice` when `GEMINI_TTS_MODEL` isn't a 3.8 model (misses and one-offs only: a
 banked clip in that voice still serves), `500` `GEMINI_TTS_STYLE` set with
 a model that takes no style (misses only; hits and `instruct` one-offs still
 work) or a default `GEMINI_TTS_VOICE` that is a locale voice on a non-3.8
-model, `502` Gemini failure (detail names the `finish_reason`, or the
-Interactions `status`, when it returned no audio), `503` encoding stack absent.
+model, `502` Gemini failure (`Gemini TTS failed`; when it returned no audio,
+the detail names the `finish_reason` or the Interactions `status`), `503`
+encoding stack absent.
 
 **`POST /v1/gemini/tts`** — studio preview. `text` (required, ≤ `MAX_TEXT_LEN`)
 · `voice` (as in `/v1/speak`, default `GEMINI_TTS_VOICE`; a locale voice with a
 non-3.8 `model` → `400`) · `instruct` (direction, routed per model
 as in `/v1/speak`) · `style` (speech-metadata style; 3.8 models only, else `400`;
-with `instruct` too, the style comes first) · `model` (default
-`GEMINI_TTS_MODEL`). Synthesizes one phrase with Gemini and returns **WAV**
+with `instruct` too, the style comes first; both ≤ 500 chars) · `model` (default
+`GEMINI_TTS_MODEL`; one of `gemini_tts.TTS_MODELS`, else `400`). Synthesizes one phrase with Gemini and returns **WAV**
 (never banked). `GEMINI_TTS_STYLE` does not apply. Needs `GEMINI_API_KEY`;
 `502` on upstream failure.
 
@@ -242,8 +245,9 @@ site backend --JWT(edge secret)--> edge (bank on /data) --miss, JWT(upstream sec
 - Concurrent misses for one clip are fetched once (single-flight, also on the
   upstream for Gemini calls).
 - Upstream `400` passes through; a rejected edge token, an upstream error, a
-  non-OGG reply, or an unreachable upstream is `502`; a timeout is `504`.
-  Nothing is saved on failure.
+  redirect (never followed: the token would go along), a non-OGG reply or one
+  over 5 MB, an `X-Voice` that isn't a known voice, or an unreachable upstream
+  is `502`; a timeout is `504`. Nothing is saved on failure.
 
 Set up (on the machine holding the upstream's `.env`):
 ```bash
@@ -273,12 +277,16 @@ bash scripts/pack.sh
 # → library.json     description: languages, word (clip) / phrase counts, per-voice word counts, folders
 # → tts-bank.tar.gz  library code + wordbank.db + served OGG (excludes WAV masters)
 ```
+The DB is snapshotted first (WAL included) and the description is of that snapshot.
 
 **Deploy = the Docker image + `library.json` + `tts-bank.tar.gz`.** Put the
 description and archive on the (persistent) volume; on first boot the container
 verifies the volume against `library.json` — described folders present, word/phrase
 counts and OGG count match — and unpacks the archive only if it isn't provisioned.
-Later restarts find the volume ready and skip the unpack.
+Later restarts find the volume ready and skip the unpack. A DB already on the volume
+is moved aside (with its `-wal`/`-shm`) before the archive's or a synced one
+replaces it, and an archive that fails verification once unpacked is not unpacked
+again (`/data/.unpack-failed`; delete it to retry).
 
 ```bash
 docker compose --profile bank up --build   # mounts library.json + tts-bank.tar.gz on /data
@@ -335,8 +343,8 @@ bearer-token auth for the synthesis routes — `POST /v1/speak` and
 `Authorization: Bearer <token>` check. Every `GET` endpoint and `/health` stay
 public either way. A
 missing/invalid/expired token gets a `401` with a `WWW-Authenticate: Bearer`
-header and a JSON `detail`. Optional `JWT_AUDIENCE` / `JWT_ISSUER` add `aud`/
-`iss` claim checks on top of the signature/expiry check.
+header and a JSON `detail`. A token must carry `exp`. Optional `JWT_AUDIENCE` /
+`JWT_ISSUER` add `aud`/`iss` claim checks on top of the signature/expiry check.
 
 Use a secret of at least 32 bytes — PyJWT warns on shorter HS256 keys (RFC
 7518). `scripts/make_jwt_secret.py` generates one (64 CSPRNG bytes) straight
@@ -397,9 +405,9 @@ GEMINI_API_KEY=… python -m wordbank --lang en-gb gemini-run --words words.txt 
 GEMINI_API_KEY=… python -m wordbank --lang en-gb batch-run --words words.txt \
     --model gemini-3.8-flash-lite-tts --voice en-gb-tutor-14 --style "plain and neutral"
 
-# Redo some words: move their current take to <db dir>/takes/<UTC>/{wav,ogg}/
-# (+ words.json), reset them to pending, generate again, re-encode
-# (--voice: only that voice's rows; default: every voice the word is banked in):
+# Redo some words: move their current take to a new <db dir>/takes/<UTC>-…/{wav,ogg}/
+# (+ words.json), reset them to pending, generate again, re-encode (encode_wavs.py
+# re-encodes an OGG older than its WAV; --voice: only that voice's rows):
 python -m wordbank --lang en-gb regenerate --words-file redo.txt --ogg-root output/words_ogg
 GEMINI_API_KEY=… python -m wordbank --lang en-gb gemini-run --model gemini-3.8-flash-tts \
     --voice Kore --style "plain and neutral"
@@ -441,17 +449,18 @@ times (default 2; 0 = only flag), with the same model, voice and style: the
 first passing take is kept; if every take is flagged the best one is kept
 (plausible length first, then the quietest end) and its reason stays in
 `review` for a listen. `gemini-run` re-takes inline (within `--rpm`); a batch
-re-queues the row (status `retake`, its best take held in `<db dir>/takes/qc/`,
-outside the bank tree) for the next submission with the same `--voice`,
+re-queues the row (status `retake`, its best take held in
+`<db dir>/takes/qc/<db name>/`, outside the bank tree) for the next submission with the same `--voice`,
 `--model` and `--style` — the next wave of `batch-run`, or the next
 `batch-submit`/`batch-run`. Re-takes don't count toward `--max-attempts`.
+`batch-collect` takes no `--voice`: each row's voice is recorded at submit.
 `wordbank qc` checks an existing bank (`--voice`, `--all-langs`, `--csv`) and
 with `--retry` re-takes flagged words synchronously (`--model`, `--style`,
 `--rpm`, `--qc-retries`; `--ogg-root` moves a replaced clip's OGG aside so it
 gets re-encoded). `--accept-file keep.txt` records words a person listened to and
 kept despite a flag (`qc_accepted`): their flag is cleared and later `qc` runs skip
-them, until a `regenerate` gives the word a new take. Phrases made by `/v1/speak`
-are not checked.
+them, until a `regenerate` gives the word a new take (a `retake` row can't be
+accepted). Phrases made by `/v1/speak` are not checked.
 
 ## Tests
 

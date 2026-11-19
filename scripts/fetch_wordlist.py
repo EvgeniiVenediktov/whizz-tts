@@ -11,9 +11,8 @@ Writes:
   data/words_<lang>.txt       one word per line, frequency-ranked (the input list)
   data/words_<lang>.meta.json provenance (source, count, filters, timestamp)
 
-The words file is the IMMUTABLE input. Processed-state is NOT tracked here — it
-lives in the SQLite manifest (wordbank.db) so resume/attempts/errors survive
-crashes and parallel workers. See the note in WORDBANK_PLAN.md.
+The words file is the immutable input; generation state lives in the manifest
+(wordbank.db).
 
 Usage:
   python scripts/fetch_wordlist.py --lang en --n 50000

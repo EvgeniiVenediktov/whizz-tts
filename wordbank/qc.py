@@ -1,17 +1,9 @@
-"""End-of-clip QC for single-word clips. Stdlib only (array/math/wave): the
-bank-only image has no numpy.
-
-A clip is flagged for review when
-  - its last END_WINDOW_S is louder than END_DB_MAX (RMS, dBFS): it ends on
-    sound instead of silence, usually a word cut off mid-sound;
-  - it is shorter than MIN_SECONDS or longer than MAX_SECONDS: implausible for
-    one word (a dropped word, or extra speech such as a direction read aloud).
-Same maths and reason texts as the throwaway data/bank-en-gb/flag.py it
-replaces, whose "review: ..." notes Manifest moves into `words.review`.
-
-~0.5% of gemini-3.8-flash-lite-tts clips were flagged, and a re-take usually
-fixed them: generation re-takes a flagged clip up to DEFAULT_RETRIES times
-(`--qc-retries`), and when every take is flagged keeps the best one (best_take).
+"""End-of-clip QC for single-word clips; stdlib only (the serving image has
+no numpy). A clip is flagged when its last END_WINDOW_S is louder than
+END_DB_MAX (RMS, dBFS: it ends on sound, usually cut off) or its length is
+outside MIN_SECONDS..MAX_SECONDS (a dropped word, or extra speech).
+Generation re-takes a flagged clip up to DEFAULT_RETRIES times and otherwise
+keeps the best take (best_take).
 """
 import array
 import math
@@ -61,12 +53,9 @@ class Check:
 
     @property
     def rank(self) -> Tuple[bool, float]:
-        """Sort key, lower is better. A passing take always ranks first (its
-        tail is at or under END_DB_MAX and its length plausible). Among flagged
-        ones, a plausible length beats any end level, since a take of the wrong
-        length usually holds the wrong content (extra speech, a direction read
-        aloud, or no word at all); then the quieter end, which is the take
-        closest to ending in silence, i.e. the least cut off."""
+        """Sort key, lower is better: a plausible length first (a wrong length
+        usually means the wrong content), then the quieter end (least cut off).
+        A passing take always ranks first."""
         return (not self.length_ok, self.end_db)
 
 
@@ -78,7 +67,7 @@ def _check(frames: int, tail: bytes, rate: int) -> Check:
     if not samples:
         samples = array.array("h", [0])
     rms = math.sqrt(sum(v * v for v in samples) / len(samples))
-    # floored at 1e-9 (-180 dB) for digital silence, as flag.py did
+    # floored at 1e-9 (-180 dB) for digital silence
     return Check(seconds=frames / rate, end_db=20 * math.log10(max(rms / 32768, 1e-9)))
 
 

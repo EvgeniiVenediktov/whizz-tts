@@ -1,13 +1,6 @@
-"""BankLookup must serve banks created before phrases grew voice/seed/ref_* columns.
-
-Manifest ALTER-migrates old DBs when it opens them, but the serving path is
-read-only and must not depend on that: a reader on an un-migrated bank used to
-raise sqlite3.OperationalError ("no such column: seed") from get_phrase — a 500
-on the real 2025 word bank that fresh-schema test fixtures could never catch.
-"""
+"""Banks written by older code: Manifest's one-time key migrations, and
+BankLookup reading legacy phrase labels ("gemini-Kore") as they are."""
 import sqlite3
-
-from fastapi.testclient import TestClient
 
 from wordbank.lookup import BankLookup
 from wordbank.manifest import Manifest
@@ -69,7 +62,7 @@ def test_manifest_migrates_old_phrase_key_so_a_second_voice_fits(tmp_path):
 
 def _phrase_bank(db, rows):
     """A current-schema bank holding `rows` (id, text, lang, voice, status,
-    file_path) as written by older code: Manifest relabels on its next open."""
+    file_path) as written by older code."""
     Manifest(db).close()
     conn = sqlite3.connect(db)
     conn.executemany("INSERT INTO phrases (id, text, lang, voice, status, file_path) "
@@ -98,9 +91,8 @@ def test_lookups_serve_the_oldest_clip_across_label_spellings(tmp_path):
 
 
 def test_lookups_read_an_unmigrated_phrase_label_as_the_plain_one(client):
-    """BankLookup never migrates (a freshly unpacked old archive may not have
-    met a Manifest yet): a "gemini-Kore" phrase is served, pinned and
-    reported as "Kore", the same as after the migration."""
+    """A "gemini-Kore" phrase (older code) is served, pinned and reported as
+    "Kore"; nothing rewrites it."""
     db = str(client.paths.db)
     _phrase_bank(db, [(1, "hello there", "en-us", "gemini-Kore", "done",
                        "en-us/gemini-Kore/phrases/0/1_hello-there.wav")])
@@ -118,7 +110,7 @@ def test_lookups_read_an_unmigrated_phrase_label_as_the_plain_one(client):
         assert info.status_code == 200 and info.json()["voice"] == "Kore", pin
     assert client.gemini.calls == []
     conn = sqlite3.connect(db)
-    assert conn.execute("SELECT voice FROM phrases").fetchall() == [("gemini-Kore",)]   # not migrated
+    assert conn.execute("SELECT voice FROM phrases").fetchall() == [("gemini-Kore",)]
     conn.close()
 
 

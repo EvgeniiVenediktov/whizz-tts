@@ -15,13 +15,15 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from .auth import require_auth
 from .upstream import UpstreamError, fetch_speech
 from wordbank.constants import BANK_OGG_APPLICATION, BANK_OGG_BITRATE
-from wordbank.gemini_tts import (DEFAULT_MODEL as GEMINI_TTS_DEFAULT_MODEL, TTS_MODELS,
+from wordbank.gemini_tts import (DEFAULT_MODEL as GEMINI_TTS_DEFAULT_MODEL, TTS_MODELS, VOICES,
                                  GeminiNoAudioError, GeminiStyleUnsupportedError,
                                  GeminiVoiceUnsupportedError, canonical_voice, check_voice,
-                                 is_classic_voice, style_models, supports_style, voice_label)
-from wordbank.languages import normalize_lang
+                                 is_classic_voice, locale_voice_models, pcm_to_wav_bytes,
+                                 style_models, supports_style, voice_label)
+from wordbank.languages import SUPPORTED_LANGUAGES, VOICE_LANGUAGES, normalize_lang
 from wordbank.lookup import BankLookup
-from wordbank.paths import voice_from_path
+from wordbank.manifest import DONE, Manifest
+from wordbank.paths import path_under, safe_filename, voice_from_path
 
 # NOTE: src.audio (ffmpeg) and google-genai are imported LAZILY inside the
 # handlers, so the serving image needs neither at import time.
@@ -44,9 +46,7 @@ def _truthy(val: Optional[str]) -> bool:
 
 
 def _gemini_configured() -> bool:
-    """google-genai authenticates from GEMINI_API_KEY (or GOOGLE_API_KEY). With
-    one set, /v1/speak can fill bank misses, so the service can serve even
-    without a bank. Read per call, like JWT_SECRET."""
+    """A key lets /v1/speak fill misses, so the service serves without a bank."""
     return bool(os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"))
 
 
@@ -57,11 +57,8 @@ def _upstream_url() -> Optional[str]:
 
 
 def _tts_style() -> Optional[str]:
-    """GEMINI_TTS_STYLE: a deployment-wide delivery direction for every clip
-    /v1/speak generates for the bank (misses, saved or with SPEAK_STORE=0
-    handed to edges), sent as the speech_metadata style. Not applied to
-    `instruct` one-offs or the studio. Needs a style-capable GEMINI_TTS_MODEL.
-    Read per call; unset by default."""
+    """GEMINI_TTS_STYLE: the style of every /v1/speak miss (not of `instruct`
+    one-offs or the studio); needs a style-capable GEMINI_TTS_MODEL."""
     return os.getenv("GEMINI_TTS_STYLE", "").strip() or None
 
 
@@ -221,27 +218,18 @@ class _BodyLimit:
 
 app.add_middleware(_BodyLimit)          # added first: CORS wraps it, so a 413 carries CORS headers
 
-# CORS_ORIGINS env var: comma-separated allowlist (e.g.
-# "https://app.example.com,https://admin.example.com"). Unset -> wildcard, so
-# local dev and the current deployment keep working unchanged. NOTE: CORS is a
-# browser-enforced control only — it stops a malicious *web page* from calling
-# this API cross-origin, but does nothing against curl/scripts/servers, which
-# ignore it entirely. It is not authentication and does not secure the API.
+# CORS is browser-enforced only: not authentication.
 app.add_middleware(
     CORSMiddleware, allow_origins=_cors_origins(),
     allow_methods=["GET", "POST", "OPTIONS"], allow_headers=["*"],
-    # /v1/speak metadata; browsers hide non-safelisted headers from
-    # cross-origin JS unless they're exposed.
-    expose_headers=["X-Source", "X-Voice"],
+    expose_headers=["X-Source", "X-Voice"],     # readable by cross-origin JS
 )
 
 
 @app.get("/health")
 def health():
     bank = app.state.bank
-    # Healthy iff the service can serve SOMETHING: the pre-generated bank or
-    # /v1/speak get-or-generate (Gemini, or an upstream server in edge mode). A
-    # deploy with no bank but a synth path is legitimate; only "none" is unhealthy.
+    # healthy iff something can serve: the bank, Gemini, or an upstream
     gemini = _gemini_configured()
     upstream = _upstream_url() is not None
     healthy = bank.available or gemini or upstream
@@ -274,13 +262,8 @@ def _file_info(path: Optional[str]) -> dict:
 
 @app.get("/v1/languages")
 def languages():
-    """Language lists:
-
-    - wordbank / phrasebank: data-driven — languages currently in each bank.
-    - generate: manually-curated, verified list of languages to generate
-      (wordbank/languages.py).
-    """
-    from wordbank.languages import SUPPORTED_LANGUAGES
+    """wordbank / phrasebank: the languages in each bank; generate: the
+    listen-verified list (wordbank/languages.py)."""
     return {"wordbank": app.state.bank.languages(),
             "phrasebank": app.state.bank.phrase_languages(),
             "generate": SUPPORTED_LANGUAGES}
@@ -379,9 +362,7 @@ def phrase_get(text: str, lang: str = DEFAULT_LANG, voice: Optional[str] = None,
 
 
 def _bank_voice_headers(source: str, voice: Optional[str]) -> dict:
-    """X-Source plus X-Voice (the voice label as /v1/search reports it). Labels
-    of older local-voice clips are user-chosen; a non-ASCII one is omitted, since headers
-    are latin-1 and a failed encode would 500 an otherwise good bank hit."""
+    """X-Source plus X-Voice; a non-ASCII label is left out (headers are latin-1)."""
     return {"X-Source": source, **({"X-Voice": voice} if voice and voice.isascii() else {})}
 
 
@@ -405,15 +386,12 @@ def _speak_bank_hit(text: str, lang: str, voice: Optional[str], eff_voice: str):
     return None
 
 
-# Single-flight for /v1/speak misses: (text, lang, voice) -> [lock, users].
-# Concurrent requests for the same new clip queue behind the first, then find it
-# banked, instead of each paying for its own generation. In-process, which is
-# enough: the bank is one SQLite file, so a deployment is one server process.
+# Single-flight for /v1/speak misses, (text, lang, voice) -> [lock, users]:
+# twins queue behind the first and find its clip banked. In-process is enough:
+# one SQLite bank, one server process.
 _miss_locks: dict = {}
 
-# With SPEAK_STORE=0 there is no saved clip for queued twins to find, so a
-# store-less miss is coalesced instead: (key) -> the in-flight generation task,
-# whose result every concurrent request for that clip shares.
+# SPEAK_STORE=0 saves nothing for twins to find: they share the in-flight task.
 _inflight: dict = {}
 
 
@@ -522,8 +500,6 @@ def _write(path: str, data: bytes) -> None:
 def _save_phrase(text: str, lang: str, clip: _Clip) -> None:
     """Save a /v1/speak clip to the phrase bank, under its voice's directory
     in a `phrases/` subtree (phrase and word ids are separate sequences)."""
-    from wordbank.manifest import DONE, Manifest
-    from wordbank.paths import path_under, safe_filename
     clip_dir = os.path.join(lang, f"gemini-{clip.voice}", "phrases")
     try:   # last line of defence, before the row exists
         for root in (app.state.ogg_root, app.state.wav_root):
@@ -541,7 +517,6 @@ def _save_phrase(text: str, lang: str, clip: _Clip) -> None:
                                f"{row['id']}_{safe_filename(text)}.wav")
             _write(_ogg_abs(rel), clip.ogg)
             if clip.pcm is not None and os.path.isdir(app.state.wav_root):   # dev-only WAV master
-                from wordbank.gemini_tts import pcm_to_wav_bytes
                 try:
                     _write(_wav_abs(rel), pcm_to_wav_bytes(clip.pcm))
                 except OSError:
@@ -632,7 +607,6 @@ async def gemini_tts(
         raise HTTPException(400, f"unknown model {model!r} (one of: {', '.join(TTS_MODELS)})")
     voice = _gemini_voice(voice) or GEMINI_TTS_VOICE
     _check_voice(voice, model)
-    from wordbank.gemini_tts import pcm_to_wav_bytes
     pcm = await _synthesize(text, voice, _direction(instruct, "instruct"), model,
                             _direction(style, "style") or None)
     return Response(content=pcm_to_wav_bytes(pcm), media_type="audio/wav")
@@ -640,25 +614,15 @@ async def gemini_tts(
 
 @app.get("/v1/gemini/voices")
 def gemini_voices():
-    """The 30 classic Gemini TTS voices (static list, name + style + gender),
-    which /v1/speak and /v1/gemini/tts accept on every model. They aren't
-    language-bound — Gemini auto-detects language. The curated per-language
-    voices are listed by /v1/gemini/languages."""
-    from wordbank.gemini_tts import VOICES
+    """The 30 classic voices {name, style, gender}: any model, any language."""
     return {"voices": [{"name": n, "style": s, "gender": g} for n, s, g in VOICES]}
 
 
 @app.get("/v1/gemini/languages")
 def gemini_languages():
-    """The curated Gemini voices per language (wordbank/gemini_voices.json):
-    each bank `lang` code with one female and one male voice and their voice
-    library metadata. A voice's `name` is what /v1/speak and /v1/gemini/tts
-    take as `voice`, and the label its words and phrases are banked under
-    (filed in `<lang>/gemini-<name>/`).
-    `classic` marks the language-agnostic classic voices (en-us uses two);
-    the others are locale voices, which need a 3.8 model (`locale_voice_models`)."""
-    from wordbank.gemini_tts import locale_voice_models
-    from wordbank.languages import VOICE_LANGUAGES
+    """The curated female + male voice per bank `lang` with their library
+    metadata; `name` is the `voice` to pass and the bank label. Non-`classic`
+    voices need one of `locale_voice_models`."""
     return {
         "languages": [{
             "code": lang["code"], "name": lang["name"],

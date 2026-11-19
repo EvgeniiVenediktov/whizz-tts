@@ -1,38 +1,16 @@
 """Gemini Batch API path for bulk word-bank generation (async, ~half cost).
 
-File-based JSONL with an explicit per-request KEY = manifest id, so every result
-maps **1:1** to its requested word regardless of response order or omissions —
-not positional. At receive time the returned PCM (24 kHz / 16-bit / mono; a WAV
-payload is first unwrapped to its data chunk by gemini_tts.pcm_from_payload) is
-written straight to **WAV** via the stdlib `wave` module: no ffmpeg, no trimming,
-no normalization. Any OGG/Opus encoding or trimming is a separate later pass over
-the WAVs on disk (see scripts/encode_wavs.py).
+JSONL keyed by manifest id, so each result maps 1:1 to its word whatever the
+order. The PCM (gemini_tts.pcm_from_payload) is written as a WAV master as is;
+OGG encoding is scripts/encode_wavs.py's separate pass. Directions are routed
+per model (gemini_tts.route_direction): an inline prefix on 3.1/2.5, the
+part's speechMetadata.style on 3.8 (documented, not yet tried live: run
+scripts/gemini_batch_smoke.py first).
 
-Text↔recording index: the manifest `word` column holds the exact requested text
-and `file_path` the WAV — `SELECT word, file_path FROM words WHERE status='done'`.
-
-google-genai is lazily imported; tests inject a fake batch client.
-
-⚠️ Confirm with scripts/gemini_batch_smoke.py + a real key before a bulk run:
-  - batch accepts the per-request TTS generationConfig on the model;
-  - result audio is base64 at candidates[0].content.parts[*].inlineData.data;
-  - the leading voice instruction steers delivery and is NOT spoken;
-  - with --style (3.8 models), the part's speechMetadata.style is honoured. The
-    docs say so (Batch API takes generateContent requests; 3.8 TTS supports
-    batch and "Attach speech_metadata … to each part"), but it was not tried live.
-
-Directions are routed per model by gemini_tts.route_direction: 3.1/2.5 get the
-instruction as an inline prefix; the 3.8 models read inline text aloud, so they
-get it (and/or --style) as the part's speechMetadata.style, the word verbatim.
-
-QC (wordbank/qc.py): every collected clip is checked. A flagged one can't be
-re-taken on the spot, so its row is re-queued (status RETAKE, best take so far
-at qc.retake_path, outside the bank tree) for the next submission by a batch
-with the same voice, model and direction — run_in_waves' next wave, or the next
-batch-submit / batch-run — up to `qc_retries` times. The first passing take is
-filed; if every take is flagged, the best one is filed with its flag. A re-take
-counts in qc_takes, not in the row's generation attempts, and one that fails to
-generate falls back to the take it was meant to replace.
+QC (wordbank/qc.py): a flagged clip can't be re-taken on the spot, so its row
+becomes RETAKE (best take at qc.retake_path) for the next submission with the
+same voice, model and direction, up to `qc_retries` times; then the best take
+is filed with its flag. Re-takes count in qc_takes, not in attempts.
 """
 import base64
 import json
@@ -48,21 +26,24 @@ from .gemini_tts import (GeminiAudioFormatError, check_voice, new_client,
 from .manifest import DONE, FAILED, RETAKE, SUBMITTED, Manifest
 from .paths import safe_filename
 
-# NOTE: not every TTS model supports batchGenerateContent. As of this writing
-# gemini-3.1-flash-tts-preview and gemini-2.5-pro-preview-tts do; the older
-# gemini-2.5-flash-preview-tts does NOT. Run scripts/list_models.py to recheck.
+# Not every TTS model takes batchGenerateContent (scripts/list_models.py).
 BATCH_DEFAULT_MODEL = "gemini-3.1-flash-tts-preview"
 
-# google.genai.types.JobState names a batch ends in: JOB_STATE_SUCCEEDED or
-# JOB_STATE_PARTIALLY_SUCCEEDED (results file; per-line errors are per row), or
-# JOB_STATE_FAILED / _CANCELLED / _EXPIRED (no results; jobs expire after 48h).
-# Matched by suffix, so the API's raw BATCH_STATE_* spellings work too.
+# Terminal JobState names, matched by suffix (raw BATCH_STATE_* too); only
+# (PARTIALLY_)SUCCEEDED jobs have results.
 _TERMINAL = ("SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED")
 
-# Style direction prepended to each word. The 3.1/2.5 TTS models treat a leading
-# "Say …:" clause as delivery instruction, not text to speak; the 3.8 models
-# read it aloud, so the CLI never defaults to it for them (see __main__).
+# The inline direction 3.1/2.5 get by default (3.8 would read it aloud).
 VOICE_INSTRUCTION = "Say the following single word clearly and naturally, in a neutral tone:"
+
+
+def job_state(job) -> str:
+    state = getattr(job, "state", "")
+    return getattr(state, "name", None) or str(state)
+
+
+def is_terminal(job) -> bool:
+    return job_state(job).endswith(_TERMINAL)
 
 
 # --- request / response helpers (pure, easily testable) --------------------
@@ -126,11 +107,9 @@ class GeminiBatch:
     def __init__(self, model: str = BATCH_DEFAULT_MODEL, voice: str = "Kore",
                  instruction: str = VOICE_INSTRUCTION, style: Optional[str] = None,
                  client=None):
-        """`instruction`/`style` are routed for `model` (route_direction):
-        afterwards `instruction` is what is prepended inline and `style` what
-        goes in speechMetadata — on a 3.8 model the instruction moves into the
-        style, so it is never spoken. A style for a model that takes none
-        raises GeminiStyleUnsupportedError here, before anything is submitted."""
+        """`instruction`/`style` are routed for `model` (route_direction), so a
+        3.8 model never gets an inline instruction; a style for a model that
+        takes none raises GeminiStyleUnsupportedError before any submission."""
         self.model = model
         self.voice = voice
         self.style, self.instruction = route_direction(model, instruction, style)
@@ -195,18 +174,13 @@ class GeminiBatch:
     def poll(self, job_name: str):
         return self._get_client().batches.get(name=job_name)
 
-    @staticmethod
-    def _state_name(job) -> str:
-        state = getattr(job, "state", "")
-        return getattr(state, "name", None) or str(state)
-
     def is_done(self, job) -> bool:
-        return self._state_name(job).endswith(_TERMINAL)
+        return is_terminal(job)
 
     def no_results_reason(self, job) -> Optional[str]:
         """Why a finished job has no results to collect (naming its state), or
         None when it has. Only (PARTIALLY_)SUCCEEDED jobs carry a results file."""
-        state = self._state_name(job)
+        state = job_state(job)
         if not state.endswith("SUCCEEDED"):
             msg = getattr(getattr(job, "error", None), "message", None)
             return f"batch job {state}" + (f": {msg}" if msg else "")

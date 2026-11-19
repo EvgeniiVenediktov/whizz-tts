@@ -112,12 +112,12 @@ def test_no_voice_prefers_the_default_voice_then_any_banked(client):
     r = _speak(client, text="hello there")
     assert r.content == kore and r.headers["x-voice"] == "Kore"
 
-    local = _bank_phrase(client.paths, "good morning", "local-en-gb")
+    charon = _bank_phrase(client.paths, "good morning", "Charon")
     r = _speak(client, text="good morning")
-    assert r.content == local and r.headers["x-voice"] == "local-en-gb"
+    assert r.content == charon and r.headers["x-voice"] == "Charon"
     assert client.gemini.calls == []
 
-    r = _speak(client, text="good morning", voice="Kore")       # pinned: local clip doesn't count
+    r = _speak(client, text="good morning", voice="Kore")       # pinned: Charon's doesn't count
     assert r.headers["x-source"] == "gemini" and r.headers["x-voice"] == "Kore"
 
 
