@@ -9,6 +9,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 
+AUDIO = {"Accept": "audio/ogg"}     # /v1/speak's audio mode (else it answers JSON)
+
+
 def pytest_addoption(parser):
     parser.addoption("--integration", action="store_true", default=False)
 

@@ -194,7 +194,7 @@
   const SPEAK = `${API_BASE}/v1/speak`;
 
   // ---- API token (JWT) ----
-  // Only the synthesis routes (/v1/speak, /v1/gemini/tts) need this — the server is env-gated (JWT_SECRET unset = open/dev).
+  // Only /v1/speak, /v1/clip and /v1/gemini/tts need this — the server is env-gated (JWT_SECRET unset = open/dev).
   // Stored in localStorage so it survives reloads; never sent to any other origin.
   const apiTokenEl = document.getElementById('api-token');
   apiTokenEl.value = localStorage.getItem('jwt_token') || '';
@@ -310,6 +310,16 @@
     } catch { /* ignore autocomplete errors */ }
   }
 
+  // A clip's audio: inline when it wasn't banked, else from its audio_url
+  // (/v1/clip needs the same token as /v1/speak).
+  async function clipBlob(clip) {
+    if (clip.audio)
+      return new Blob([Uint8Array.from(atob(clip.audio), c => c.charCodeAt(0))], { type: 'audio/ogg' });
+    const res = await fetch(API_BASE + clip.audio_url, { headers: authHeaders() });
+    if (!res.ok) throw new Error(await readError(res));
+    return res.blob();
+  }
+
   async function speakBank() {
     const text = bankWord.value.trim();
     if (!text) { bankWord.focus(); return; }
@@ -323,9 +333,8 @@
       if (voice) form.append('voice', voice);
       const res = await fetch(SPEAK, { method: 'POST', headers: authHeaders(), body: form });
       if (!res.ok) throw new Error(await readError(res));
-      const fromBank = res.headers.get('X-Source') === 'bank';
-      const gotVoice = res.headers.get('X-Voice');
-      const blob = await res.blob();
+      const clip = await res.json();          // {id, text, file, voice, source, audio_url[, audio]}
+      const blob = await clipBlob(clip);
 
       bankCompare.style.display = 'flex';
       wavRow.style.display = 'none';
@@ -336,8 +345,10 @@
       oggPlayer.src = URL.createObjectURL(blob);
       oggPlayer.play();
 
-      bankStatus.textContent = (fromBank ? 'speak: served from bank' : 'speak: generated + saved to bank')
-        + (gotVoice ? ` · voice: ${gotVoice}` : '');
+      const fromBank = clip.source === 'bank';
+      bankStatus.textContent = 'speak: ' + (fromBank ? 'served from bank'
+        : clip.audio_url ? 'generated + saved to bank' : 'generated (not saved)')
+        + (clip.voice ? ` · voice: ${clip.voice}` : '');
       if (!fromBank) await refreshSuggestions(text);   // now indexed — show it as banked
     } catch (e) {
       bankStatus.textContent = e.message;

@@ -49,8 +49,9 @@ g.synthesize_pcm = lambda text, voice="Kore", instruct="", model=None, **kw: b"\
 from fastapi.testclient import TestClient
 from src.server import app
 with TestClient(app) as c:
-    miss = c.post("/v1/speak", data={"text": "hello there", "voice": "Puck"})
-    hit = c.post("/v1/speak", data={"text": "hello there", "voice": "Puck"})
+    audio = {"Accept": "audio/ogg"}
+    miss = c.post("/v1/speak", headers=audio, data={"text": "hello there", "voice": "Puck"})
+    hit = c.post("/v1/speak", headers=audio, data={"text": "hello there", "voice": "Puck"})
 got = (miss.status_code, miss.headers.get("x-source"), miss.content[:4],
        hit.status_code, hit.headers.get("x-source"))
 print(got, miss.text[:300] if miss.status_code != 200 else "")

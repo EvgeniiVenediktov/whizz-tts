@@ -39,12 +39,13 @@ class UpstreamError(Exception):
 class UpstreamSpeech:
     ogg: bytes
     voice: Optional[str]    # upstream's X-Voice ("Puck"; from older code "gemini-Puck" for a phrase)
+    clip_id: Optional[str]  # upstream's X-Clip-Id (absent from older code, and for a word)
 
 
 def fetch_speech(base_url: str, token: Optional[str], text: str, lang: str,
                  voice: Optional[str] = None, instruct: str = "",
                  timeout: float = 60.0) -> UpstreamSpeech:
-    """POST text to `<base_url>/v1/speak` and return the OGG it answers with.
+    """POST text to `<base_url>/v1/speak` in audio mode and return the OGG.
 
     Upstream 400s are passed through (the request itself is bad); every other
     failure is the edge's upstream problem, not the caller's: 502 (504 on a
@@ -59,7 +60,7 @@ def fetch_speech(base_url: str, token: Optional[str], text: str, lang: str,
     req = urllib.request.Request(
         base_url.rstrip("/") + "/v1/speak",
         data=urllib.parse.urlencode(fields).encode(),
-        headers={"Authorization": f"Bearer {token}"} if token else {},
+        headers={"Accept": "audio/ogg", **({"Authorization": f"Bearer {token}"} if token else {})},
         method="POST",
     )
     try:
@@ -84,7 +85,7 @@ def fetch_speech(base_url: str, token: Optional[str], text: str, lang: str,
         raise UpstreamError(502, f"upstream reply exceeds {MAX_REPLY_BYTES} bytes")
     if body[:4] != b"OggS":
         raise UpstreamError(502, f"upstream returned {headers.get('Content-Type')!r}, not OGG audio")
-    return UpstreamSpeech(ogg=body, voice=headers.get("X-Voice"))
+    return UpstreamSpeech(ogg=body, voice=headers.get("X-Voice"), clip_id=headers.get("X-Clip-Id"))
 
 
 def _detail(raw: bytes) -> str:

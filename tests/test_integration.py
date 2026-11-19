@@ -15,6 +15,7 @@ import pytest
 import soundfile as sf
 from fastapi.testclient import TestClient
 
+from tests.conftest import AUDIO
 from wordbank.manifest import DONE, Manifest
 
 pytestmark = pytest.mark.integration
@@ -56,7 +57,7 @@ def live_client(bank_env, monkeypatch):
 
 
 def test_speak_miss_generates_with_real_gemini_then_serves_from_bank(live_client):
-    miss = live_client.post("/v1/speak", data={"text": TEXT, "voice": "Puck"})
+    miss = live_client.post("/v1/speak", headers=AUDIO, data={"text": TEXT, "voice": "Puck"})
     assert miss.status_code == 200, miss.text
     assert miss.headers["x-source"] == "gemini" and miss.headers["x-voice"] == "Puck"
     assert miss.content[:4] == b"OggS"
@@ -72,7 +73,7 @@ def test_speak_miss_generates_with_real_gemini_then_serves_from_bank(live_client
     assert 1.0 < seconds < 8.0, f"{seconds:.2f} s for a 9-word sentence"
     assert abs(audio).max() > 0.05, "clip is silent"
 
-    hit = live_client.post("/v1/speak", data={"text": TEXT, "voice": "Puck"})
+    hit = live_client.post("/v1/speak", headers=AUDIO, data={"text": TEXT, "voice": "Puck"})
     assert hit.headers["x-source"] == "bank" and hit.content == miss.content
     assert len(live_client.calls) == 1                     # the hit cost nothing
 

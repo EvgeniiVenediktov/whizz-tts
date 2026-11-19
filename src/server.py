@@ -1,14 +1,17 @@
 import asyncio
+import base64
 import logging
 import os
 import subprocess
 import time
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Annotated, Optional
+from urllib.parse import quote, urlencode
 
 import jwt
-from fastapi import Depends, FastAPI, Form, HTTPException
+from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 
@@ -32,6 +35,7 @@ MAX_TEXT_LEN = int(os.getenv("MAX_TEXT_LEN", "2000"))
 MAX_DIRECTION_LEN = 500           # instruct / style
 MAX_BODY_BYTES = 64 * 1024        # every POST is a small form
 MAX_RESULTS = 50                  # /v1/search, /v1/bank
+LONG_TEXT = 25                    # a longer phrase's file is named by its clip id
 FRONTEND_DIR = os.getenv("FRONTEND_DIR", "frontend")
 DEFAULT_LANG = os.getenv("DEFAULT_LANG", "en-us")
 GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", GEMINI_TTS_DEFAULT_MODEL)
@@ -222,7 +226,7 @@ app.add_middleware(_BodyLimit)          # added first: CORS wraps it, so a 413 c
 app.add_middleware(
     CORSMiddleware, allow_origins=_cors_origins(),
     allow_methods=["GET", "POST", "OPTIONS"], allow_headers=["*"],
-    expose_headers=["X-Source", "X-Voice"],     # readable by cross-origin JS
+    expose_headers=["X-Source", "X-Voice", "X-Clip-Id"],   # readable by cross-origin JS
 )
 
 
@@ -366,7 +370,21 @@ def _bank_voice_headers(source: str, voice: Optional[str]) -> dict:
     return {"X-Source": source, **({"X-Voice": voice} if voice and voice.isascii() else {})}
 
 
-def _speak_bank_hit(text: str, lang: str, voice: Optional[str], eff_voice: str):
+@dataclass
+class _Clip:
+    """What /v1/speak answers with: a banked clip (`path`) or a new one (`ogg`)."""
+    voice: Optional[str]
+    source: str                       # "bank" | "gemini" | "upstream"
+    ogg: Optional[bytes] = None
+    path: Optional[str] = None        # its OGG on disk, once banked
+    audio_url: Optional[str] = None   # once banked
+    clip_id: Optional[str] = None     # phrases only
+    pcm: Optional[bytes] = None       # Gemini only: the dev WAV master
+    model: Optional[str] = None
+    style: Optional[str] = None
+
+
+def _speak_bank_hit(text: str, lang: str, voice: Optional[str], eff_voice: str) -> Optional[_Clip]:
     """The banked recording /v1/speak should serve, or None. Single tokens may be
     in the word bank; anything may be in the phrase bank. Without a `voice`,
     the default voice (`eff_voice`) is preferred in both. A row whose OGG is
@@ -374,16 +392,45 @@ def _speak_bank_hit(text: str, lang: str, voice: Optional[str], eff_voice: str):
     it: one saved in other casing)."""
     if not any(c.isspace() for c in text):
         row = app.state.bank.get(text, lang, voice=voice, prefer=eff_voice)
-        if row is not None and os.path.exists(_ogg_abs(row["file_path"])):
+        if row is not None and os.path.exists(ogg := _ogg_abs(row["file_path"])):
             row_voice = row["voice"] or voice_from_path(row["file_path"] or "")
-            return _serve_audio(row["file_path"], "ogg",
-                                headers=_bank_voice_headers("bank", row_voice))
+            query = urlencode({"lang": lang, **({"voice": row_voice} if row_voice else {})})
+            return _Clip(row_voice, "bank", path=ogg,
+                         audio_url=f"/v1/bank/{quote(row['word'], safe='')}?{query}")
     for pinned in ([eff_voice] if voice else [eff_voice, None]):
         for row in app.state.bank.phrases(text, lang, voice=pinned):
-            if os.path.exists(_ogg_abs(row["file_path"])):
-                return _serve_audio(row["file_path"], "ogg",
-                                    headers=_bank_voice_headers("bank", row["voice"]))
+            if os.path.exists(ogg := _ogg_abs(row["file_path"])):
+                url = (f"/v1/clip/{row['clip_id']}" if row["clip_id"] else   # a bank no writer opened yet
+                       "/v1/phrase?" + urlencode({"text": row["text"], "lang": lang,
+                                                  "voice": row["voice"] or ""}))
+                return _Clip(row["voice"], "bank", path=ogg, audio_url=url, clip_id=row["clip_id"])
     return None
+
+
+def _wants_audio(request: Request) -> bool:
+    """Accept lists audio/ogg before application/json (q-values aren't read)."""
+    types = [t.split(";")[0].strip() for t in request.headers.get("accept", "").split(",")]
+    return "audio/ogg" in types and types.index("audio/ogg") < (
+        types.index("application/json") if "application/json" in types else len(types))
+
+
+def _respond(clip: _Clip, text: str, audio: bool) -> Response:
+    """Audio mode: the OGG with X-Source / X-Voice / X-Clip-Id. Else JSON; a
+    clip that wasn't banked carries its audio inline (base64)."""
+    if audio:
+        headers = _bank_voice_headers(clip.source, clip.voice)
+        if clip.clip_id:
+            headers["X-Clip-Id"] = clip.clip_id
+        if clip.path:
+            return FileResponse(clip.path, media_type="audio/ogg", headers=headers)
+        return Response(clip.ogg, media_type="audio/ogg", headers=headers)
+    banked = clip.audio_url is not None
+    body = {"id": clip.clip_id if banked else None, "text": text,
+            "file": os.path.basename(clip.path) if banked else None,
+            "voice": clip.voice, "source": clip.source, "audio_url": clip.audio_url}
+    if not banked:
+        body["audio"] = base64.b64encode(clip.ogg).decode()
+    return JSONResponse(body)
 
 
 # Single-flight for /v1/speak misses, (text, lang, voice) -> [lock, users]:
@@ -458,22 +505,12 @@ async def _encode_ogg(pcm: bytes) -> bytes:
         raise HTTPException(500, "OGG encoding failed") from exc
 
 
-@dataclass
-class _Clip:
-    ogg: bytes
-    voice: str
-    source: str                       # "gemini" | "upstream"
-    pcm: Optional[bytes] = None       # Gemini only: the dev WAV master
-    model: Optional[str] = None
-    style: Optional[str] = None
-
-
 async def _upstream_clip(url: str, text: str, lang: str, voice: Optional[str],
                          instruct: str, fallback_voice: str) -> _Clip:
-    """A miss fetched from the upstream server, filed under the voice it
-    reports, which must be a known voice: it names the saved clip's directory
-    and is later shown by the frontend (an older upstream's "gemini-Kore" is
-    "Kore")."""
+    """A miss fetched from the upstream server in audio mode, filed under the
+    voice it reports, which must be a known voice: it names the saved clip's
+    directory and is shown by the frontend (an older upstream's "gemini-Kore"
+    is "Kore"); and under its clip id, when it sends one."""
     token = os.getenv("SPEAK_UPSTREAM_TOKEN")
     try:
         speech = await _in_executor(lambda: fetch_speech(
@@ -482,13 +519,16 @@ async def _upstream_clip(url: str, text: str, lang: str, voice: Optional[str],
         if exc.status >= 500:
             log.warning("upstream /v1/speak: %s (%r)", exc.detail, exc.__cause__)
         raise HTTPException(exc.status, exc.detail) from exc
-    if not speech.voice:
-        return _Clip(speech.ogg, fallback_voice, "upstream")
-    label = canonical_voice(speech.voice.strip().removeprefix("gemini-"))
+    label = canonical_voice(speech.voice.strip().removeprefix("gemini-")) \
+        if speech.voice else fallback_voice
     if label is None:
         log.warning("upstream X-Voice %r is not a known voice", speech.voice)
         raise HTTPException(502, "upstream reported an unknown voice")
-    return _Clip(speech.ogg, label, "upstream")
+    clip_id = _uuid(speech.clip_id) if speech.clip_id else ""      # "": none sent
+    if clip_id is None:
+        log.warning("upstream X-Clip-Id %r is not a UUID", speech.clip_id)
+        raise HTTPException(502, "upstream reported an invalid clip id")
+    return _Clip(label, "upstream", ogg=speech.ogg, clip_id=clip_id or None)
 
 
 def _write(path: str, data: bytes) -> None:
@@ -497,9 +537,20 @@ def _write(path: str, data: bytes) -> None:
         f.write(data)
 
 
+def _uuid(value: str) -> Optional[str]:
+    """`value` as a canonical UUID string, or None."""
+    try:
+        return str(uuid.UUID(value))
+    except ValueError:
+        return None
+
+
 def _save_phrase(text: str, lang: str, clip: _Clip) -> None:
-    """Save a /v1/speak clip to the phrase bank, under its voice's directory
-    in a `phrases/` subtree (phrase and word ids are separate sequences)."""
+    """Save a /v1/speak clip to the phrase bank under its voice's directory,
+    in a `phrases/` subtree (phrase and word ids are separate sequences), as
+    `<id // 1000>/<row id>_<slug>`, or `<clip_id[:2]>/<clip_id>` for a text
+    over LONG_TEXT characters (a slug can't outgrow a file name). Sets the
+    clip's path, clip_id and audio_url once it is banked."""
     clip_dir = os.path.join(lang, f"gemini-{clip.voice}", "phrases")
     try:   # last line of defence, before the row exists
         for root in (app.state.ogg_root, app.state.wav_root):
@@ -512,9 +563,11 @@ def _save_phrase(text: str, lang: str, clip: _Clip) -> None:
     try:
         m.add_words([text], lang, voice=clip.voice)
         row = m.get_entry(text, lang, clip.voice)
+        clip_id = clip.clip_id or str(uuid.uuid4())
         try:
-            rel = os.path.join(clip_dir, str(row["id"] // 1000),
-                               f"{row['id']}_{safe_filename(text)}.wav")
+            rel = os.path.join(clip_dir, *(
+                (clip_id[:2], f"{clip_id}.wav") if len(text) > LONG_TEXT
+                else (str(row["id"] // 1000), f"{row['id']}_{safe_filename(text)}.wav")))
             _write(_ogg_abs(rel), clip.ogg)
             if clip.pcm is not None and os.path.isdir(app.state.wav_root):   # dev-only WAV master
                 try:
@@ -522,7 +575,7 @@ def _save_phrase(text: str, lang: str, clip: _Clip) -> None:
                 except OSError:
                     pass
             m.set_status(row["id"], DONE, file_path=rel, voice=clip.voice, model=clip.model,
-                         style=clip.style,
+                         style=clip.style, clip_id=clip_id,
                          billed_chars=len(text) if clip.source == "gemini" else None)
         except Exception:
             m.discard_unfinished(row["id"])     # no pending row left behind
@@ -530,15 +583,12 @@ def _save_phrase(text: str, lang: str, clip: _Clip) -> None:
     finally:
         m.close()
     app.state.bank.close()   # drop the memoized read conn so the new row is visible
-
-
-def _clip_response(clip: _Clip) -> Response:
-    return Response(content=clip.ogg, media_type="audio/ogg",
-                    headers=_bank_voice_headers(clip.source, clip.voice))
+    clip.path, clip.clip_id, clip.audio_url = _ogg_abs(rel), clip_id, f"/v1/clip/{clip_id}"
 
 
 @app.post("/v1/speak", dependencies=[Depends(require_auth)])
 async def speak(
+    request: Request,
     text: str = Form(...),
     lang: Annotated[str, Form()] = DEFAULT_LANG,
     voice: Annotated[Optional[str], Form()] = None,
@@ -548,9 +598,10 @@ async def speak(
     generate it (Gemini, or the upstream in edge mode), save it to the phrase
     bank (not with SPEAK_STORE=0) and serve it. `voice` pins the recording;
     omitted, any banked voice serves and a miss uses GEMINI_TTS_VOICE.
-    `instruct` makes a one-off: no lookup, no save. Headers: X-Source
-    (bank|gemini|upstream), X-Voice. See README for the full contract."""
-    text = text.strip()
+    `instruct` makes a one-off: no lookup, no save. Answers JSON {id, text,
+    file, voice, source, audio_url}, or the OGG when Accept prefers audio/ogg.
+    See README for the full contract."""
+    raw, text = text, text.strip()
     if not text:
         raise HTTPException(400, "text must not be empty")
     if len(text) > MAX_TEXT_LEN:
@@ -560,6 +611,7 @@ async def speak(
     instruct = _direction(instruct, "instruct")
     eff_voice = voice or _default_voice()
     upstream = _upstream_url()
+    audio = _wants_audio(request)
 
     async def generate() -> _Clip:
         if upstream:
@@ -568,24 +620,38 @@ async def speak(
         style = None if instruct else _tts_style()   # a one-off's instruct replaces it
         pcm = await _synthesize(text, eff_voice, instruct, GEMINI_TTS_MODEL, style,
                                 server_style=True)
-        return _Clip(await _encode_ogg(pcm), eff_voice, "gemini", pcm, GEMINI_TTS_MODEL, style)
+        return _Clip(eff_voice, "gemini", ogg=await _encode_ogg(pcm), pcm=pcm,
+                     model=GEMINI_TTS_MODEL, style=style,
+                     clip_id=None if instruct else str(uuid.uuid4()))   # also when not stored
 
     if instruct:
-        return _clip_response(await generate())
+        return _respond(await generate(), raw, audio)
     if (hit := _speak_bank_hit(text, lang, voice, eff_voice)) is not None:
-        return hit
+        return _respond(hit, raw, audio)
     key = (text.casefold(), lang, eff_voice)
     if not _speak_store():
-        return _clip_response(await _coalesced(key, generate))
+        return _respond(await _coalesced(key, generate), raw, audio)
     async with _single_flight(key):
         if (hit := _speak_bank_hit(text, lang, voice, eff_voice)) is not None:
-            return hit                  # a queued twin saved it
+            return _respond(hit, raw, audio)        # a queued twin saved it
         clip = await generate()
         try:
             await _in_executor(_save_phrase, text, lang, clip)
         except Exception:                       # the clip is paid for: serve it anyway
             log.exception("could not save the /v1/speak clip for %r", text[:80])
-    return _clip_response(clip)
+    return _respond(clip, raw, audio)
+
+
+@app.get("/v1/clip/{clip_id}", dependencies=[Depends(require_auth)])
+def clip_get(clip_id: str):
+    """A banked /v1/speak phrase's OGG by its id (JWT, like /v1/speak)."""
+    if (canon := _uuid(clip_id)) is None:
+        raise HTTPException(400, "invalid clip id")
+    row = app.state.bank.clip(canon)
+    if row is None:
+        raise HTTPException(404, "no such clip")
+    return _serve_audio(row["file_path"], "ogg", headers={
+        **_bank_voice_headers("bank", row["voice"]), "X-Clip-Id": canon})
 
 
 # --- Voice studio: preview Gemini prebuilt voices ---

@@ -56,6 +56,7 @@ Both share the same columns:
 | `voice` | the voice label the clip was generated with (`Kore`, `en-gb-tutor-11`; the same for words and phrases; surfaced in lookups) |
 | `status` | `pending → submitted → done` (or `failed`; `retake`: a batch take QC flagged, queued for a re-take, not served) |
 | `file_path` | **relative to the bank root**, e.g. `en/gemini-Kore/1/1914_hello.wav` |
+| `clip_id` | phrases only: a UUID, the id `/v1/speak` returns and `/v1/clip/{id}` serves; also the file name of a text over 25 characters (`…/phrases/<id[:2]>/<id>.wav`). Given to existing phrases the first time the `wordbank` tools or a `/v1/speak` save open the bank |
 | `model`, `style` | **provenance for Gemini clips** — the model and the delivery direction used (`style`: the speech-metadata style on 3.8 models, the inline prefix such as `VOICE_INSTRUCTION` on 3.1/2.5; NULL = none). NULL on rows generated before these columns existed. Shown by `wordbank export` |
 | `review` | why QC (`wordbank/qc.py`) flagged the clip, e.g. `ends on sound (-31 dB)`, `too long (3.40 s)`; NULL = passed or never checked |
 | `qc_seconds`, `qc_end_db`, `qc_takes` | QC measurements of the current clip (length, last-100 ms level in dBFS; NULL = never checked) and the re-takes it took |
@@ -85,14 +86,16 @@ the `UNIQUE` index; prefix autocomplete uses an index range scan.
 | `GET /v1/bank?prefix=he` | word-only autocomplete (index range scan; optional `voice`) |
 | `GET /v1/bank/{word}` · `/info` | serve a word (OGG default; `wav` dev-only; optional `voice`) · sizes+type+voice |
 | `GET /v1/phrase?text=…` · `/info` | serve a phrase (by text, optional `voice`) · sizes+type+voice |
-| `POST /v1/speak` | get-or-generate — `text` (required), `lang` (default `en-us`), `voice` (optional: a classic Gemini voice or a curated locale voice, case-insensitive; unknown → `400`), `instruct` (optional, one-off: not looked up or saved). Bank hit in that voice → stored OGG, `X-Source: bank`. Miss → Gemini synth in that voice, saved into the phrase bank under the voice's label, as words are (`Kore`, `en-gb-tutor-11`; filed in `<lang>/gemini-<label>/phrases/`), served with `X-Source: gemini`; `X-Voice` names the voice served (that label, for a word or a phrase). Needs `GEMINI_API_KEY` only on a miss |
+| `POST /v1/speak` | get-or-generate — `text` (required), `lang` (default `en-us`), `voice` (optional: a classic Gemini voice or a curated locale voice, case-insensitive; unknown → `400`), `instruct` (optional, one-off: not looked up or saved). Bank hit in that voice, else a Gemini synth saved into the phrase bank under the voice's label (`Kore`, `en-gb-tutor-11`; filed in `<lang>/gemini-<label>/phrases/`). Answers JSON `{id, text, file, voice, source, audio_url}`, or the OGG when `Accept` prefers `audio/ogg`. Needs `GEMINI_API_KEY` only on a miss |
+| `GET /v1/clip/{id}` | a banked phrase's OGG by the `id` `/v1/speak` returned (JWT) |
 | voice studio | `GET /v1/gemini/voices` (the 30 classic voices), `GET /v1/gemini/languages` (the curated female + male voice per language), `POST /v1/gemini/tts` (preview a voice, nothing saved) |
 
 ### Endpoint reference
 
-Read-only endpoints are public. The `POST` routes marked **JWT** require
-`Authorization: Bearer <token>` when `JWT_SECRET` is set (see [Auth](#auth));
-with it unset the whole API is open (dev mode).
+Read-only endpoints are public. The routes marked **JWT** (`POST /v1/speak`,
+`GET /v1/clip/{id}`, `POST /v1/gemini/tts`) require `Authorization: Bearer
+<token>` when `JWT_SECRET` is set (see [Auth](#auth)); with it unset the whole
+API is open (dev mode).
 
 `lang` (every endpoint that takes it) is a language code, default `en-us`,
 case-insensitive and stored lowercase (`EN-US` = `en-us`). Anything else
@@ -171,9 +174,21 @@ or a curated locale voice from `/v1/gemini/languages`, case-insensitive; default
 `GEMINI_TTS_VOICE` = Kore; also pins the bank lookup: words and phrases by the
 same label, where a classic label keeps its capitals (`Kore`)
 and a locale voice is its lowercase id (`en-gb-tutor-11`); any language may use
-any of them) · `instruct` (delivery direction, ≤ 500 chars). Bank hit (words table for single tokens, phrases otherwise) → stored
-OGG with `X-Source: bank`; miss → Gemini synth, persisted into the phrase bank,
-returned with `X-Source: gemini`. A request with `instruct` is a **one-off**:
+any of them) · `instruct` (delivery direction, ≤ 500 chars). Bank hit (words
+table for single tokens, phrases otherwise), else a Gemini synth persisted into
+the phrase bank. The answer is JSON:
+```json
+{"id": "<uuid>", "text": "<text as sent>", "file": "<uuid>.ogg", "voice": "Puck",
+ "source": "bank|gemini|upstream", "audio_url": "/v1/clip/<uuid>"}
+```
+`file` is the clip's file name: `<uuid>.ogg` for a text over 25 characters,
+else `<row id>_<slug>.ogg`. A hit from the **word** table has `id: null` and
+`audio_url` the word route (`/v1/bank/<word>?lang=…&voice=…`). A clip that isn't
+banked (`instruct`, `SPEAK_STORE=0`) has `id`, `file` and `audio_url` null and
+its OGG inline as `"audio": "<base64>"`. **Audio mode**: when `Accept` lists
+`audio/ogg` before `application/json`, the answer is the OGG itself with
+`X-Source`, `X-Voice` (the voice label served) and `X-Clip-Id` (when banked, or
+generated by a stateless upstream). A request with `instruct` is a **one-off**:
 never looked up or saved (the bank has no key for it). How `instruct` reaches
 Gemini depends on `GEMINI_TTS_MODEL`: the 3.8 models get it as the
 speech-metadata **style**, with `text` sent verbatim (they read an inline prefix
@@ -190,6 +205,9 @@ work) or a default `GEMINI_TTS_VOICE` that is a locale voice on a non-3.8
 model, `502` Gemini failure (`Gemini TTS failed`; when it returned no audio,
 the detail names the `finish_reason` or the Interactions `status`), `503`
 encoding stack absent.
+
+**`GET /v1/clip/{id}`** (JWT) — a banked phrase's OGG by its `id`; `400` for an
+id that isn't a UUID, `404` for an unknown one or a missing file.
 
 **`POST /v1/gemini/tts`** — studio preview. `text` (required, ≤ `MAX_TEXT_LEN`)
 · `voice` (as in `/v1/speak`, default `GEMINI_TTS_VOICE`; a locale voice with a
@@ -233,10 +251,12 @@ no Gemini key, only a token for the upstream.
 site backend --JWT(edge secret)--> edge (bank on /data) --miss, JWT(upstream secret)--> upstream (Gemini)
 ```
 
-- Same request/voice semantics as the upstream; `X-Source: upstream` marks a
-  clip just fetched. The voice is forwarded as requested, and the clip is filed
-  under the voice upstream reports (`X-Voice`), as its label: an upstream on
-  older code reports a phrase as `gemini-Kore`, filed here as `Kore`.
+- Same request/voice semantics as the upstream; `source: upstream` marks a
+  clip just fetched. The edge asks its upstream in audio mode, forwarding the
+  voice as requested, and files the clip under the voice upstream reports
+  (`X-Voice`; an older upstream's `gemini-Kore` is filed as `Kore`) and the
+  upstream's `X-Clip-Id` (one is minted when absent). Its JSON points at the
+  edge's own `/v1/clip/{id}`, so a clip is found on the edge by text and by id.
 - `instruct` requests are forwarded and never saved.
 - **Stateless upstream:** run the upstream with `SPEAK_STORE=0` and it never
   writes the bank — misses are generated with Gemini and returned only, so the
@@ -338,10 +358,10 @@ SERVE_FRONTEND=1 .venv/bin/uvicorn src.server:app --port 8000
 ## Auth
 
 The API is **open by default** (dev mode). Setting `JWT_SECRET` turns on
-bearer-token auth for the synthesis routes — `POST /v1/speak` and
-`POST /v1/gemini/tts` — via an HS256
-`Authorization: Bearer <token>` check. Every `GET` endpoint and `/health` stay
-public either way. A
+bearer-token auth for `POST /v1/speak`, `GET /v1/clip/{id}` and
+`POST /v1/gemini/tts` via an HS256
+`Authorization: Bearer <token>` check. Every other `GET` endpoint and `/health`
+stay public either way. A
 missing/invalid/expired token gets a `401` with a `WWW-Authenticate: Bearer`
 header and a JSON `detail`. A token must carry `exp`. Optional `JWT_AUDIENCE` /
 `JWT_ISSUER` add `aud`/`iss` claim checks on top of the signature/expiry check.
@@ -359,10 +379,10 @@ set -a; . ./.env; set +a
 python scripts/make_token.py --sub dev --ttl 3600
 ```
 
-`POST /v1/speak` is get-or-generate: a bank hit serves the stored OGG
-(`X-Source: bank`); a miss synthesizes via Gemini, saves it into the phrase
+`POST /v1/speak` is get-or-generate: a bank hit serves the stored clip
+(`source: bank`); a miss synthesizes via Gemini, saves it into the phrase
 bank (so the same text is a bank hit next time), and serves that
-(`X-Source: gemini`) — it needs `GEMINI_API_KEY` only when it actually has to
+(`source: gemini`) — it needs `GEMINI_API_KEY` only when it actually has to
 generate. `voice` pins the recording: `voice=Puck` only ever serves or generates
 Puck (a banked Kore word is not a hit). Without `voice`, any banked recording
 serves (the default `GEMINI_TTS_VOICE` first) and a miss uses the default.
@@ -371,7 +391,8 @@ since the bank has no key for style; on the 3.8 models it is sent as the
 speech-metadata style, so it is never spoken.
 
 ```bash
-curl -H "Authorization: Bearer $TOKEN" -F text="good morning" -F voice=Puck http://localhost:8000/v1/speak -o out.ogg
+curl -H "Authorization: Bearer $TOKEN" -F text="good morning" -F voice=Puck http://localhost:8000/v1/speak   # JSON
+curl -H "Authorization: Bearer $TOKEN" -H "Accept: audio/ogg" -F text="good morning" http://localhost:8000/v1/speak -o out.ogg
 ```
 
 **Health and startup.** `/health` returns **503** when the service can serve
@@ -475,4 +496,4 @@ pytest --integration tests/test_integration.py      # live Gemini (paid; one syn
 ## TODO
 
 - [ ] **Add multi-language support** — serving + `/v1/languages` are already data-driven (language-scoped lookup + `(lang, word)` index), so it's a word list + a Gemini batch run + a verified listen per language.
-- [x] **Add JWT auth** — bearer tokens (HS256, `JWT_SECRET`) protect `/v1/speak` and `/v1/gemini/tts`; read-only bank endpoints stay public. See [Auth](#auth) above.
+- [x] **Add JWT auth** — bearer tokens (HS256, `JWT_SECRET`) protect `/v1/speak`, `/v1/clip` and `/v1/gemini/tts`; read-only bank endpoints stay public. See [Auth](#auth) above.

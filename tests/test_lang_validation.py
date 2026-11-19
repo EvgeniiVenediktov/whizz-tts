@@ -12,6 +12,7 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+from tests.conftest import AUDIO
 from tests.test_edge import FakeUpstream
 from wordbank.languages import is_lang_code, normalize_lang
 from wordbank.manifest import Manifest
@@ -86,7 +87,7 @@ def edge(bank_env, fake_gemini, _upstream, monkeypatch):
 def test_speak_rejects_bad_lang_before_generating(client, tmp_path):
     for lang in ESCAPES:
         with _nothing_written(tmp_path, client.paths.db):
-            r = client.post("/v1/speak", data={"text": "hello there", "lang": _bad(lang, tmp_path)})
+            r = client.post("/v1/speak", headers=AUDIO, data={"text": "hello there", "lang": _bad(lang, tmp_path)})
         assert r.status_code == 400 and "invalid lang" in r.json()["detail"], lang
     assert client.gemini.calls == []
 
@@ -95,16 +96,16 @@ def test_speak_one_off_paths_reject_bad_lang_too(client, tmp_path, monkeypatch):
     """instruct and SPEAK_STORE=0 skip the bank but still call Gemini."""
     bad = {"text": "hello there", "lang": _bad(ESCAPES[0], tmp_path)}
     with _nothing_written(tmp_path, client.paths.db):
-        assert client.post("/v1/speak", data={**bad, "instruct": "whisper"}).status_code == 400
+        assert client.post("/v1/speak", headers=AUDIO, data={**bad, "instruct": "whisper"}).status_code == 400
         monkeypatch.setenv("SPEAK_STORE", "0")
-        assert client.post("/v1/speak", data=bad).status_code == 400
+        assert client.post("/v1/speak", headers=AUDIO, data=bad).status_code == 400
     assert client.gemini.calls == []
 
 
 def test_edge_speak_rejects_bad_lang_before_fetching_upstream(edge, tmp_path):
     for lang in ESCAPES:
         with _nothing_written(tmp_path, edge.paths.db):
-            r = edge.post("/v1/speak", data={"text": "hello there", "lang": _bad(lang, tmp_path)})
+            r = edge.post("/v1/speak", headers=AUDIO, data={"text": "hello there", "lang": _bad(lang, tmp_path)})
         assert r.status_code == 400 and "invalid lang" in r.json()["detail"], lang
     assert edge.upstream.requests == [] and edge.gemini.calls == []
 
@@ -115,8 +116,16 @@ def test_edge_refuses_an_upstream_voice_that_is_not_a_known_voice(edge, tmp_path
     for label in ("../../escaped", "a/b", "..", "<img src=x onerror=alert(1)>", "k" * 300):
         edge.upstream.respond = lambda f, label=label: (200, {"X-Source": "gemini", "X-Voice": label}, b"OggS-x")
         with _nothing_written(tmp_path, edge.paths.db):
-            r = edge.post("/v1/speak", data={"text": "hello there"})
+            r = edge.post("/v1/speak", headers=AUDIO, data={"text": "hello there"})
         assert r.status_code == 502 and r.json()["detail"] == "upstream reported an unknown voice", label
+
+
+def test_edge_refuses_an_upstream_clip_id_that_is_not_a_uuid(edge, tmp_path):
+    """It names the saved file of a long text."""
+    edge.upstream.respond = lambda f: (200, {"X-Voice": "Kore", "X-Clip-Id": "../../escaped"}, b"OggS")
+    with _nothing_written(tmp_path, edge.paths.db):
+        r = edge.post("/v1/speak", data={"text": "a text long enough to be filed by its clip id"})
+    assert r.status_code == 502 and r.json()["detail"] == "upstream reported an invalid clip id"
 
 
 def test_read_routes_reject_bad_lang(client):
@@ -133,7 +142,7 @@ def test_read_routes_reject_bad_lang(client):
 
 def test_valid_lang_speak_saves_under_it_and_then_serves_from_bank(client):
     lang = "en-gb"
-    r = client.post("/v1/speak", data={"text": "hello there", "lang": lang})
+    r = client.post("/v1/speak", headers=AUDIO, data={"text": "hello there", "lang": lang})
     assert r.status_code == 200 and r.headers["x-source"] == "gemini"
     m = Manifest(str(client.paths.db), table="phrases", text_col="text")
     [row] = [dict(x) for x in m.iter_rows()]
@@ -141,17 +150,17 @@ def test_valid_lang_speak_saves_under_it_and_then_serves_from_bank(client):
     assert row["lang"] == lang and row["file_path"].startswith(f"{lang}/gemini-Kore/phrases/")
     assert (client.paths.ogg / (row["file_path"][:-4] + ".ogg")).read_bytes() == r.content
 
-    again = client.post("/v1/speak", data={"text": "hello there", "lang": lang})
+    again = client.post("/v1/speak", headers=AUDIO, data={"text": "hello there", "lang": lang})
     assert again.headers["x-source"] == "bank" and again.content == r.content
     assert len(client.gemini.calls) == 1
 
 
 def test_lang_is_case_and_space_insensitive_and_filed_lowercase(client):
     """Normalized, not rejected: "EN-US" finds the existing "en-us" rows."""
-    first = client.post("/v1/speak", data={"text": "hello there", "lang": "EN-US"})
+    first = client.post("/v1/speak", headers=AUDIO, data={"text": "hello there", "lang": "EN-US"})
     assert first.status_code == 200
     for lang in ("en-us", " En-Us "):
-        r = client.post("/v1/speak", data={"text": "hello there", "lang": lang})
+        r = client.post("/v1/speak", headers=AUDIO, data={"text": "hello there", "lang": lang})
         assert r.headers["x-source"] == "bank" and r.content == first.content
     assert client.get("/v1/phrase", params={"text": "hello there", "lang": "EN-us"}).content == first.content
     m = Manifest(str(client.paths.db), table="phrases", text_col="text")
@@ -161,14 +170,14 @@ def test_lang_is_case_and_space_insensitive_and_filed_lowercase(client):
 
 def test_empty_form_lang_means_the_default(client):
     """FastAPI hands an empty form field the parameter's default (DEFAULT_LANG)."""
-    assert client.post("/v1/speak", data={"text": "hello there", "lang": ""}).status_code == 200
+    assert client.post("/v1/speak", headers=AUDIO, data={"text": "hello there", "lang": ""}).status_code == 200
     m = Manifest(str(client.paths.db), table="phrases", text_col="text")
     assert [x["lang"] for x in m.iter_rows()] == ["en-us"]
     m.close()
 
 
 def test_edge_forwards_and_files_the_normalized_lang(edge):
-    r = edge.post("/v1/speak", data={"text": "hello there", "lang": "RU-RU"})
+    r = edge.post("/v1/speak", headers=AUDIO, data={"text": "hello there", "lang": "RU-RU"})
     assert r.status_code == 200 and r.headers["x-source"] == "upstream"
     assert edge.upstream.requests[0]["lang"] == "ru-ru"
     m = Manifest(str(edge.paths.db), table="phrases", text_col="text")
@@ -217,5 +226,5 @@ def test_save_phrase_refuses_a_path_outside_the_bank(client, tmp_path):
     for lang, voice in [("../../escaped", "Kore"), ("{out}", "Kore"), ("en-us", "x/../../../escaped")]:
         with _nothing_written(tmp_path, client.paths.db):
             with pytest.raises(HTTPException) as exc:
-                _save_phrase("hello there", _bad(lang, tmp_path), _Clip(b"OggS", voice, "gemini", b"\0\0"))
+                _save_phrase("hello there", _bad(lang, tmp_path), _Clip(voice, "gemini", ogg=b"OggS", pcm=b"\0\0"))
         assert exc.value.status_code == 500 and "outside" in exc.value.detail, (lang, voice)

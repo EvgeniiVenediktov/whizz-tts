@@ -9,6 +9,7 @@ import pytest
 genai_types = pytest.importorskip("google.genai.types")
 
 import wordbank.gemini_tts as gemini_tts  # noqa: E402
+from tests.conftest import AUDIO  # noqa: E402
 from tests.test_gemini_payload import fmt_chunk, gemini_lite_wav, wav_payload  # noqa: E402
 
 PCM = b"\x00\x10" * 2400
@@ -146,7 +147,7 @@ def test_speak_answers_502_with_the_reason_and_saves_nothing(bank_env, fake_clie
 
     fake_client.responses = [empty_resp()]
     with TestClient(app) as c:
-        r = c.post("/v1/speak", data={"text": "Persistence check 1793813068", "voice": "Puck"})
+        r = c.post("/v1/speak", headers=AUDIO, data={"text": "Persistence check 1793813068", "voice": "Puck"})
     assert r.status_code == 502
     assert "finish_reason=OTHER" in r.json()["detail"]
     assert fake_client.calls == 3

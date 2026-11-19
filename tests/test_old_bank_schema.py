@@ -1,7 +1,9 @@
 """Banks written by older code: Manifest's one-time key migrations, and
 BankLookup reading legacy phrase labels ("gemini-Kore") as they are."""
 import sqlite3
+import uuid
 
+from tests.conftest import AUDIO
 from wordbank.lookup import BankLookup
 from wordbank.manifest import Manifest
 
@@ -101,7 +103,7 @@ def test_lookups_read_an_unmigrated_phrase_label_as_the_plain_one(client):
     ogg.write_bytes(b"OggS-kore")
 
     for data in ({"voice": "kore"}, {}):
-        r = client.post("/v1/speak", data={"text": "hello there", **data})
+        r = client.post("/v1/speak", headers=AUDIO, data={"text": "hello there", **data})
         assert (r.headers["x-source"], r.headers["x-voice"], r.content) == ("bank", "Kore", b"OggS-kore")
     assert client.get("/v1/search", params={"prefix": "hello", "voice": "Kore"}).json()["results"] \
         == [{"text": "hello there", "type": "phrase", "voice": "Kore"}]
@@ -198,3 +200,21 @@ def test_manifest_migrates_the_old_word_key_keeping_rows_and_ids(tmp_path):
     bank = BankLookup(db)
     assert bank.get("dog", "en-us", voice="Kore")["file_path"] == "en/gemini-Kore/0/2_dog.wav"
     bank.close()
+
+
+def test_a_bank_from_before_clip_ids(tmp_path):
+    """Lookups serve its phrases without an id (not a 500); the first Manifest
+    open gives every phrase one."""
+    db = str(tmp_path / "wb.db")
+    _phrase_bank(db, [(1, "hello there", "en-us", "Kore", "done", "a.wav")])
+    conn = sqlite3.connect(db)
+    conn.executescript("DROP INDEX idx_phrases_clip_id; ALTER TABLE phrases DROP COLUMN clip_id;")
+    conn.close()
+    bank = BankLookup(db)
+    assert bank.get_phrase("hello there", "en-us")["clip_id"] is None
+    assert bank.clip(str(uuid.uuid4())) is None
+    bank.close()
+    m = Manifest(db, table="phrases", text_col="text")
+    [row] = m.iter_rows()
+    m.close()
+    assert str(uuid.UUID(row["clip_id"])) == row["clip_id"]

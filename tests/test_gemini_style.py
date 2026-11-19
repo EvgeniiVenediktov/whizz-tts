@@ -21,7 +21,7 @@ from fastapi.testclient import TestClient
 pytest.importorskip("google.genai.types")      # the generateContent path builds SDK config
 
 import wordbank.gemini_tts as gemini_tts  # noqa: E402
-from tests.conftest import interaction_resp  # noqa: E402
+from tests.conftest import AUDIO, interaction_resp  # noqa: E402
 from tests.test_gemini_payload import gemini_lite_wav  # noqa: E402
 from wordbank.gemini_tts import (  # noqa: E402
     GeminiAPIError, GeminiNetworkError, GeminiNoAudioError, GeminiStyleUnsupportedError,
@@ -190,7 +190,7 @@ def server(bank_env, gemini_api, monkeypatch):
 
 def test_speak_instruct_on_a_38_model_is_sent_as_style_and_never_saved(server):
     with server.client(LITE) as c:
-        r = c.post("/v1/speak", data={"text": "laughing", "voice": "Puck",
+        r = c.post("/v1/speak", headers=AUDIO, data={"text": "laughing", "voice": "Puck",
                                       "instruct": "whisper it"})
     assert r.status_code == 200, r.text
     assert r.headers["x-source"] == "gemini" and r.content[:4] == b"OggS"
@@ -201,9 +201,9 @@ def test_speak_instruct_on_a_38_model_is_sent_as_style_and_never_saved(server):
 def test_tts_style_applies_to_misses_and_is_saved_as_provenance(server, monkeypatch):
     monkeypatch.setenv("GEMINI_TTS_STYLE", STYLE)
     with server.client(FLASH) as c:
-        miss = c.post("/v1/speak", data={"text": "haha", "voice": "Kore"})
-        hit = c.post("/v1/speak", data={"text": "haha", "voice": "Kore"})
-        one_off = c.post("/v1/speak", data={"text": "haha", "voice": "Kore",
+        miss = c.post("/v1/speak", headers=AUDIO, data={"text": "haha", "voice": "Kore"})
+        hit = c.post("/v1/speak", headers=AUDIO, data={"text": "haha", "voice": "Kore"})
+        one_off = c.post("/v1/speak", headers=AUDIO, data={"text": "haha", "voice": "Kore",
                                             "instruct": "whisper it"})
     assert miss.headers["x-source"] == "gemini" and hit.headers["x-source"] == "bank"
     assert one_off.status_code == 200
@@ -221,9 +221,9 @@ def test_tts_style_with_a_model_that_cannot_take_it(server, monkeypatch, caplog)
     banked = _bank_phrase(server.paths, "hello there", "Kore")
     monkeypatch.setenv("GEMINI_TTS_STYLE", STYLE)
     with caplog.at_level(logging.WARNING, logger="uvicorn.error"), server.client(PREVIEW) as c:
-        miss = c.post("/v1/speak", data={"text": "haha"})
-        hit = c.post("/v1/speak", data={"text": "hello there"})
-        one_off = c.post("/v1/speak", data={"text": "haha", "instruct": "whisper it"})
+        miss = c.post("/v1/speak", headers=AUDIO, data={"text": "haha"})
+        hit = c.post("/v1/speak", headers=AUDIO, data={"text": "hello there"})
+        one_off = c.post("/v1/speak", headers=AUDIO, data={"text": "haha", "instruct": "whisper it"})
     assert f"GEMINI_TTS_STYLE is set but GEMINI_TTS_MODEL={PREVIEW}" in caplog.text
     assert miss.status_code == 500 and "GEMINI_TTS_STYLE" in miss.json()["detail"]
     assert hit.headers["x-source"] == "bank" and hit.content == banked

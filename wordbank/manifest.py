@@ -12,6 +12,7 @@ Thread-safe: one connection (check_same_thread=False) behind a lock.
 import sqlite3
 import threading
 import time
+import uuid
 from typing import Iterable, Optional
 
 from .paths import voice_from_path
@@ -77,6 +78,7 @@ CREATE TABLE IF NOT EXISTS phrases (
     qc_takes     INTEGER NOT NULL DEFAULT 0,
     qc_accepted  INTEGER NOT NULL DEFAULT 0,
     batch_id     TEXT,
+    clip_id      TEXT,      -- uuid4: /v1/clip/{id}, and the file name of a long text
     created_at   REAL,
     updated_at   REAL,
     UNIQUE(text, lang, voice)
@@ -86,6 +88,7 @@ CREATE TABLE IF NOT EXISTS phrases (
 # After the key migrations (a rebuilt table loses its indexes and triggers).
 _POST_SCHEMA = """
 CREATE INDEX IF NOT EXISTS idx_phrases_lang_text ON phrases(lang, text);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_phrases_clip_id ON phrases(clip_id);
 
 -- A word is added for a voice unless that voice has it or an unattributed row
 -- still to generate covers it; a voice-less add is one row per word (NULL-
@@ -122,12 +125,20 @@ class Manifest:
                     self._conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {decl}")
                 except sqlite3.OperationalError:
                     pass  # column already exists
+        try:
+            self._conn.execute("ALTER TABLE phrases ADD COLUMN clip_id TEXT")
+        except sqlite3.OperationalError:
+            pass
         # A key without `voice` silently dropped a second voice's row, and
         # ALTER can't widen a UNIQUE key: rebuilt once.
         if ["text", "lang"] in self._unique_keys("phrases"):
             self._rebuild("phrases")
         if ["lang", "word", "voice"] not in self._unique_keys("words"):
             self._rebuild("words", self._migrate_word_rows)
+        self._conn.executemany("UPDATE phrases SET clip_id = ? WHERE id = ?", [
+            (str(uuid.uuid4()), r[0])
+            for r in self._conn.execute("SELECT id FROM phrases WHERE clip_id IS NULL")])
+        self._conn.commit()
         self._conn.executescript(_POST_SCHEMA)
 
     def _unique_keys(self, table: str) -> list:
@@ -276,23 +287,27 @@ class Manifest:
                    file_path: Optional[str] = None, billed_chars: Optional[int] = None,
                    voice: Optional[str] = None, model: Optional[str] = None,
                    style: Optional[str] = None, check=None,
-                   qc_takes: Optional[int] = None) -> None:
+                   qc_takes: Optional[int] = None, clip_id: Optional[str] = None) -> None:
         # A status-only update keeps the voice. `model` (a generation result)
         # writes model and style together, style as given (None: no direction);
-        # without it both are kept. `check` (qc.Check) and `qc_takes` likewise.
-        qc_sql, qc_params = "", []
+        # without it both are kept. `check` (qc.Check), `qc_takes` and
+        # `clip_id` (phrases) likewise.
+        more_sql, more_params = "", []
         if check is not None:
-            qc_sql += "review = ?, qc_seconds = ?, qc_end_db = ?, "
-            qc_params += [check.review, check.seconds, check.end_db]
+            more_sql += "review = ?, qc_seconds = ?, qc_end_db = ?, "
+            more_params += [check.review, check.seconds, check.end_db]
         if qc_takes is not None:
-            qc_sql += "qc_takes = ?, "
-            qc_params.append(qc_takes)
+            more_sql += "qc_takes = ?, "
+            more_params.append(qc_takes)
+        if clip_id is not None:
+            more_sql += "clip_id = ?, "
+            more_params.append(clip_id)
         with self._lock:
             self._conn.execute(
                 f"UPDATE {self.table} SET status = ?, error = ?, file_path = ?, "
                 "billed_chars = ?, voice = COALESCE(?, voice), "
-                f"{_PROVENANCE_SQL}, {qc_sql}updated_at = ? WHERE id = ?",
-                (status, error, file_path, billed_chars, voice, model, model, style, *qc_params,
+                f"{_PROVENANCE_SQL}, {more_sql}updated_at = ? WHERE id = ?",
+                (status, error, file_path, billed_chars, voice, model, model, style, *more_params,
                  time.time(), row_id),
             )
             self._conn.commit()

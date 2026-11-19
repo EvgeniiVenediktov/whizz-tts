@@ -1,16 +1,19 @@
 """/v1/speak get-or-generate: voice selection, bank hit vs Gemini miss,
 persistence, and the saved format. Real handler over a tmp bank; Gemini faked."""
+import base64
 import io
+import uuid
 
 import pytest
 import soundfile as sf
 from fastapi.testclient import TestClient
 
+from tests.conftest import AUDIO
 from wordbank.manifest import DONE, Manifest
 
 
 def _speak(client, **data):
-    return client.post("/v1/speak", data=data)
+    return client.post("/v1/speak", headers=AUDIO, data=data)
 
 
 def _phrase_rows(paths):
@@ -77,6 +80,34 @@ def test_repeat_is_a_bank_hit_and_each_voice_is_banked_separately(client):
     assert sorted(r["voice"] for r in _phrase_rows(client.paths)) == ["Charon", "Puck"]
     results = client.get("/v1/search", params={"prefix": "hello"}).json()["results"]
     assert {r["voice"] for r in results} == {"Puck", "Charon"}
+
+
+def test_a_long_text_is_filed_by_its_clip_id_and_found_again_by_it(client):
+    """JSON by default; a text over 25 characters is named by its clip id (a
+    slug of 1,500 characters would not fit a file name), and the next request
+    is a bank hit with the same id. `text` comes back as sent."""
+    text = "word " * 300
+    first = client.post("/v1/speak", data={"text": text, "voice": "Puck"}).json()
+    cid = first["id"]
+    assert first == {"id": cid, "text": text, "file": f"{cid}.ogg", "voice": "Puck",
+                     "source": "gemini", "audio_url": f"/v1/clip/{cid}"}
+    assert _phrase_rows(client.paths)[0]["file_path"] == f"en-us/gemini-Puck/phrases/{cid[:2]}/{cid}.wav"
+    again = client.post("/v1/speak", data={"text": text.upper(), "voice": "Puck"}).json()
+    assert (again["source"], again["id"]) == ("bank", cid)
+    assert client.get(again["audio_url"]).content[:4] == b"OggS"
+
+
+def test_a_word_hit_points_at_the_word_route(client):
+    word_ogg = _bank_word(client.paths, "cat", voice="Kore")
+    body = client.post("/v1/speak", data={"text": "cat"}).json()
+    assert (body["id"], body["file"], body["source"]) == (None, "1_cat.ogg", "bank")
+    assert client.get(body["audio_url"]).content == word_ogg
+
+
+def test_a_one_off_answers_its_audio_inline(client):
+    body = client.post("/v1/speak", data={"text": "hello there", "instruct": "whisper"}).json()
+    assert (body["id"], body["file"], body["audio_url"]) == (None, None, None)
+    assert base64.b64decode(body["audio"])[:4] == b"OggS"
 
 
 def test_unknown_voice_is_rejected_before_calling_gemini(client):
@@ -227,7 +258,7 @@ def test_store_off_serves_the_miss_and_writes_nothing(client, monkeypatch):
     r = _speak(client, text="hello there", voice="Puck")
     assert r.status_code == 200, r.text
     assert r.headers["x-source"] == "gemini" and r.headers["x-voice"] == "Puck"
-    assert r.content[:4] == b"OggS"
+    assert r.content[:4] == b"OggS" and uuid.UUID(r.headers["x-clip-id"])   # for an edge to file
     assert _phrase_rows(client.paths) == [] and _ogg_files(client.paths) == []
 
     again = _speak(client, text="hello there", voice="Puck")   # nothing banked -> generated again

@@ -15,6 +15,7 @@ import pathlib
 import pytest
 
 import src.server as srv
+from tests.conftest import AUDIO
 from wordbank.gemini_tts import GeminiVoiceUnsupportedError, canonical_voice, synthesize_pcm
 from wordbank.languages import VOICE_LANGUAGES, is_lang_code
 from wordbank.manifest import Manifest
@@ -51,8 +52,8 @@ def test_locale_voice_on_a_non_38_model_is_refused_before_any_request(gemini_api
 def test_routes_refuse_a_locale_voice_on_a_non_38_model(client, monkeypatch):
     studio = client.post("/v1/gemini/tts", data={"text": "hi", "voice": LOCALE, "model": PREVIEW})
     monkeypatch.setattr(srv, "GEMINI_TTS_MODEL", PREVIEW)
-    speak = client.post("/v1/speak", data={"text": "hello there", "voice": LOCALE})
-    classic = client.post("/v1/speak", data={"text": "hello there", "voice": "Kore"})
+    speak = client.post("/v1/speak", headers=AUDIO, data={"text": "hello there", "voice": LOCALE})
+    classic = client.post("/v1/speak", headers=AUDIO, data={"text": "hello there", "voice": "Kore"})
     assert studio.status_code == 400 and "verified only on" in studio.json()["detail"]
     assert speak.status_code == 400 and "verified only on" in speak.json()["detail"]
     assert classic.status_code == 200
@@ -71,9 +72,9 @@ def test_cli_refuses_a_locale_voice_on_a_non_38_model(tmp_path):
 
 
 def test_speak_files_a_locale_voice_under_its_id(client):
-    miss = client.post("/v1/speak", data={"text": "hello there", "lang": "en-gb",
+    miss = client.post("/v1/speak", headers=AUDIO, data={"text": "hello there", "lang": "en-gb",
                                           "voice": "EN-GB-Tutor-11"})
-    hit = client.post("/v1/speak", data={"text": "hello there", "lang": "en-gb", "voice": LOCALE})
+    hit = client.post("/v1/speak", headers=AUDIO, data={"text": "hello there", "lang": "en-gb", "voice": LOCALE})
     assert miss.status_code == 200, miss.text
     assert (miss.headers["x-source"], miss.headers["x-voice"]) == ("gemini", LOCALE)
     assert hit.headers["x-source"] == "bank" and hit.content == miss.content

@@ -35,12 +35,12 @@ def test_cors_default_allows_any_origin(client):
 
 
 def test_cors_exposes_speak_metadata_headers(client):
-    """Cross-origin JS can only read X-Source/X-Voice if they're exposed."""
+    """Cross-origin JS can only read X-Source/X-Voice/X-Clip-Id if they're exposed."""
     r = client.post("/v1/speak", data={"text": "hello there", "voice": "Puck"},
-                    headers={"Origin": "https://app.example.com"})
+                    headers={"Origin": "https://app.example.com", "Accept": "audio/ogg"})
     assert r.status_code == 200 and r.headers["x-voice"] == "Puck"
     exposed = {h.strip().lower() for h in r.headers["access-control-expose-headers"].split(",")}
-    assert {"x-source", "x-voice"} <= exposed
+    assert {"x-source", "x-voice", "x-clip-id"} <= exposed
 
 
 def test_cors_restricted_rejects_disallowed_origin(bank_env, monkeypatch):

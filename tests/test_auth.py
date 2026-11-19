@@ -5,6 +5,7 @@ setenv/delenv per test -- no client re-creation needed. With no secret the
 routes are open; every other server test exercises that.
 """
 import time
+import uuid
 
 import jwt
 import pytest
@@ -72,3 +73,14 @@ def test_oversized_body_is_413_before_anything_parses_it(client, monkeypatch):
     chunked = client.post("/v1/speak", content=iter([big[:40_000], big[40_000:]]), headers=form)
     assert chunked.status_code == 413
     assert _post(client, "/v1/speak", {"text": "hello"}).status_code == 401
+
+
+def test_clip_route_needs_the_token_and_a_uuid(client, monkeypatch):
+    """Phrase audio by id is not public: the same token as /v1/speak."""
+    monkeypatch.setenv("JWT_SECRET", SECRET)
+    auth = {"Authorization": f"Bearer {_token()}"}
+    url = _post(client, "/v1/speak", {"text": "good morning"}, _token()).json()["audio_url"]
+    assert client.get(url).status_code == 401
+    assert client.get(url, headers=auth).content[:4] == b"OggS"
+    assert client.get("/v1/clip/not-a-uuid", headers=auth).status_code == 400
+    assert client.get(f"/v1/clip/{uuid.uuid4()}", headers=auth).status_code == 404

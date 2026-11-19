@@ -3,6 +3,7 @@ type flag, and phrase serving."""
 from fastapi.testclient import TestClient
 import pytest
 
+from tests.conftest import AUDIO
 from wordbank.lookup import BankLookup
 from wordbank.manifest import DONE, Manifest
 
@@ -137,7 +138,7 @@ def test_search_prefix_is_literal_and_limit_is_clamped(client):
     LIMIT -1 as no limit), and a prefix ending in U+10FFFF (no range bound
     above it) is a miss, not a 500."""
     for voice in ("Kore", "Puck"):
-        client.post("/v1/speak", data={"text": "hello there", "voice": voice})
+        client.post("/v1/speak", headers=AUDIO, data={"text": "hello there", "voice": voice})
 
     def search(prefix, **params):
         r = client.get("/v1/search", params={"prefix": prefix, **params})

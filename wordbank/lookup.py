@@ -51,6 +51,7 @@ class BankLookup:
         self._lock = threading.Lock()
         self._conn = None
         self._ready_count = None   # memoized; the served bank is static per process
+        self._clip_col = "NULL"
         self._open()
 
     def _open(self) -> None:
@@ -69,6 +70,9 @@ class BankLookup:
             conn.create_function("voice_label", 1, voice_label, deterministic=True)
             # phrase text is matched case-insensitively beyond ASCII ("Привет")
             conn.create_function("casefold", 1, str.casefold, deterministic=True)
+            # phrases.clip_id arrives when a Manifest (a writer) first opens the bank
+            self._clip_col = "clip_id" if any(
+                r[1] == "clip_id" for r in conn.execute("PRAGMA table_info(phrases)")) else "NULL"
             self._conn = conn
 
     @property
@@ -137,13 +141,24 @@ class BankLookup:
     def phrases(self, text: str, lang: str = "en", voice: Optional[str] = None) -> list:
         """Every ready row of an exact phrase match (case-insensitive), earliest
         banked first; `voice` pins it (a legacy "gemini-Kore" row matches "Kore")."""
-        sql = (f"SELECT text, lang, file_path, status, {_PHRASE_VOICE_SQL} AS voice FROM phrases "
+        if not self.available:          # opened first: _clip_col is known
+            return []
+        sql = (f"SELECT text, lang, file_path, status, {_PHRASE_VOICE_SQL} AS voice, "
+               f"{self._clip_col} AS clip_id FROM phrases "
                f"WHERE casefold(text) = casefold(?) AND lang = ? AND {_READY_SQL}")
         params = [text.strip(), lang]
         if voice is not None:
             sql += f" AND {_PHRASE_VOICE_SQL} = ?"
             params.append(voice)
         return self._query(sql + " ORDER BY id", params)
+
+    def clip(self, clip_id: str) -> Optional[sqlite3.Row]:
+        """The ready phrase stored under `clip_id`, or None."""
+        if not self.available or self._clip_col == "NULL":
+            return None
+        rows = self._query(f"SELECT file_path, {_PHRASE_VOICE_SQL} AS voice, clip_id FROM phrases "
+                           f"WHERE clip_id = ? AND {_READY_SQL}", (clip_id,))
+        return rows[0] if rows else None
 
     def get_phrase(self, text: str, lang: str = "en",
                    voice: Optional[str] = None) -> Optional[sqlite3.Row]:

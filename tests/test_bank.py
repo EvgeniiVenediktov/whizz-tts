@@ -2,6 +2,7 @@
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.conftest import AUDIO
 from wordbank.gemini_batch import write_wav_from_pcm_bytes
 from wordbank.lookup import BankLookup
 from wordbank.manifest import DONE, Manifest
@@ -148,7 +149,7 @@ def test_server_serves_the_requested_voice_else_the_default(client):
     assert client.get("/v1/bank/cat/info", params={"voice": "Iapetus"}).json()["voice"] == "Iapetus"
     assert client.get("/v1/bank/cat", params={"voice": "Puck"}).status_code == 404
     for data, voice in (({}, "Kore"), ({"voice": "Iapetus"}, "Iapetus")):
-        r = client.post("/v1/speak", data={"text": "cat", **data})
+        r = client.post("/v1/speak", headers=AUDIO, data={"text": "cat", **data})
         assert r.headers["x-source"] == "bank" and r.content == b"OggS-" + voice.encode()
     assert client.gemini.calls == []
 

@@ -14,6 +14,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -21,6 +22,7 @@ import jwt
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.conftest import AUDIO
 from wordbank.manifest import DONE, Manifest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -41,7 +43,7 @@ class FakeUpstream:
             def do_POST(self):
                 raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
                 fields = dict(urllib.parse.parse_qsl(raw.decode()))
-                up.requests.append({"path": self.path,
+                up.requests.append({"path": self.path, "accept": self.headers.get("Accept"),
                                     "auth": self.headers.get("Authorization"), **fields})
                 time.sleep(up.delay)
                 status, headers, body = up.respond(fields)
@@ -90,7 +92,7 @@ def edge(bank_env, fake_gemini, upstream, monkeypatch):
 
 
 def _speak(client, **data):
-    return client.post("/v1/speak", data=data)
+    return client.post("/v1/speak", headers=AUDIO, data=data)
 
 
 def _phrases(paths):
@@ -108,7 +110,7 @@ def test_miss_is_fetched_from_upstream_saved_and_then_served_locally(edge):
     assert r.content == b"OggS|hello there|Puck|"
 
     [req] = edge.upstream.requests
-    assert req == {"path": "/v1/speak", "auth": f"Bearer {TOKEN}",
+    assert req == {"path": "/v1/speak", "accept": "audio/ogg", "auth": f"Bearer {TOKEN}",
                    "text": "hello there", "lang": "en-us", "voice": "Puck"}
     [row] = _phrases(edge.paths)
     assert row["voice"] == "Puck" and row["status"] == DONE
@@ -118,6 +120,14 @@ def test_miss_is_fetched_from_upstream_saved_and_then_served_locally(edge):
     assert again.headers["x-source"] == "bank" and again.content == r.content
     assert len(edge.upstream.requests) == 1
     assert edge.gemini.calls == []                  # an edge never calls Gemini itself
+
+
+def test_a_miss_is_banked_under_the_upstreams_clip_id_and_served_by_it(edge):
+    cid = str(uuid.uuid4())
+    edge.upstream.respond = lambda f: (200, {"X-Voice": "Puck", "X-Clip-Id": cid}, b"OggS-x")
+    body = edge.post("/v1/speak", data={"text": "hello there", "voice": "Puck"}).json()
+    assert (body["id"], body["source"], body["audio_url"]) == (cid, "upstream", f"/v1/clip/{cid}")
+    assert edge.get(body["audio_url"]).content == b"OggS-x"
 
 
 def test_packaged_bank_serves_without_asking_upstream(edge):
@@ -297,6 +307,7 @@ def test_edge_against_a_real_upstream_server(bank_env, fake_gemini, tmp_path, mo
             assert miss.content[:4] == b"OggS"
             hit = _speak(c, text="hello there", voice="Puck")
             assert hit.headers["x-source"] == "bank" and hit.content == miss.content
+            assert hit.headers["x-clip-id"] == miss.headers["x-clip-id"]   # the upstream's
 
         found = urllib.request.urlopen(url + "/v1/search?prefix=hello").read()
         if store == "1":
