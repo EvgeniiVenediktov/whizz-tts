@@ -186,6 +186,7 @@ dev-only convenience: `docker compose --profile bank up --build`):
   finds the archive already there. For deploying before persistent storage
   exists — every rollout re-bakes the bank into the image. Requires
   `library.json`/`tts-bank.tar.gz` present at build time (`scripts/pack.sh`).
+- The image's `ffmpeg` is a static minimal build (the Dockerfile's `ffmpeg` stage, ~6 MB): s16le in, `libopus`, Ogg out, nothing else. If `src/audio.py` needs another codec, format or filter, enable it in that `./configure` line, or the encode fails only in the container (the dev `.venv/bin/ffmpeg` is a full build). No pip and plain `uvicorn` (not `[standard]`) in the image either: thin ~210 MB.
 - Both run as the unprivileged user `app` (uid 1000): code under `/app` is root-owned
   and read-only to the server, `/data` belongs to `app`. A fresh named volume inherits
   that; a volume written by an older (root) image needs a one-time

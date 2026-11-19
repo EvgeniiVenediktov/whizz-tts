@@ -1,11 +1,9 @@
 # Bank-only server runtime (lightweight — no ML stack).
 # wordbank.lookup / wordbank.paths use only the Python stdlib.
 fastapi>=0.111.0
-uvicorn[standard]>=0.29.0
+uvicorn>=0.29.0  # not [standard]: uvloop/httptools/watchfiles add ~22 MB for no need here
 python-multipart>=0.0.9
 PyJWT>=2.8.0  # JWT bearer auth for write/synthesis routes; pure Python, no ML deps
 # /v1/speak get-or-generate: Gemini synthesis of bank misses (needs GEMINI_API_KEY
-# at runtime) + OGG encoding. imageio-ffmpeg ships a static ffmpeg with libopus
-# (~80 MB) — the Dockerfile symlinks it onto PATH; apt's ffmpeg adds ~430 MB.
+# at runtime). OGG encoding uses the static ffmpeg the Dockerfile builds.
 google-genai>=1.0.0
-imageio-ffmpeg>=0.5.1

@@ -13,6 +13,28 @@
 #     still runs its verify/unpack, it just finds the archive already sitting
 #     at /data instead of on a mounted volume. For deploying before
 #     persistent storage exists; every rollout re-bakes the bank in.
+
+# ---- ffmpeg: a static build with just what src/audio.py uses (s16le in,
+# libopus, Ogg out): ~6 MB instead of imageio-ffmpeg's 165 MB. ~45 s cold,
+# cached after.
+FROM debian:trixie-slim AS ffmpeg
+ARG FFMPEG_VERSION=7.1.1
+ARG FFMPEG_SHA256=733984395e0dbbe5c046abda2dc49a5544e7e0e1e2366bba849222ae9e3a03b1
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential pkg-config libopus-dev curl ca-certificates xz-utils && \
+    rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+RUN curl -fsSLo ffmpeg.tar.xz "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz" && \
+    echo "${FFMPEG_SHA256}  ffmpeg.tar.xz" | sha256sum -c - && \
+    tar xJf ffmpeg.tar.xz --strip-components=1 && \
+    ./configure --disable-everything --disable-autodetect --disable-doc --disable-debug \
+        --disable-network --disable-ffplay --disable-ffprobe --disable-avdevice --disable-swscale \
+        --disable-x86asm --enable-small --enable-libopus --enable-encoder=libopus \
+        --enable-demuxer=pcm_s16le --enable-decoder=pcm_s16le --enable-muxer=ogg \
+        --enable-protocol=pipe,file --enable-filter=aresample,aformat,anull \
+        --pkg-config-flags=--static --extra-ldflags=-static && \
+    make -j"$(nproc)" ffmpeg && strip ffmpeg
+
 FROM python:3.12-slim AS base
 
 ENV PYTHONUNBUFFERED=1 \
@@ -21,12 +43,12 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Base server deps (always). src/audio.py calls `ffmpeg` from PATH, so expose
-# imageio-ffmpeg's static binary there (/v1/speak encodes Gemini output to OGG).
+# Base server deps (always); pip itself isn't needed at runtime. src/audio.py
+# calls `ffmpeg` from PATH (/v1/speak encodes Gemini output to OGG).
+COPY --from=ffmpeg /src/ffmpeg /usr/local/bin/ffmpeg
 COPY requirements-base.txt ./
 RUN pip install -r requirements-base.txt && \
-    ln -s "$(python -c 'import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())')" \
-        /usr/local/bin/ffmpeg && \
+    pip uninstall -y -q pip && \
     ffmpeg -hide_banner -encoders | grep -q libopus
 
 COPY src/ ./src/
