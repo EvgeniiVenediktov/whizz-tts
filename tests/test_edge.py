@@ -309,7 +309,9 @@ def test_edge_against_a_real_upstream_server(bank_env, fake_gemini, tmp_path, mo
             assert hit.headers["x-source"] == "bank" and hit.content == miss.content
             assert hit.headers["x-clip-id"] == miss.headers["x-clip-id"]   # the upstream's
 
-        found = urllib.request.urlopen(url + "/v1/search?prefix=hello").read()
+        token = jwt.encode({"sub": "t", "exp": int(time.time()) + 60}, secret, algorithm="HS256")
+        found = urllib.request.urlopen(urllib.request.Request(          # search needs the token
+            url + "/v1/search?prefix=hello", headers={"Authorization": f"Bearer {token}"})).read()
         if store == "1":
             # upstream banked it too, so a second edge would get it without Gemini
             assert b'"voice":"Puck"' in found

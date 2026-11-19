@@ -178,10 +178,14 @@ async def lifespan(app: FastAPI):
     app.state.bank = BankLookup(os.getenv("BANK_DB", "wordbank.db"))
     app.state.wav_root = os.getenv("WAV_ROOT", "output/words")
     app.state.ogg_root = os.getenv("OGG_ROOT", "output/words_ogg")
-    # Auth is env-gated (JWT_SECRET) so dev setups and existing deploys keep
-    # working unauthenticated unless a secret is explicitly configured.
+    # Fail closed: a server that can spend money (a Gemini key, or an upstream
+    # to relay misses to) needs JWT_SECRET; AUTH_DISABLED=1 opts out, for dev.
     if not os.getenv("JWT_SECRET"):
-        log.warning("JWT_SECRET not set: /v1/speak, /v1/gemini/tts are unauthenticated")
+        paid = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or os.getenv("SPEAK_UPSTREAM_URL")
+        if paid and os.getenv("AUTH_DISABLED") != "1":
+            raise RuntimeError("JWT_SECRET is not set but this server can generate (Gemini key or "
+                               "SPEAK_UPSTREAM_URL): set JWT_SECRET, or AUTH_DISABLED=1 for local development")
+        log.warning("JWT_SECRET not set: speak, clip, phrase and search routes are unauthenticated")
     _warn_about_upstream_token(log)
     _warn_about_tts_style(log)
     yield
@@ -277,7 +281,7 @@ def _limit(limit: int) -> int:
     return max(1, min(limit, MAX_RESULTS))      # SQLite reads LIMIT -1 as "no limit"
 
 
-@app.get("/v1/search")
+@app.get("/v1/search", dependencies=[Depends(require_auth)])
 def search(prefix: str, lang: str = DEFAULT_LANG, limit: int = 10,
            kind: Optional[str] = None, voice: Optional[str] = None):
     """Merged prefix search over the word + phrase banks. Each result carries a
@@ -342,7 +346,7 @@ def bank_get(word: str, lang: str = DEFAULT_LANG, format: str = "ogg",
     return _serve_audio(_bank_word(word, lang, voice)["file_path"], format)
 
 
-@app.get("/v1/phrase/info")
+@app.get("/v1/phrase/info", dependencies=[Depends(require_auth)])
 def phrase_info(text: str, lang: str = DEFAULT_LANG, voice: Optional[str] = None):
     """Sizes/availability for a phrase (optionally pin a voice: its label,
     "Kore"; the legacy "gemini-Kore" is accepted too)."""
@@ -354,7 +358,7 @@ def phrase_info(text: str, lang: str = DEFAULT_LANG, voice: Optional[str] = None
             "wav": _file_info(_wav_abs(rel)), "ogg": _file_info(_ogg_abs(rel))}
 
 
-@app.get("/v1/phrase")
+@app.get("/v1/phrase", dependencies=[Depends(require_auth)])
 def phrase_get(text: str, lang: str = DEFAULT_LANG, voice: Optional[str] = None,
                format: str = "ogg"):
     """Serve a phrase's audio (OGG by default, WAV master in dev); `voice` as

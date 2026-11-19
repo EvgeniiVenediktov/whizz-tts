@@ -70,11 +70,16 @@ if python -m wordbank verify --desc "$LIBRARY_DESC" --root "$DATA_DIR"; then
 elif [ -f "$LIBRARY_ARCHIVE" ] && [ "$(cksum < "$LIBRARY_ARCHIVE")" != "$(cat "$UNPACK_FAILED" 2>/dev/null)" ]; then
     echo "[entrypoint] volume not provisioned — unpacking $LIBRARY_ARCHIVE -> $DATA_DIR"
     mkdir -p "$DATA_DIR"
-    # e.g. phrases /v1/speak saved before the archive was added: kept in the backup
-    move_db_aside unpack
-    tar xzf "$LIBRARY_ARCHIVE" -C "$DATA_DIR" --strip-components=1 output/words_ogg
-    tar xzf "$LIBRARY_ARCHIVE" -C "$DATA_DIR" wordbank.db
-    tar xzf "$LIBRARY_ARCHIVE" -C "$DATA_DIR" library.json 2>/dev/null || true
+    if tar tvzf "$LIBRARY_ARCHIVE" | grep -q '^[lh]'; then
+        # a link member could point the served files (or the DB) anywhere
+        echo "[entrypoint] ERROR: $LIBRARY_ARCHIVE contains symlinks or hard links; refusing to unpack it" >&2
+    else
+        # e.g. phrases /v1/speak saved before the archive was added: kept in the backup
+        move_db_aside unpack
+        tar xzf "$LIBRARY_ARCHIVE" -C "$DATA_DIR" --no-same-owner --strip-components=1 output/words_ogg
+        tar xzf "$LIBRARY_ARCHIVE" -C "$DATA_DIR" --no-same-owner wordbank.db
+        tar xzf "$LIBRARY_ARCHIVE" -C "$DATA_DIR" --no-same-owner library.json 2>/dev/null || true
+    fi
     if python -m wordbank verify --desc "$LIBRARY_DESC" --root "$DATA_DIR"; then
         echo "[entrypoint] library verified after unpack — starting"
     # failed: recorded, so this archive isn't unpacked again on every boot

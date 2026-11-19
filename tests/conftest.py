@@ -52,6 +52,7 @@ def bank_env(tmp_path, monkeypatch):
     monkeypatch.setenv("WAV_ROOT", str(paths.wav))
     for var in ("JWT_SECRET", "GEMINI_API_KEY", "GOOGLE_API_KEY", "SPEAK_STORE", "GEMINI_TTS_STYLE"):
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("AUTH_DISABLED", "1")   # tests run open unless they set JWT_SECRET
     return paths
 
 

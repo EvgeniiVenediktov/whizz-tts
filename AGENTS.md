@@ -26,8 +26,8 @@ Orientation, dev setup, invariants, and runbooks. Full detail in `README.md`.
   **real Gemini** (paid, one synthesis): source `.env` first; it needs DNS for
   `generativelanguage.googleapis.com` (blocked on this machine — run in docker with
   `--dns 8.8.8.8`). Without a key it skips; with unresolvable DNS it fails saying so.
-- **Run server + UI:** `PATH="$PWD/.venv/bin:$PATH" SERVE_FRONTEND=1 .venv/bin/uvicorn src.server:app --port 8000` → http://localhost:8000. The PATH prefix matters for the same ffmpeg reason as the tests: `/v1/speak` misses encode OGG server-side, and without it they 503 with `ffmpeg not installed`.
-- **Creds:** `GEMINI_API_KEY` for word-bank generation/cleanup, `/v1/speak` misses, and `/v1/gemini/tts`; serving bank hits needs none. `JWT_SECRET` (optional) — when set, `POST /v1/speak`, `GET /v1/clip/{id}` and `/v1/gemini/tts` require a bearer token (unset = open, dev mode); generate it with `scripts/make_jwt_secret.py` (writes `.env`, never prints it; `--rotate` to replace). Secrets live in `.env` (gitignored, `0600`) — never print or cat it.
+- **Run server + UI:** `PATH="$PWD/.venv/bin:$PATH" SERVE_FRONTEND=1 .venv/bin/uvicorn src.server:app --port 8000` → http://localhost:8000 (with a `GEMINI_API_KEY` in the environment, also set `JWT_SECRET` or `AUTH_DISABLED=1`, or it refuses to start). The PATH prefix matters for the same ffmpeg reason as the tests: `/v1/speak` misses encode OGG server-side, and without it they 503 with `ffmpeg not installed`.
+- **Creds:** `GEMINI_API_KEY` for word-bank generation/cleanup, `/v1/speak` misses, and `/v1/gemini/tts`; serving bank hits needs none. `JWT_SECRET` — when set, the phrase and synthesis routes (`POST /v1/speak`, `/v1/clip`, `/v1/phrase*`, `/v1/search`, `/v1/gemini/tts`) require a bearer token; a server with a Gemini key or `SPEAK_UPSTREAM_URL` refuses to start without it unless `AUTH_DISABLED=1` (local dev); generate it with `scripts/make_jwt_secret.py` (writes `.env`, never prints it; `--rotate` to replace). Secrets live in `.env` (gitignored, `0600`) — never print or cat it.
 - **After editing `src/server.py` or `wordbank/lookup.py`, run `.venv/bin/pytest`** — it includes `tests/test_serves_real_bank.py`, which serves a real word from the local bank (synthetic tests have missed "no audio" regressions: path resolution, WAL visibility, env defaults). It skips without a local bank.
 
 ## Data & state (important)
@@ -122,8 +122,9 @@ Stdlib only (array/math/wave). A clip is **flagged** when its last `END_WINDOW_S
 1. **Multi-language support** — generation is data-driven; what's needed is a
    word list + a Gemini batch run per language, then a verified listen before
    adding the locale to `wordbank/languages.py`.
-JWT auth (HS256, `JWT_SECRET`; unset = open/dev) is in place on `/v1/speak`,
-`/v1/clip` and `/v1/gemini/tts`; tokens via `scripts/make_token.py --sub <name> --ttl 3600`.
+JWT auth (HS256, `JWT_SECRET`, fail closed; `AUTH_DISABLED=1` for dev) covers the phrase and
+synthesis routes; word-bank lookups stay public. Tokens via `scripts/make_token.py --sub <name> --ttl 3600`.
+The entrypoint and `scripts/unpack.sh` refuse archives with symlink or hard-link members.
 
 ### Code-quality backlog
 

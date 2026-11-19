@@ -58,9 +58,33 @@ def test_audience_and_issuer_are_enforced_when_configured(client, monkeypatch):
 
 def test_public_routes_unaffected_by_secret(client, monkeypatch):
     monkeypatch.setenv("JWT_SECRET", SECRET)
-    for path in ("/health", "/v1/gemini/voices", "/v1/languages"):
+    for path in ("/health", "/v1/gemini/voices", "/v1/languages", "/v1/bank?prefix=a"):
         assert client.get(path).status_code == 200, path
-    assert client.get("/v1/search", params={"prefix": "a"}).status_code == 200
+
+
+def test_phrase_routes_need_the_token(client, monkeypatch):
+    """Phrase text is client data (order numbers, names), unlike the word bank."""
+    monkeypatch.setenv("JWT_SECRET", SECRET)
+    auth = {"Authorization": f"Bearer {_token()}"}
+    assert _post(client, "/v1/speak", {"text": "hello there"}, _token()).status_code == 200
+    for path in ("/v1/search?prefix=hel", "/v1/phrase?text=hello+there", "/v1/phrase/info?text=hello+there"):
+        assert client.get(path).status_code == 401, path
+        assert client.get(path, headers=auth).status_code == 200, path
+
+
+def test_server_refuses_to_start_open_when_it_can_spend(bank_env, monkeypatch):
+    """Fail closed: a Gemini key (or an upstream) without JWT_SECRET is a
+    misconfiguration unless AUTH_DISABLED=1 says it's deliberate."""
+    from fastapi.testclient import TestClient
+    from src.server import app
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    monkeypatch.delenv("AUTH_DISABLED")
+    with pytest.raises(RuntimeError, match="JWT_SECRET"):
+        with TestClient(app):
+            pass
+    monkeypatch.setenv("AUTH_DISABLED", "1")
+    with TestClient(app) as c:
+        assert c.get("/health").status_code == 200
 
 
 def test_oversized_body_is_413_before_anything_parses_it(client, monkeypatch):

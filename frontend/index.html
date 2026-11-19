@@ -244,12 +244,18 @@
     suggestTimer = setTimeout(() => refreshSuggestions(p), 120);
   });
 
-  // Resolve a text to its bank entry: try the word bank, then the phrase bank.
+  // Resolve a text to its bank entry: try the word bank (public), then the
+  // phrase bank (needs the token, so its audio is fetched and played as a blob).
   async function entryInfo(text) {
     let r = await fetch(`${BANK}/${encodeURIComponent(text)}/info?${langQ()}`);
-    if (r.ok) return { info: await r.json(), url: f => `${BANK}/${encodeURIComponent(text)}?format=${f}&${langQ()}` };
-    r = await fetch(`${PHRASE}/info?text=${encodeURIComponent(text)}&${langQ()}`);
-    if (r.ok) return { info: await r.json(), url: f => `${PHRASE}?text=${encodeURIComponent(text)}&format=${f}&${langQ()}` };
+    if (r.ok) return { info: await r.json(), url: async f => `${BANK}/${encodeURIComponent(text)}?format=${f}&${langQ()}` };
+    r = await fetch(`${PHRASE}/info?text=${encodeURIComponent(text)}&${langQ()}`, { headers: authHeaders() });
+    if (r.status === 401) throw new Error(await readError(r));
+    if (r.ok) return { info: await r.json(), url: async f => {
+      const a = await fetch(`${PHRASE}?text=${encodeURIComponent(text)}&format=${f}&${langQ()}`, { headers: authHeaders() });
+      if (!a.ok) throw new Error(await readError(a));
+      return URL.createObjectURL(await a.blob());
+    } };
     return null;
   }
 
@@ -272,7 +278,7 @@
         oggSize.textContent = kb(info.ogg.bytes) + ratio;
         oggPlayer.style.display = 'block';
         oggMissing.style.display = 'none';
-        oggPlayer.src = url('ogg');
+        oggPlayer.src = await url('ogg');
       } else {
         oggSize.textContent = '';
         oggPlayer.style.display = 'none';
@@ -283,7 +289,7 @@
       if (info.wav.exists) {
         wavRow.style.display = 'block';
         wavSize.textContent = kb(info.wav.bytes);
-        wavPlayer.src = url('wav');
+        wavPlayer.src = await url('wav');
       } else {
         wavRow.style.display = 'none';
         wavPlayer.removeAttribute('src');
@@ -300,7 +306,7 @@
 
   async function refreshSuggestions(prefix) {
     try {                                    // merged: words + phrases, tagged
-      const res = await fetch(`${SEARCH}?prefix=${encodeURIComponent(prefix)}&limit=10&${langQ()}`);
+      const res = await fetch(`${SEARCH}?prefix=${encodeURIComponent(prefix)}&limit=10&${langQ()}`, { headers: authHeaders() });
       const { results } = await res.json();
       bankList.replaceChildren(...results.map(r => {
         const o = new Option('', r.text);

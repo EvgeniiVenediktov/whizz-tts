@@ -92,10 +92,11 @@ the `UNIQUE` index; prefix autocomplete uses an index range scan.
 
 ### Endpoint reference
 
-Read-only endpoints are public. The routes marked **JWT** (`POST /v1/speak`,
-`GET /v1/clip/{id}`, `POST /v1/gemini/tts`) require `Authorization: Bearer
-<token>` when `JWT_SECRET` is set (see [Auth](#auth)); with it unset the whole
-API is open (dev mode).
+Word-bank lookups (`/v1/bank*`), voices, languages and `/health` are public.
+Everything that touches phrases or generates (`POST /v1/speak`,
+`GET /v1/clip/{id}`, `GET /v1/phrase`, `/v1/phrase/info`, `GET /v1/search`,
+`POST /v1/gemini/tts`) requires `Authorization: Bearer <token>` when
+`JWT_SECRET` is set (see [Auth](#auth)).
 
 `lang` (every endpoint that takes it) is a language code, default `en-us`,
 case-insensitive and stored lowercase (`EN-US` = `en-us`). Anything else
@@ -342,7 +343,8 @@ SERVE_FRONTEND=1 .venv/bin/uvicorn src.server:app --port 8000
 | `WAV_ROOT` | `output/words` | WAV masters (dev compare only) |
 | `SERVE_FRONTEND` | off | serve the static UI from the API |
 | `CORS_ORIGINS` | `*` (any) | comma-separated allowed origins. **Browser-enforced only — not authentication**; it does nothing against `curl` or any non-browser client |
-| `JWT_SECRET` | unset | enables bearer-token auth on write/synthesis routes (see [Auth](#auth)); unset = open/dev |
+| `JWT_SECRET` | unset | bearer-token auth on the phrase and synthesis routes (see [Auth](#auth)); required when the server can generate |
+| `AUTH_DISABLED` | unset | `1` lets a server with a Gemini key or an upstream run without `JWT_SECRET` (local dev only) |
 | `JWT_AUDIENCE` / `JWT_ISSUER` | unset | optional — if set, tokens must carry a matching `aud`/`iss` claim |
 | `SYNC_BUCKET` / `SYNC_PREFIX` | — | pull the bank from S3 at container start (structured + quoted; preferred over `BANK_SYNC_CMD`) |
 | `BANK_SYNC_CMD` | — | escape hatch: arbitrary shell command run at container start to pull the bank into the volume. Runs via `sh -c` — **set it only from trusted configuration** |
@@ -357,11 +359,13 @@ SERVE_FRONTEND=1 .venv/bin/uvicorn src.server:app --port 8000
 
 ## Auth
 
-The API is **open by default** (dev mode). Setting `JWT_SECRET` turns on
-bearer-token auth for `POST /v1/speak`, `GET /v1/clip/{id}` and
-`POST /v1/gemini/tts` via an HS256
-`Authorization: Bearer <token>` check. Every other `GET` endpoint and `/health`
-stay public either way. A
+Setting `JWT_SECRET` turns on an HS256 `Authorization: Bearer <token>` check
+for `POST /v1/speak`, `GET /v1/clip/{id}`, `GET /v1/phrase`, `/v1/phrase/info`,
+`GET /v1/search` and `POST /v1/gemini/tts` (phrase text is client data: order
+numbers, names). Word-bank lookups, voices, languages and `/health` stay public.
+**Fail closed:** a server that can spend money (`GEMINI_API_KEY` /
+`GOOGLE_API_KEY`, or `SPEAK_UPSTREAM_URL`) refuses to start without
+`JWT_SECRET`; set `AUTH_DISABLED=1` to run it open on purpose (local dev). A
 missing/invalid/expired token gets a `401` with a `WWW-Authenticate: Bearer`
 header and a JSON `detail`. A token must carry `exp`. Optional `JWT_AUDIENCE` /
 `JWT_ISSUER` add `aud`/`iss` claim checks on top of the signature/expiry check.
@@ -496,4 +500,4 @@ pytest --integration tests/test_integration.py      # live Gemini (paid; one syn
 ## TODO
 
 - [ ] **Add multi-language support** — serving + `/v1/languages` are already data-driven (language-scoped lookup + `(lang, word)` index), so it's a word list + a Gemini batch run + a verified listen per language.
-- [x] **Add JWT auth** — bearer tokens (HS256, `JWT_SECRET`) protect `/v1/speak`, `/v1/clip` and `/v1/gemini/tts`; read-only bank endpoints stay public. See [Auth](#auth) above.
+- [x] **Add JWT auth** — bearer tokens (HS256, `JWT_SECRET`) protect the phrase and synthesis routes; word-bank lookups stay public; fail closed without a secret. See [Auth](#auth) above.

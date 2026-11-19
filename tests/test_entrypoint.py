@@ -188,3 +188,21 @@ def test_pack_archives_the_db_library_json_describes(tmp_path):
     bank = BankLookup(str(tmp_path / "unpacked" / "wordbank.db"))
     assert json.loads((repo / "library.json").read_text())["words"] == bank.count() == 1
     bank.close()
+
+
+def test_archive_with_a_symlink_is_not_unpacked(tmp_path):
+    """A link member could point a served clip (or the DB) anywhere on the host."""
+    pkg = _package(tmp_path)
+    with tarfile.open(pkg / "evil.tar.gz", "w:gz") as tar:
+        with tarfile.open(pkg / "tts-bank.tar.gz") as good:
+            for member in good.getmembers():
+                tar.addfile(member, good.extractfile(member) if member.isfile() else None)
+        link = tarfile.TarInfo("output/words_ogg/en-us/gemini-Kore/0/9_evil.ogg")
+        link.type, link.linkname = tarfile.SYMTYPE, "/etc/passwd"
+        tar.addfile(link)
+    (pkg / "evil.tar.gz").replace(pkg / "tts-bank.tar.gz")
+    data = tmp_path / "data"
+    _provision(pkg, data)
+    code, out = _entrypoint(data)
+    assert code == 1 and "contains symlinks or hard links; refusing to unpack it" in out
+    assert not (data / "wordbank.db").exists() and not (data / "words_ogg").exists()

@@ -12,9 +12,12 @@ set -euo pipefail
 archive="${1:-}"
 dest="${2:-tts-bank}"
 if [ -n "$archive" ] && [ -f "$archive" ]; then
+  if tar -tvzf "$archive" | grep -q '^[lh]'; then
+    echo "error: $archive contains symlinks or hard links; refusing to extract it" >&2; exit 1
+  fi
   echo "extracting $archive → $dest/"
   mkdir -p "$dest"
-  tar -xzf "$archive" -C "$dest"
+  tar -xzf "$archive" -C "$dest" --no-same-owner
   cd "$dest"
 else
   cd "$(dirname "$0")/.."               # already extracted — go to the root
