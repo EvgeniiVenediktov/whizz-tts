@@ -290,6 +290,29 @@ def test_collect_fails_words_of_jobs_without_results_and_keeps_going(tmp_path):
     m.close()
 
 
+def test_a_job_that_is_gone_fails_its_words_and_the_others_are_collected(tmp_path):
+    """A deleted job (or results past their 48 h) answers 404 (403 for the
+    file); it used to abort the collect of every job, every time."""
+    class Gone(Exception):
+        code = 404
+
+    class OneGone(FakeBatch):
+        def poll(self, job_name):
+            if job_name == "job-1":
+                raise Gone("404 NOT_FOUND")
+            return super().poll(job_name)
+    m = Manifest(str(tmp_path / "wb.db"))
+    m.add_words(list("abcd"), "en")
+    batch = OneGone()
+    submit_pending(m, batch, lang="en", chunk=2, log=quiet)
+    collect_active(m, batch, str(tmp_path / "out"), sleep=lambda *_: None, log=quiet)
+    rows = {r["word"]: r for r in m.iter_rows()}
+    assert [rows[w]["status"] for w in "abcd"] == [FAILED, FAILED, DONE, DONE]
+    assert rows["a"]["error"].startswith("batch job gone")
+    assert m.active_batch_ids() == []
+    m.close()
+
+
 def test_jobs_that_always_expire_stop_at_the_attempt_budget(tmp_path):
     """Each submission is one attempt, so words whose jobs keep expiring are
     retried up to max_attempts (3) and then left FAILED — no endless waves."""

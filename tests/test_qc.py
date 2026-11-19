@@ -3,11 +3,13 @@
 --retry re-take flagged words over the faked Gemini transports."""
 import csv
 
+import pytest
+
 from tests.conftest import clip_pcm16, interaction_resp
 from wordbank import qc
 from wordbank.gemini_batch import write_wav_from_pcm_bytes
 from wordbank.gemini_tts import pcm_to_wav_bytes
-from wordbank.manifest import DONE, Manifest
+from wordbank.manifest import DONE, RETAKE, Manifest
 
 LITE = "gemini-3.8-flash-lite-tts"
 VOICE = "en-gb-tutor-11"
@@ -129,3 +131,22 @@ def test_accepted_clips_are_neither_reflagged_nor_retaken(tmp_path, gemini_api, 
     m.reset([tom["id"]])
     m.close()
     assert _rows(tmp_path)["tom"]["qc_accepted"] == 0
+
+
+def test_held_takes_of_two_banks_in_one_directory_do_not_collide(tmp_path):
+    assert qc.retake_path(str(tmp_path / "a.db"), 1) != qc.retake_path(str(tmp_path / "b.db"), 1)
+
+
+def test_accepting_a_clip_that_waits_for_a_retake_is_refused(tmp_path):
+    """Its take is held outside the bank: accepting it would leave it unserved
+    and still re-taken by the next batch."""
+    _bank(tmp_path, {"haha": clip_pcm16(end_db=-25)})
+    m = Manifest(str(tmp_path / "wb.db"))
+    [row] = m.iter_rows()
+    m.set_status(row["id"], RETAKE, file_path=row["file_path"], check=qc.check_pcm(clip_pcm16()))
+    m.close()
+    keep = tmp_path / "keep.txt"
+    keep.write_text("haha\n")
+    with pytest.raises(SystemExit, match="haha wait.s. for a QC re-take"):
+        _cli(tmp_path, "qc", "--accept-file", str(keep))
+    assert _rows(tmp_path)["haha"]["qc_accepted"] == 0

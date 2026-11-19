@@ -204,7 +204,8 @@ class Manifest:
         - a row not generated yet (ingested without a voice: pending, failed,
           or in flight in a batch) takes its language's voice when that
           language's clips are all in one voice — the voice the run that
-          ingested it was for, since the old key held one voice per word. Left
+          ingested it was for, since the old key held one voice per word (a
+          row in flight keeps NULL: the batch it is in may be another's). Left
           NULL, a second voice's run could claim it. What stays NULL (no or
           several voices in its language, done clips whose path has none) is
           unattributed — see the module docstring.
@@ -218,9 +219,9 @@ class Manifest:
         for lang, voice in self._conn.execute(
                 "SELECT lang, MIN(voice) FROM words WHERE voice IS NOT NULL "
                 "GROUP BY lang HAVING COUNT(DISTINCT voice) = 1").fetchall():
-            self._conn.execute(
+            self._conn.execute(       # not SUBMITTED: its batch's voice may be any
                 "UPDATE words SET voice = ? WHERE lang = ? AND voice IS NULL "
-                "AND status != ?", (voice, lang, DONE))
+                "AND status NOT IN (?, ?)", (voice, lang, DONE, SUBMITTED))
 
     def close(self) -> None:
         with self._lock:
@@ -278,6 +279,16 @@ class Manifest:
             params.append(limit)
         with self._lock:
             return self._conn.execute(sql, params).fetchall()
+
+    def claim(self, row_id: int, voice: str) -> bool:
+        """Give an unattributed row `voice` before generating it; False when
+        another voice's run claimed it first."""
+        with self._lock:
+            n = self._conn.execute(f"UPDATE {self.table} SET voice = ? WHERE id = ? "
+                                   "AND (voice IS NULL OR voice = ?)",
+                                   (voice, row_id, voice)).rowcount
+            self._conn.commit()
+        return n == 1
 
     def start_attempt(self, row_id: int) -> int:
         """Mark an entry in-progress, increment attempts, return the new count."""
@@ -339,14 +350,15 @@ class Manifest:
         a QC re-take doesn't: its row was generated, it counts in qc_takes).
         `voice` (claiming an unattributed row) and `model`/`style` record the
         request now, since a later collect (possibly another process) doesn't
-        know it."""
+        know it. A row another voice's batch claimed meanwhile is left to it."""
         now = time.time()
         with self._lock:
             self._conn.executemany(
                 f"UPDATE {self.table} SET status = ?, batch_id = ?, voice = COALESCE(voice, ?), "
                 f"attempts = attempts + (status != '{RETAKE}'), {_PROVENANCE_SQL}, "
-                "updated_at = ? WHERE id = ?",
-                [(SUBMITTED, batch_id, voice, model, model, style, now, wid) for wid in row_ids],
+                "updated_at = ? WHERE id = ? AND (voice IS NULL OR voice = COALESCE(?, voice))",
+                [(SUBMITTED, batch_id, voice, model, model, style, now, wid, voice)
+                 for wid in row_ids],
             )
             self._conn.commit()
 

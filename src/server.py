@@ -388,8 +388,9 @@ def _bank_voice_headers(source: str, voice: Optional[str]) -> dict:
 def _speak_bank_hit(text: str, lang: str, voice: Optional[str], eff_voice: str):
     """The banked recording /v1/speak should serve, or None. Single tokens may be
     in the word bank; anything may be in the phrase bank. Without a `voice`,
-    the default voice (`eff_voice`) is preferred in both. A manifest row whose
-    OGG is missing on disk is a MISS."""
+    the default voice (`eff_voice`) is preferred in both. A row whose OGG is
+    missing on disk is passed over (a phrase may have a later row that holds
+    it: one saved in other casing)."""
     if not any(c.isspace() for c in text):
         row = app.state.bank.get(text, lang, voice=voice, prefer=eff_voice)
         if row is not None and os.path.exists(_ogg_abs(row["file_path"])):
@@ -397,10 +398,10 @@ def _speak_bank_hit(text: str, lang: str, voice: Optional[str], eff_voice: str):
             return _serve_audio(row["file_path"], "ogg",
                                 headers=_bank_voice_headers("bank", row_voice))
     for pinned in ([eff_voice] if voice else [eff_voice, None]):
-        row = app.state.bank.get_phrase(text, lang, voice=pinned)
-        if row is not None and os.path.exists(_ogg_abs(row["file_path"])):
-            return _serve_audio(row["file_path"], "ogg",
-                                headers=_bank_voice_headers("bank", row["voice"]))
+        for row in app.state.bank.phrases(text, lang, voice=pinned):
+            if os.path.exists(_ogg_abs(row["file_path"])):
+                return _serve_audio(row["file_path"], "ogg",
+                                    headers=_bank_voice_headers("bank", row["voice"]))
     return None
 
 
@@ -598,7 +599,7 @@ async def speak(
         return _clip_response(await generate())
     if (hit := _speak_bank_hit(text, lang, voice, eff_voice)) is not None:
         return hit
-    key = (text.lower(), lang, eff_voice)
+    key = (text.casefold(), lang, eff_voice)
     if not _speak_store():
         return _clip_response(await _coalesced(key, generate))
     async with _single_flight(key):

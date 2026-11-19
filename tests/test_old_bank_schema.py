@@ -186,11 +186,12 @@ def test_manifest_migrates_the_old_word_key_keeping_rows_and_ids(tmp_path):
 
     m = Manifest(db)
     rows = {r["id"]: r for r in m.iter_rows()}
+    # emu is in flight: its batch may be another voice's, so it stays unattributed
     assert [(r["word"], r["voice"]) for r in rows.values()] == [
-        ("cat", "en-gb-tutor-11"), ("dog", "Kore"), ("emu", "en-gb-tutor-11"), ("gnu", None)]
+        ("cat", "en-gb-tutor-11"), ("dog", "Kore"), ("emu", None), ("gnu", None)]
     before = [dict(r) for r in m.iter_rows()]
 
-    assert m.add_words(["cat", "emu"], "en-gb", voice="en-gb-tutor-14") == 2
+    assert m.add_words(["cat", "emu"], "en-gb", voice="en-gb-tutor-14") == 1
     assert m.get_entry("cat", "en-gb", "en-gb-tutor-14")["id"] == 6   # 5 is never reused
     assert m.add_words(["gnu"], "fr-fr", voice="fr-fr-x") == 0        # claimed by generating
     assert [r["word"] for r in m.pending(lang="fr-fr", voice="fr-fr-x")] == ["gnu"]
@@ -200,7 +201,7 @@ def test_manifest_migrates_the_old_word_key_keeping_rows_and_ids(tmp_path):
 
     m = Manifest(db)                           # reopen: no second migration
     assert [dict(r) for r in m.iter_rows()][:4] == before
-    assert len(m.iter_rows()) == 6
+    assert len(m.iter_rows()) == 5
     m.close()
     bank = BankLookup(db)
     assert bank.get("dog", "en-us", voice="Kore")["file_path"] == "en/gemini-Kore/0/2_dog.wav"

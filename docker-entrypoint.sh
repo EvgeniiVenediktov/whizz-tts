@@ -39,11 +39,23 @@ BANK_DB="${BANK_DB:-/data/wordbank.db}"
 DATA_DIR="$(dirname "$BANK_DB")"
 LIBRARY_DESC="${LIBRARY_DESC:-$DATA_DIR/library.json}"
 LIBRARY_ARCHIVE="${LIBRARY_ARCHIVE:-$DATA_DIR/tts-bank.tar.gz}"
+UNPACK_FAILED="$DATA_DIR/.unpack-failed"   # cksum of an archive that failed verification once unpacked
 
 # Mirrors src/server.py's /health rule: any synthesis path can serve with no bank
 # (Gemini, or an upstream server in edge mode).
 can_synthesize() {
     [ -n "${GEMINI_API_KEY:-}${GOOGLE_API_KEY:-}${SPEAK_UPSTREAM_URL:-}" ]
+}
+
+# Move the live DB, -wal/-shm included, aside before it is replaced: it is never
+# overwritten, and a stale -wal is never replayed onto another file.
+move_db_aside() {
+    [ -f "$BANK_DB" ] || return 0
+    backup="$(mktemp "$BANK_DB.pre-$1-$(date +%Y%m%d-%H%M%S)-XXXXXX")"
+    for ext in "" -wal -shm; do
+        if [ -f "$BANK_DB$ext" ]; then mv "$BANK_DB$ext" "$backup$ext"; fi
+    done
+    echo "[entrypoint] existing $BANK_DB moved to $backup before the $1"
 }
 
 # Shared explanation for "nothing usable" failures.
@@ -72,7 +84,9 @@ if [ -n "$SYNC_BUCKET" ] && [ -n "$SYNC_PREFIX" ]; then
         echo "[entrypoint] syncing bank via structured params: s3://$SYNC_BUCKET/$SYNC_PREFIX -> $DATA_DIR"
         mkdir -p "$DATA_DIR/words_ogg"
         aws s3 sync "s3://$SYNC_BUCKET/$SYNC_PREFIX/words_ogg" "$DATA_DIR/words_ogg"
-        aws s3 cp "s3://$SYNC_BUCKET/$SYNC_PREFIX/wordbank.db" "$DATA_DIR/wordbank.db"
+        aws s3 cp "s3://$SYNC_BUCKET/$SYNC_PREFIX/wordbank.db" "$BANK_DB.sync"
+        move_db_aside sync
+        mv "$BANK_DB.sync" "$BANK_DB"
     else
         echo "[entrypoint] ERROR: SYNC_BUCKET/SYNC_PREFIX set but no 'aws' CLI in this image (the bank-only build ships no cloud CLI to keep it small)." >&2
         echo "[entrypoint]   Fix: use BANK_SYNC_CMD instead (it can invoke any tool you install), or build a variant image with awscli installed." >&2
@@ -87,26 +101,18 @@ fi
 
 if python -m wordbank verify --desc "$LIBRARY_DESC" --root "$DATA_DIR"; then
     echo "[entrypoint] library verified — starting"
-elif [ -f "$LIBRARY_ARCHIVE" ]; then
+elif [ -f "$LIBRARY_ARCHIVE" ] && [ "$(cksum < "$LIBRARY_ARCHIVE")" != "$(cat "$UNPACK_FAILED" 2>/dev/null)" ]; then
     echo "[entrypoint] volume not provisioned — unpacking $LIBRARY_ARCHIVE -> $DATA_DIR"
     mkdir -p "$DATA_DIR"
-    # A DB already here (e.g. phrases /v1/speak saved before the archive was
-    # added) would be overwritten by the archive's, and a leftover -wal could be
-    # replayed onto the new file. Move it aside, WAL/SHM included, so nothing is
-    # lost or corrupted; its phrases can be merged back from the backup.
-    if [ -f "$BANK_DB" ]; then
-        backup="$BANK_DB.pre-unpack-$(date +%Y%m%d-%H%M%S)"
-        for ext in "" -wal -shm; do
-            if [ -f "$BANK_DB$ext" ]; then mv "$BANK_DB$ext" "$backup$ext"; fi
-        done
-        echo "[entrypoint] existing $BANK_DB moved to $backup before unpacking"
-    fi
+    # e.g. phrases /v1/speak saved before the archive was added: kept in the backup
+    move_db_aside unpack
     tar xzf "$LIBRARY_ARCHIVE" -C "$DATA_DIR" --strip-components=1 output/words_ogg
     tar xzf "$LIBRARY_ARCHIVE" -C "$DATA_DIR" wordbank.db
     tar xzf "$LIBRARY_ARCHIVE" -C "$DATA_DIR" library.json 2>/dev/null || true
     if python -m wordbank verify --desc "$LIBRARY_DESC" --root "$DATA_DIR"; then
         echo "[entrypoint] library verified after unpack — starting"
-    elif can_synthesize; then
+    # failed: recorded, so this archive isn't unpacked again on every boot
+    elif cksum < "$LIBRARY_ARCHIVE" > "$UNPACK_FAILED" && can_synthesize; then
         echo "[entrypoint] WARNING: still invalid after unpacking $LIBRARY_ARCHIVE (see verification problems above) — synthesis is available (GEMINI_API_KEY / SPEAK_UPSTREAM_URL), continuing in synthesis-only mode (bank unavailable)"
     else
         echo "[entrypoint] ERROR: still invalid after unpacking $LIBRARY_ARCHIVE (see verification problems above)." >&2
@@ -119,7 +125,11 @@ elif [ ! -f "$LIBRARY_DESC" ] && [ -f "$BANK_DB" ] && can_synthesize; then
     # runtime by /v1/speak, so there is no description to verify it against.
     echo "[entrypoint] no library description at $LIBRARY_DESC — serving the bank built at runtime ($BANK_DB) + synthesis for misses"
 else
-    echo "[entrypoint] volume not provisioned and no archive at $LIBRARY_ARCHIVE"
+    if [ -f "$LIBRARY_ARCHIVE" ]; then
+        echo "[entrypoint] $LIBRARY_ARCHIVE failed verification when unpacked before; not unpacking it again (delete $UNPACK_FAILED to retry)"
+    else
+        echo "[entrypoint] volume not provisioned and no archive at $LIBRARY_ARCHIVE"
+    fi
     if can_synthesize; then
         echo "[entrypoint] WARNING: no bank and no archive — synthesis is available (GEMINI_API_KEY / SPEAK_UPSTREAM_URL), continuing in synthesis-only mode (bank unavailable)"
     else

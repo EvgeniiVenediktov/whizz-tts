@@ -84,6 +84,22 @@ def _rows(bank):
     return {r["word"]: r for r in bank.m.iter_rows()}
 
 
+def test_a_row_another_voices_run_claimed_is_skipped(bank):
+    """Runs for two voices both list the same unattributed rows; the first to
+    reach a row claims it, the other skips it."""
+    other, haha = Manifest(bank.m.path), _rows(bank)["haha"]["id"]
+    synth = FakeSynth(bank.t)
+
+    def racing(text, **kw):
+        if text == "laughing":                  # meanwhile, a tutor-14 run takes haha
+            assert other.claim(haha, "en-gb-tutor-14")
+        return synth(text, **kw)
+    assert _run(bank, racing)["done"] == len(WORDS) - 1
+    other.close()
+    assert "haha" not in [c[0] for c in synth.calls]
+    assert (_rows(bank)["haha"]["voice"], _rows(bank)["haha"]["status"]) == ("en-gb-tutor-14", PENDING)
+
+
 def test_writes_the_batch_layout_with_provenance(bank):
     result = _run(bank, FakeSynth(bank.t))
     assert result == {"done": 5, "failed": 0, "flagged": 0, "resolved": 0, "stopped": None}
@@ -237,7 +253,7 @@ def test_regenerate_moves_the_take_and_resets_the_rows(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "not-a-word" in out and "reset 2 word(s)" in out
     [take] = (tmp_path / "takes").iterdir()
-    assert take.name.endswith("Z")                              # UTC stamp
+    assert take.name[15:17] == "Z-"                             # <UTC stamp>-<unique>
     m = Manifest(str(tmp_path / "wb.db"))
     rows = {r["word"]: r for r in m.iter_rows()}
     m.close()
@@ -256,6 +272,29 @@ def test_regenerate_moves_the_take_and_resets_the_rows(tmp_path, capsys):
     assert [(e["word"], e["wav"], e["ogg"], e["model"], e["style"]) for e in listing] == [
         (w, f"wav/{rows[w]['id']}_{w}.wav", f"ogg/{rows[w]['id']}_{w}.ogg",
          "gemini-3.1-flash-tts-preview", "old") for w in ("laughing", "haha")]
+
+
+def test_take_dirs_are_unique_and_list_each_clip_as_it_moves(tmp_path, monkeypatch):
+    """Two runs in one second get two take dirs; a run interrupted after its
+    first move still says in words.json where that clip went."""
+    import shutil
+    _done_bank(tmp_path, ["laughing", "haha", "calling"])
+    words = tmp_path / "regen.txt"
+    words.write_text("laughing\n")
+    _cli(tmp_path, "regenerate", "--words-file", str(words))
+    words.write_text("haha\ncalling\n")
+    move, moves = shutil.move, []
+
+    def fail_second(src, dest):
+        moves.append(dest)
+        if len(moves) > 1:
+            raise OSError("disk full")
+        return move(src, dest)
+    monkeypatch.setattr(shutil, "move", fail_second)
+    with pytest.raises(OSError):
+        _cli(tmp_path, "regenerate", "--words-file", str(words))
+    assert sorted([e["word"] for e in json.loads((d / "words.json").read_text())]
+                  for d in (tmp_path / "takes").iterdir()) == [["haha"], ["laughing"]]
 
 
 def test_regenerate_then_gemini_run_makes_a_new_take(tmp_path, gemini_api):

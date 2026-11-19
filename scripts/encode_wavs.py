@@ -4,7 +4,8 @@
   output/words_ogg/...       (OGG copies, mirrored structure)
 
 Defaults: 16 kbps, libopus VoIP mode (tuned for speech) → ~3 KB/word. ffmpeg work
-is parallelized; existing copies are skipped unless --force. Prints space saved.
+is parallelized; a copy newer than its WAV is skipped unless --force (a WAV
+written again, e.g. a re-take, is re-encoded). Prints space saved.
 
   python scripts/encode_wavs.py output/words output/words_ogg              # 16k voip
   python scripts/encode_wavs.py output/words output/words_ogg --force      # re-encode all
@@ -29,7 +30,7 @@ def encode_one(wav: pathlib.Path, src_root: str, dest_root: str, bitrate: str,
         return (str(wav), 0, 0, "outside src root")
     dest = pathlib.Path(dest)
     wav_bytes = wav.stat().st_size
-    if dest.exists() and not force:
+    if dest.exists() and not force and dest.stat().st_mtime >= wav.stat().st_mtime:
         return (str(wav), wav_bytes, dest.stat().st_size, "skip")
     dest.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -53,7 +54,7 @@ def main() -> None:
                    choices=["voip", "audio", "lowdelay"],
                    help="libopus mode; 'voip' is tuned for speech at low bitrates")
     p.add_argument("--force", action="store_true",
-                   help="re-encode even if the OGG copy already exists")
+                   help="re-encode even OGG copies newer than their WAV")
     args = p.parse_args()
 
     wavs = sorted(pathlib.Path(args.src).rglob("*.wav"))

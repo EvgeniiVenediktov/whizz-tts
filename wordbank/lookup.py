@@ -67,6 +67,8 @@ class BankLookup:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA query_only = ON")
             conn.create_function("voice_label", 1, voice_label, deterministic=True)
+            # phrase text is matched case-insensitively beyond ASCII ("Привет")
+            conn.create_function("casefold", 1, str.casefold, deterministic=True)
             self._conn = conn
 
     @property
@@ -132,18 +134,21 @@ class BankLookup:
             return voiced(voice)
         return (voiced(prefer) if prefer else None) or (rows[0] if rows else None)
 
-    def get_phrase(self, text: str, lang: str = "en",
-                   voice: Optional[str] = None) -> Optional[sqlite3.Row]:
-        """Exact phrase match (case-insensitive), the earliest banked, or None;
-        `voice` pins it (a legacy "gemini-Kore" row matches "Kore")."""
+    def phrases(self, text: str, lang: str = "en", voice: Optional[str] = None) -> list:
+        """Every ready row of an exact phrase match (case-insensitive), earliest
+        banked first; `voice` pins it (a legacy "gemini-Kore" row matches "Kore")."""
         sql = (f"SELECT text, lang, file_path, status, {_PHRASE_VOICE_SQL} AS voice FROM phrases "
-               f"WHERE LOWER(text) = LOWER(?) AND lang = ? AND {_READY_SQL}")
+               f"WHERE casefold(text) = casefold(?) AND lang = ? AND {_READY_SQL}")
         params = [text.strip(), lang]
         if voice is not None:
             sql += f" AND {_PHRASE_VOICE_SQL} = ?"
             params.append(voice)
-        rows = self._query(sql + " ORDER BY id LIMIT 1", params)
-        return rows[0] if rows else None
+        return self._query(sql + " ORDER BY id", params)
+
+    def get_phrase(self, text: str, lang: str = "en",
+                   voice: Optional[str] = None) -> Optional[sqlite3.Row]:
+        """The earliest banked of phrases(), or None."""
+        return next(iter(self.phrases(text, lang, voice)), None)
 
     def search(self, prefix: str, lang: str = "en", limit: int = 10,
                kind: Optional[str] = None, voice: Optional[str] = None) -> List[dict]:
@@ -164,8 +169,8 @@ class BankLookup:
         if p and kind in (None, "phrase"):
             # DISTINCT: one result for a text banked under both label spellings
             sql = (f"SELECT DISTINCT text, 'phrase' AS type, {_PHRASE_VOICE_SQL} AS voice FROM phrases "
-                   f"WHERE lang = ? AND LOWER(text) LIKE ? ESCAPE '\\' AND {_READY_SQL}")
-            params += [lang, _like_prefix(p)]
+                   f"WHERE lang = ? AND casefold(text) LIKE ? ESCAPE '\\' AND {_READY_SQL}")
+            params += [lang, _like_prefix(prefix.strip().casefold())]
             if voice is not None:
                 sql += f" AND {_PHRASE_VOICE_SQL} = ?"
                 params.append(voice)

@@ -115,6 +115,8 @@ def best_take(*takes):
 
 def retake_path(db_path: str, row_id: int) -> pathlib.Path:
     """Where a batch row queued for a QC re-take (status `retake`) keeps its
-    best take so far: <db dir>/takes/qc/<id>.wav, outside the bank tree, so
-    scripts/encode_wavs.py never encodes a take that may still be replaced."""
-    return pathlib.Path(db_path).resolve().parent / "takes" / "qc" / f"{row_id}.wav"
+    best take so far: <db dir>/takes/qc/<db name>/<id>.wav, outside the bank
+    tree, so scripts/encode_wavs.py never encodes a take that may still be
+    replaced (the db name keeps two banks in one directory apart)."""
+    db = pathlib.Path(db_path).resolve()
+    return db.parent / "takes" / "qc" / db.stem / f"{row_id}.wav"

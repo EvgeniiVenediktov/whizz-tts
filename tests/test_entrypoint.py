@@ -6,11 +6,13 @@ for uvicorn, so each case shows whether the container would start and why.
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tarfile
 
 from wordbank.library import describe
+from wordbank.lookup import BankLookup
 from wordbank.manifest import DONE, Manifest
 
 REPO_ROOT = pathlib.Path(__file__).parent.parent
@@ -35,7 +37,7 @@ def _add_phrase(db, ogg_root, text, voice, pid):
     ogg.write_bytes(b"OggS")
 
 
-def _package(tmp_path):
+def _package(tmp_path, **desc_override):
     """A packaged library as scripts/pack.sh lays it out: library.json +
     tts-bank.tar.gz holding wordbank.db and output/words_ogg."""
     src = tmp_path / "src"
@@ -49,7 +51,8 @@ def _package(tmp_path):
         ogg.parent.mkdir(parents=True, exist_ok=True)
         ogg.write_bytes(b"OggS")
     m.close()
-    desc = describe(str(src / "wordbank.db"), str(src / "output" / "words_ogg"))
+    desc = {**describe(str(src / "wordbank.db"), str(src / "output" / "words_ogg")),
+            **desc_override}
     (src / "library.json").write_text(json.dumps(desc))
     pkg = tmp_path / "pkg"
     pkg.mkdir()
@@ -122,3 +125,66 @@ def test_unpack_over_an_existing_bank_keeps_it_as_a_backup(tmp_path):
     new = Manifest(str(data / "wordbank.db"))
     assert sorted(r["word"] for r in new.iter_rows()) == ["cat", "dog"]
     new.close()
+
+
+def test_an_archive_that_failed_verification_is_not_unpacked_on_every_boot(tmp_path):
+    """Each unpack moves the live DB aside: phrases served since would vanish
+    from the bank on every restart."""
+    data = tmp_path / "data"
+    _provision(_package(tmp_path, words=99), data)
+    code, out = _entrypoint(data, GEMINI_API_KEY="k")
+    assert code == 0 and "still invalid after unpacking" in out
+
+    _add_phrase(data / "wordbank.db", data / "words_ogg", "good morning", "Puck", 1)
+    code, out = _entrypoint(data, GEMINI_API_KEY="k")
+    assert code == 0 and "not unpacking it again" in out
+    assert not list(data.glob("wordbank.db.pre-*"))
+
+
+def test_sync_moves_the_live_db_aside_with_its_wal(tmp_path):
+    """The synced DB replaces the live one: a -wal left next to it would be
+    replayed onto the wrong file."""
+    data, bin_dir = tmp_path / "data", tmp_path / "bin"
+    data.mkdir()
+    bin_dir.mkdir()
+    _add_phrase(data / "wordbank.db", data / "words_ogg", "good morning", "Puck", 1)
+    (data / "wordbank.db-wal").write_bytes(b"live wal")
+    _package(tmp_path)
+    aws = bin_dir / "aws"           # "s3 sync SRC DST" | "s3 cp SRC DST", from a local "bucket"
+    aws.write_text(f'#!/bin/sh\n[ "$2" = cp ] && cp "{tmp_path}/src/wordbank.db" "$4" || mkdir -p "$4"\n')
+    aws.chmod(0o755)
+    code, out = _entrypoint(data, GEMINI_API_KEY="k", SYNC_BUCKET="b", SYNC_PREFIX="p",
+                            PATH=f"{bin_dir}:{pathlib.Path(sys.executable).parent}:{os.environ['PATH']}")
+    assert code == 0, out
+    [backup] = data.glob("wordbank.db.pre-sync-*[!wl]")
+    assert pathlib.Path(f"{backup}-wal").read_bytes() == b"live wal"
+    bank = BankLookup(str(data / "wordbank.db"))
+    assert bank.count() == 2
+    bank.close()
+
+
+def test_pack_archives_the_db_library_json_describes(tmp_path):
+    """describe reads through the WAL while tar copies files: the archive must
+    hold a snapshot with the WAL's rows, or every boot re-unpacks it."""
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True)
+    shutil.copy(REPO_ROOT / "scripts" / "pack.sh", repo / "scripts")
+    for name in ("wordbank", "src", "frontend", ".venv", "requirements.txt",
+                 "requirements-base.txt", "README.md", "AGENTS.md", "pytest.ini", "Dockerfile",
+                 "docker-compose.yml", "docker-entrypoint.sh"):
+        (repo / name).symlink_to(REPO_ROOT / name)
+    m = Manifest(str(repo / "wordbank.db"))         # held open: its rows stay in the -wal
+    m.add_words(["cat"], "en-us", voice="Kore")
+    m.set_status(m.iter_rows()[0]["id"], DONE, file_path="en-us/gemini-Kore/0/1_cat.wav")
+    ogg = repo / "output" / "words_ogg" / "en-us" / "gemini-Kore" / "0" / "1_cat.ogg"
+    ogg.parent.mkdir(parents=True)
+    ogg.write_bytes(b"OggS")
+    try:
+        subprocess.run(["bash", str(repo / "scripts" / "pack.sh")], check=True, capture_output=True)
+    finally:
+        m.close()
+    with tarfile.open(repo / "tts-bank.tar.gz") as tar:
+        tar.extract("wordbank.db", tmp_path / "unpacked", filter="data")
+    bank = BankLookup(str(tmp_path / "unpacked" / "wordbank.db"))
+    assert json.loads((repo / "library.json").read_text())["words"] == bank.count() == 1
+    bank.close()

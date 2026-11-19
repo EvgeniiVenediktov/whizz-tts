@@ -121,6 +121,9 @@ def run_sync(manifest: Manifest, out_dir: str, *, lang: str, voice: str, model: 
     consecutive = 0
     for n, row in enumerate(rows, start=1):
         word = row["word"]
+        if not manifest.claim(row["id"], voice):    # an unattributed row: first run wins
+            log(f"  {word!r}: claimed by another voice's run, skipped")
+            continue
         while True:
             attempt = manifest.start_attempt(row["id"])
             try:

@@ -13,6 +13,7 @@ description) · status · export.
 """
 import argparse
 import csv
+import json
 import os
 import pathlib
 import sys
@@ -208,21 +209,25 @@ def cmd_gemini_run(args, cfg: Config) -> None:
 
 
 def _take_dir(cfg: Config) -> pathlib.Path:
-    """<db dir>/takes/<UTC>/: where replaced takes are moved, with a words.json."""
+    """A new <db dir>/takes/<UTC>-<random>/: where replaced takes are moved,
+    with a words.json."""
     import datetime
+    import tempfile
+    root = pathlib.Path(cfg.db).resolve().parent / "takes"
+    root.mkdir(parents=True, exist_ok=True)
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    return pathlib.Path(cfg.db).resolve().parent / "takes" / stamp
+    return pathlib.Path(tempfile.mkdtemp(prefix=f"{stamp}-", dir=root))
 
 
 def _take_roots(cfg: Config, ogg_root: Optional[str]) -> list:
     return [("wav", cfg.out_dir, ".wav")] + ([("ogg", ogg_root, ".ogg")] if ogg_root else [])
 
 
-def _archive_take(cfg: Config, row, take_dir: pathlib.Path, roots) -> dict:
+def _archive_take(cfg: Config, row, take_dir: pathlib.Path, roots, listing: list) -> None:
     """Move a row's current take out of the bank trees into take_dir/{wav,ogg}/
-    -> its words.json entry. Moved, not copied: encode_wavs.py skips existing
-    OGGs, so a stale copy left in place would never be re-encoded. A row queued
-    for a QC re-take holds its take outside the bank (qc.retake_path)."""
+    and add its entry to `listing`, rewriting take_dir/words.json at once (an
+    interrupted run still says what moved where). A row queued for a QC
+    re-take holds its take outside the bank (qc.retake_path)."""
     import shutil
     from .paths import safe_filename
     from .qc import retake_path
@@ -242,14 +247,8 @@ def _archive_take(cfg: Config, row, take_dir: pathlib.Path, roots) -> dict:
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(src), str(dest))
             entry[kind] = str(dest.relative_to(take_dir))
-    return entry
-
-
-def _write_listing(take_dir: pathlib.Path, listing: list) -> None:
-    import json
-    take_dir.mkdir(parents=True, exist_ok=True)
-    (take_dir / "words.json").write_text(json.dumps(listing, indent=1) + "\n",
-                                         encoding="utf-8")
+    listing.append(entry)
+    (take_dir / "words.json").write_text(json.dumps(listing, indent=1) + "\n", encoding="utf-8")
 
 
 def cmd_regenerate(args, cfg: Config) -> None:
@@ -273,11 +272,10 @@ def cmd_regenerate(args, cfg: Config) -> None:
         if not rows:
             sys.exit(f"none of the {len(words)} word(s) in {args.words_file} is in the {bank}")
 
-        take_dir = _take_dir(cfg)
-        roots = _take_roots(cfg, args.ogg_root)
-        listing = [_archive_take(cfg, row, take_dir, roots) for row in rows]
+        take_dir, roots, listing = _take_dir(cfg), _take_roots(cfg, args.ogg_root), []
+        for row in rows:
+            _archive_take(cfg, row, take_dir, roots, listing)
         m.reset([r["id"] for r in rows])
-        _write_listing(take_dir, listing)
     finally:
         m.close()
 
@@ -323,6 +321,10 @@ def cmd_qc(args, cfg: Config) -> None:
         if args.accept_file:
             keep = set(_load_words(args.accept_file))
             accept = [r for r in in_scope if r["word"] in keep]
+            waiting = [r["word"] for r in accept if r["status"] == RETAKE]
+            if waiting:     # its take is held outside the bank: nothing to accept yet
+                sys.exit(f"--accept-file: {', '.join(waiting)} wait(s) for a QC re-take "
+                         "(status retake); re-take first (qc --retry, or the next batch)")
             m.accept_qc([r["id"] for r in accept])
             print(f"accepted {len(accept)} clip(s) ({scope}); "
                   f"{len(keep - {r['word'] for r in accept})} listed word(s) not in scope")
@@ -365,9 +367,6 @@ def cmd_qc(args, cfg: Config) -> None:
         print(f"wrote {args.csv} ({len(still)} still flagged)")
     if replaced:
         print(f"replaced {replaced} clip(s); previous takes in {take_dir}")
-        if not args.ogg_root:
-            print("  no --ogg-root: their old OGG copies are still in place and encode_wavs.py "
-                  "skips existing OGGs - delete the .ogg of each file_path in words.json first")
         print(f"  python scripts/encode_wavs.py {cfg.out_dir} {args.ogg_root or '<ogg root>'}")
     elif flagged and not args.retry:
         print("re-take them: add --retry --model <model> [--style \"...\"]")
@@ -388,7 +387,7 @@ def _qc_retakes(args, cfg: Config, m: Manifest, flagged, checks, final, clip) ->
     take, sent_style, inline = sync_session(model=args.model, instruction=instruction,
                                             style=style, rpm=args.rpm)
     direction = sent_style or inline or None
-    take_dir, roots, listing = _take_dir(cfg), _take_roots(cfg, args.ogg_root), []
+    take_dir, roots, listing = None, _take_roots(cfg, args.ogg_root), []
     out = pathlib.Path(cfg.out_dir)
     print(f"re-taking {len(flagged)} flagged clip(s) with {args.model}, up to "
           f"{args.qc_retries} take(s) each, {args.rpm:g} rpm")
@@ -409,15 +408,14 @@ def _qc_retakes(args, cfg: Config, m: Manifest, flagged, checks, final, clip) ->
             else:
                 m.record_qc([(row["id"], check, takes)])
         else:
-            if row["status"] == RETAKE:
-                held.unlink()               # a held take never reached the bank
-            else:
-                listing.append(_archive_take(cfg, row, take_dir, roots))
+            if row["status"] != RETAKE:     # a held take never reached the bank
+                take_dir = take_dir or _take_dir(cfg)
+                _archive_take(cfg, row, take_dir, roots, listing)
             _write_and_mark(m, out, row["lang"], voice, row, pcm, model=args.model,
                             style=direction, check=check, qc_takes=takes)
+            if row["status"] == RETAKE:
+                held.unlink()               # only once the new take is filed
         final[row["id"]] = check
-    if listing:
-        _write_listing(take_dir, listing)
     return take_dir, len(listing)
 
 

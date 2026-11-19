@@ -142,6 +142,24 @@ def test_banked_row_whose_ogg_is_missing_is_regenerated(client):
     assert len(_phrase_rows(client.paths)) == 1
 
 
+def test_a_clip_saved_in_other_casing_is_served_past_a_row_whose_ogg_is_gone(client):
+    """The lowest-id match lost its OGG; the clip saved for the same text in
+    other casing must serve, or every request would pay Gemini again."""
+    _bank_phrase(client.paths, "Hello there", "Puck")
+    (client.paths.ogg / "en-us/Puck/0/Puck.ogg").unlink()
+    assert _speak(client, text="hello there", voice="Puck").headers["x-source"] == "gemini"
+    assert _speak(client, text="hello there", voice="Puck").headers["x-source"] == "bank"
+    assert len(client.gemini.calls) == 1
+
+
+def test_phrase_matching_ignores_case_beyond_ascii(client):
+    for text in ("Привет, мир", "привет, МИР"):
+        r = _speak(client, text=text, voice="Puck")
+    assert r.headers["x-source"] == "bank" and len(client.gemini.calls) == 1
+    assert [x["text"] for x in client.get("/v1/search", params={"prefix": "ПРИВ"}).json()["results"]] \
+        == ["Привет, мир"]
+
+
 def test_gemini_failure_is_502_and_saves_nothing(client):
     client.gemini.error = RuntimeError("quota exhausted")
     r = _speak(client, text="hello there", voice="Puck")

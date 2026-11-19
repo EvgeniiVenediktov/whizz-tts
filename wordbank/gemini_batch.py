@@ -215,11 +215,9 @@ class GeminiBatch:
         return None
 
     def result_lines(self, job) -> Iterable[dict]:
+        """The job's result lines; the results file is downloaded on the call."""
         content = self._get_client().files.download(file=job.dest.file_name)
-        for line in content.decode("utf-8").splitlines():
-            line = line.strip()
-            if line:
-                yield json.loads(line)
+        return (json.loads(line) for line in content.decode("utf-8").splitlines() if line.strip())
 
 
 # --- pipeline --------------------------------------------------------------
@@ -282,15 +280,27 @@ def _settle_take(manifest: Manifest, out_dir: pathlib.Path, row, pcm: Optional[b
     return "resolved" if row["qc_takes"] else "passed"
 
 
+# A job deleted (gemini_batch_cleanup.py), or a results file past its 48 h:
+# the Files API answers 403 "... or it may not exist" for a file that is gone.
+_GONE = (403, 404)
+
+
 def _collect(manifest: Manifest, batch: GeminiBatch, job_name: str,
              out_dir: pathlib.Path, poll_interval: float, sleep: Callable, log: Callable,
              qc_retries: int = qc.DEFAULT_RETRIES) -> None:
-    while True:
-        job = batch.poll(job_name)
-        if batch.is_done(job):
-            break
-        log(f"{job_name}: {getattr(job, 'state', '?')} — waiting {poll_interval}s")
-        sleep(poll_interval)
+    try:
+        while True:
+            job = batch.poll(job_name)
+            if batch.is_done(job):
+                break
+            log(f"{job_name}: {getattr(job, 'state', '?')} — waiting {poll_interval}s")
+            sleep(poll_interval)
+        why = batch.no_results_reason(job)
+        lines = () if why else batch.result_lines(job)
+    except Exception as exc:  # noqa: BLE001 - only a job that is gone is settled here
+        if getattr(exc, "code", None) not in _GONE:
+            raise
+        why, lines = f"batch job gone ({exc})", ()
 
     # Rows already settled (a collect interrupted half-way) are left alone.
     rows_by_key = {str(r["id"]): r for r in manifest.get_by_batch(job_name)
@@ -305,9 +315,8 @@ def _collect(manifest: Manifest, batch: GeminiBatch, job_name: str,
             outcome = "failed"
         outcomes[outcome] = outcomes.get(outcome, 0) + 1
 
-    why = batch.no_results_reason(job)
     if why:
-        # A FAILED/CANCELLED/EXPIRED job has nothing to download. Fail its words
+        # A FAILED/CANCELLED/EXPIRED or gone job has nothing to download. Fail its words
         # (the submission already spent one attempt) so pending() retries them
         # within max_attempts, rather than leaving them SUBMITTED for every
         # later collect to trip over again. A QC re-take keeps its held take.
@@ -317,7 +326,7 @@ def _collect(manifest: Manifest, batch: GeminiBatch, job_name: str,
         return
 
     seen = set()
-    for line in batch.result_lines(job):
+    for line in lines:
         key = str(line.get("key"))
         row = rows_by_key.get(key)
         if row is None:
