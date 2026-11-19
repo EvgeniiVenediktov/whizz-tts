@@ -29,8 +29,20 @@ _PHRASE_VOICE_SQL = ("CASE WHEN voice GLOB 'gemini-?*' THEN voice_label(voice) "
 
 
 def _prefix_upper(prefix: str) -> str:
-    """Smallest string strictly greater than every string starting with prefix."""
-    return prefix[:-1] + chr(ord(prefix[-1]) + 1)
+    """Smallest string strictly greater than every string starting with prefix.
+    U+10FFFF (a noncharacter, in no word) can't be incremented: carry into the
+    character before it; a prefix of nothing else gets "", which matches none.
+    The surrogates (unencodable) are skipped."""
+    head = prefix.rstrip("\U0010ffff")
+    if not head:
+        return ""
+    nxt = ord(head[-1]) + 1
+    return head[:-1] + chr(0xE000 if 0xD800 <= nxt < 0xE000 else nxt)
+
+
+def _like_prefix(prefix: str) -> str:
+    """A LIKE pattern (ESCAPE '\\') matching strings that start with `prefix`."""
+    return prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
 
 
 class BankLookup:
@@ -62,10 +74,6 @@ class BankLookup:
         with self._lock:
             self._open()
             return self._conn is not None
-
-    @property
-    def path(self) -> Optional[str]:
-        return os.path.abspath(self._db_path) if self._db_path else None
 
     def _query(self, sql: str, params=()) -> list:
         """Rows of `sql`, or [] while there is no bank file."""
@@ -156,8 +164,8 @@ class BankLookup:
         if p and kind in (None, "phrase"):
             # DISTINCT: one result for a text banked under both label spellings
             sql = (f"SELECT DISTINCT text, 'phrase' AS type, {_PHRASE_VOICE_SQL} AS voice FROM phrases "
-                   f"WHERE lang = ? AND LOWER(text) LIKE ? AND {_READY_SQL}")
-            params += [lang, p + "%"]
+                   f"WHERE lang = ? AND LOWER(text) LIKE ? ESCAPE '\\' AND {_READY_SQL}")
+            params += [lang, _like_prefix(p)]
             if voice is not None:
                 sql += f" AND {_PHRASE_VOICE_SQL} = ?"
                 params.append(voice)

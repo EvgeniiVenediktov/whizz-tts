@@ -24,7 +24,7 @@ def require_auth(request: Request) -> None:
 
     audience = os.getenv("JWT_AUDIENCE")
     issuer = os.getenv("JWT_ISSUER")
-    options = {} if audience else {"verify_aud": False}
+    options = {"require": ["exp"], "verify_aud": bool(audience)}
     try:
         jwt.decode(
             token, secret, algorithms=["HS256"],

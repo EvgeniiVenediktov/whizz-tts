@@ -364,6 +364,13 @@ class Manifest:
             )
             self._conn.commit()
 
+    def discard_unfinished(self, row_id: int) -> None:
+        """Delete the row unless it holds a clip (a save that failed midway)."""
+        with self._lock:
+            self._conn.execute(f"DELETE FROM {self.table} WHERE id = ? AND status != ?",
+                               (row_id, DONE))
+            self._conn.commit()
+
     def get_by_batch(self, batch_id: str):
         """Rows in a batch, in submission (id) order — aligns with inlined_responses."""
         with self._lock:

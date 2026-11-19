@@ -52,6 +52,8 @@ class FakeUpstream:
                 self.end_headers()
                 self.wfile.write(body)
 
+            do_GET = do_POST            # what urllib turns a redirected POST into
+
             def log_message(self, *args):
                 pass
 
@@ -177,6 +179,17 @@ def test_upstream_failures_map_to_clear_errors_and_save_nothing(edge, status, bo
     r = _speak(edge, text="hello there", voice="Puck")
     assert r.status_code == want_status and want_detail in r.json()["detail"]
     assert _phrases(edge.paths) == []
+
+
+def test_upstream_redirects_are_not_followed(edge):
+    """urllib would follow a 302 to any host, bearer token included."""
+    elsewhere = FakeUpstream()
+    try:
+        edge.upstream.respond = lambda f: (302, {"Location": elsewhere.url + "/v1/speak"}, b"")
+        assert _speak(edge, text="hello there").status_code == 502
+        assert elsewhere.requests == [] and _phrases(edge.paths) == []
+    finally:
+        elsewhere.server.shutdown()
 
 
 def test_unreachable_upstream_is_502(edge, monkeypatch):

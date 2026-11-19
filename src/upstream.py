@@ -14,6 +14,16 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Optional
 
+MAX_REPLY_BYTES = 5 * 1024 * 1024       # a clip is ~3 KB/s of speech
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None             # a 3xx is an error: the bearer token never goes elsewhere
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
 
 class UpstreamError(Exception):
     """Upstream call failed. `status` is the HTTP status the edge should
@@ -38,7 +48,8 @@ def fetch_speech(base_url: str, token: Optional[str], text: str, lang: str,
 
     Upstream 400s are passed through (the request itself is bad); every other
     failure is the edge's upstream problem, not the caller's: 502 (504 on a
-    timeout), with upstream's detail in the message.
+    timeout), with upstream's detail in the message. Redirects are not
+    followed, and a reply over MAX_REPLY_BYTES is refused.
     """
     fields = {"text": text, "lang": lang}
     if voice:
@@ -52,11 +63,11 @@ def fetch_speech(base_url: str, token: Optional[str], text: str, lang: str,
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = resp.read()
+        with _OPENER.open(req, timeout=timeout) as resp:
+            body = resp.read(MAX_REPLY_BYTES + 1)
             headers = resp.headers
     except urllib.error.HTTPError as exc:
-        detail = _detail(exc.read()) or exc.reason
+        detail = _detail(exc.read(4096)) or exc.reason
         if exc.code == 400:
             raise UpstreamError(400, detail) from exc
         if exc.code in (401, 403):
@@ -67,8 +78,10 @@ def fetch_speech(base_url: str, token: Optional[str], text: str, lang: str,
     except urllib.error.URLError as exc:
         if isinstance(exc.reason, (socket.timeout, TimeoutError)):
             raise UpstreamError(504, f"upstream timed out after {timeout:g}s") from exc
-        raise UpstreamError(502, f"upstream unreachable: {exc.reason}") from exc
+        raise UpstreamError(502, "upstream unreachable") from exc
 
+    if len(body) > MAX_REPLY_BYTES:
+        raise UpstreamError(502, f"upstream reply exceeds {MAX_REPLY_BYTES} bytes")
     if body[:4] != b"OggS":
         raise UpstreamError(502, f"upstream returned {headers.get('Content-Type')!r}, not OGG audio")
     return UpstreamSpeech(ogg=body, voice=headers.get("X-Voice"))

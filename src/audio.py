@@ -18,6 +18,7 @@ def pcm16_to_ogg(pcm: bytes, sample_rate: int = SAMPLE_RATE, bitrate: str = "64k
         input=pcm,
         capture_output=True,
         check=True,
+        timeout=60,
     )
     return result.stdout
 

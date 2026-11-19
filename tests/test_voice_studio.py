@@ -29,4 +29,11 @@ def test_gemini_tts_unknown_voice_is_400(client):
 def test_gemini_tts_upstream_failure_is_502(client):
     client.gemini.error = RuntimeError("No API key was provided")
     r = client.post("/v1/gemini/tts", data={"text": "hi"})
-    assert r.status_code == 502 and "No API key" in r.json()["detail"]
+    assert r.status_code == 502 and r.json()["detail"] == "Gemini TTS failed"
+
+
+def test_unknown_model_or_long_direction_is_400(client):
+    for data in ({"model": "gemini-9-unknown"}, {"instruct": "x" * 501}, {"style": "x" * 501}):
+        assert client.post("/v1/gemini/tts", data={"text": "hi", **data}).status_code == 400, data
+    assert client.post("/v1/speak", data={"text": "hi", "instruct": "x" * 501}).status_code == 400
+    assert client.gemini.calls == []

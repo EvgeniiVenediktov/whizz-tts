@@ -130,3 +130,19 @@ def test_word_info_endpoint_includes_type_and_voice(search_client):
 
 def test_languages_includes_phrase_langs(search_client):
     assert {"code": "en-us", "words": 1} in search_client.get("/v1/languages").json()["phrasebank"]
+
+
+def test_search_prefix_is_literal_and_limit_is_clamped(client):
+    """`%`/`_` in a prefix match themselves, limit stays in 1..50 (SQLite reads
+    LIMIT -1 as no limit), and a prefix ending in U+10FFFF (no range bound
+    above it) is a miss, not a 500."""
+    for voice in ("Kore", "Puck"):
+        client.post("/v1/speak", data={"text": "hello there", "voice": voice})
+
+    def search(prefix, **params):
+        r = client.get("/v1/search", params={"prefix": prefix, **params})
+        assert r.status_code == 200
+        return r.json()["results"]
+    assert len(search("hello")) == 2 and len(search("hello", limit=-1)) == 1
+    assert search("%") == search("_ello") == search("hello\U0010ffff") == []
+    assert client.get("/v1/bank", params={"prefix": "\U0010ffff"}).json() == {"words": []}

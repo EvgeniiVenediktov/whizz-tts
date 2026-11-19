@@ -81,7 +81,7 @@ if [ -n "$SYNC_BUCKET" ] && [ -n "$SYNC_PREFIX" ]; then
 elif [ -n "$BANK_SYNC_CMD" ]; then
     # Escape hatch: arbitrary shell command. Trusted-configuration only — see
     # header comment. Prefer SYNC_BUCKET/SYNC_PREFIX above when possible.
-    echo "[entrypoint] syncing bank via BANK_SYNC_CMD (trusted-config shell command): $BANK_SYNC_CMD"
+    echo "[entrypoint] syncing bank via BANK_SYNC_CMD (trusted-config shell command)"
     sh -c "$BANK_SYNC_CMD"
 fi
 

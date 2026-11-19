@@ -25,6 +25,7 @@ def test_health_is_healthy_iff_something_can_serve(bank_env, monkeypatch, bank, 
     assert r.status_code == status and body["healthy"] is (status == 200)
     assert (body["bank"], body["gemini"]) == (bank, gemini)
     assert body["bank_words"] == (1 if bank else 0)
+    assert "bank_path" not in body                  # no server paths to the public
 
 
 def test_cors_default_allows_any_origin(client):

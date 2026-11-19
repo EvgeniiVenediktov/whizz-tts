@@ -36,6 +36,8 @@ def test_protected_route_needs_valid_token_when_secret_set(client, monkeypatch, 
     assert missing.status_code == 401 and missing.headers.get("www-authenticate") == "Bearer"
     assert _post(client, route, data, _token(secret="wrong-secret-0123456789abcdef0123456789")).status_code == 401
     assert _post(client, route, data, _token(exp_delta=-10)).status_code == 401
+    no_exp = jwt.encode({"sub": "dev"}, SECRET, algorithm="HS256")     # would never expire
+    assert _post(client, route, data, no_exp).status_code == 401
     # nothing was synthesized or written by the rejected calls
     assert client.gemini.calls == []
     assert not client.paths.db.exists()
@@ -58,3 +60,15 @@ def test_public_routes_unaffected_by_secret(client, monkeypatch):
     for path in ("/health", "/v1/gemini/voices", "/v1/languages"):
         assert client.get(path).status_code == 200, path
     assert client.get("/v1/search", params={"prefix": "a"}).status_code == 200
+
+
+def test_oversized_body_is_413_before_anything_parses_it(client, monkeypatch):
+    """FastAPI parses a form before require_auth runs, so the body cap comes
+    first: by Content-Length, and by counting a chunked body."""
+    monkeypatch.setenv("JWT_SECRET", SECRET)
+    big = b"text=" + b"x" * (64 * 1024)
+    form = {"Content-Type": "application/x-www-form-urlencoded"}
+    assert client.post("/v1/speak", content=big, headers=form).status_code == 413
+    chunked = client.post("/v1/speak", content=iter([big[:40_000], big[40_000:]]), headers=form)
+    assert chunked.status_code == 413
+    assert _post(client, "/v1/speak", {"text": "hello"}).status_code == 401

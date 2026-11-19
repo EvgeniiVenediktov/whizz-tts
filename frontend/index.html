@@ -233,14 +233,14 @@
   const langQ = () => `lang=${encodeURIComponent(bankLang.value)}`;
 
   const kb = b => b == null ? '' : `(${(b / 1024).toFixed(1)} KB)`;
-
-  const esc = s => s.replace(/"/g, '&quot;');
+  // Server strings (bank texts, voice labels) only ever reach the page as
+  // DOM text or properties, never through innerHTML.
 
   let suggestTimer = null;
   bankWord.addEventListener('input', () => {
     const p = bankWord.value.trim();
     clearTimeout(suggestTimer);
-    if (!p) { bankList.innerHTML = ''; return; }
+    if (!p) { bankList.replaceChildren(); return; }
     suggestTimer = setTimeout(() => refreshSuggestions(p), 120);
   });
 
@@ -302,8 +302,11 @@
     try {                                    // merged: words + phrases, tagged
       const res = await fetch(`${SEARCH}?prefix=${encodeURIComponent(prefix)}&limit=10&${langQ()}`);
       const { results } = await res.json();
-      bankList.innerHTML = results.map(r =>
-        `<option value="${esc(r.text)}" label="${r.type}${r.voice ? ' · ' + r.voice : ''}">`).join('');
+      bankList.replaceChildren(...results.map(r => {
+        const o = new Option('', r.text);
+        o.label = r.type + (r.voice ? ' · ' + r.voice : '');
+        return o;
+      }));
     } catch { /* ignore autocomplete errors */ }
   }
 
@@ -348,32 +351,42 @@
   // Per language: its two curated voices (/v1/gemini/languages), then the 30
   // classic style presets, which speak any language, grouped Female / Male.
   let voiceLangs = [], classicVoices = [];
-  const voiceOpt = (v, label) =>
-    `<option value="${v.name}" title="${esc(v.description || '')}">${label}</option>`;
+  const voiceOpt = (v, label) => {
+    const o = new Option(label, v.name);
+    o.title = v.description || '';
+    return o;
+  };
+  const group = (label, options) => {      // [] for no options
+    if (!options.length) return [];
+    const g = document.createElement('optgroup');
+    g.label = label;
+    g.append(...options);
+    return [g];
+  };
   function voiceOptions(code) {
     const lang = voiceLangs.find(l => l.code === code);
     const own = lang ? lang.voices : [];
-    const classic = (label, gender) => {
-      const items = classicVoices.filter(v => v.gender === gender && !own.some(o => o.name === v.name));
-      return items.length ? `<optgroup label="${label}">` + items.map(v =>
-        voiceOpt(v, `${v.name} — ${v.style}`)).join('') + '</optgroup>' : '';
-    };
-    return (own.length ? `<optgroup label="${lang.name}">` + own.map(v =>
-        voiceOpt(v, `${v.gender}: ${v.display_name} — ${v.accent}${v.classic ? '' : ` (${v.name})`}`)).join('')
-        + '</optgroup>' : '')
-      + classic('Classic female (any language)', 'female') + classic('Classic male (any language)', 'male');
+    const classic = (label, gender) => group(label, classicVoices
+      .filter(v => v.gender === gender && !own.some(o => o.name === v.name))
+      .map(v => voiceOpt(v, `${v.name} — ${v.style}`)));
+    return [
+      ...group(lang ? lang.name : '', own.map(v =>
+        voiceOpt(v, `${v.gender}: ${v.display_name} — ${v.accent}${v.classic ? '' : ` (${v.name})`}`))),
+      ...classic('Classic female (any language)', 'female'),
+      ...classic('Classic male (any language)', 'male'),
+    ];
   }
   const gLang = document.getElementById('g-lang');
   const gVoice = document.getElementById('g-voice');
   const speakVoice = document.getElementById('bank-voice');
-  const anyVoice = speakVoice.options[0].outerHTML;
+  const anyVoice = speakVoice.options[0];
   function showStudioVoices() {
     const lang = voiceLangs.find(l => l.code === gLang.value);
-    gVoice.innerHTML = voiceOptions(gLang.value);
+    gVoice.replaceChildren(...voiceOptions(gLang.value));
     gVoice.value = lang ? lang.voices[0].name : 'Kore';
   }
   function showSpeakVoices() {
-    speakVoice.innerHTML = anyVoice + voiceOptions(bankLang.value);
+    speakVoice.replaceChildren(anyVoice, ...voiceOptions(bankLang.value));
   }
   async function loadGeminiVoices() {
     try {
@@ -382,14 +395,14 @@
       if (res.ok) voiceLangs = (await res.json()).languages;
     } catch { /* keep the default options */ }
     if (voiceLangs.length) {
-      const langOpts = voiceLangs.map(l => `<option value="${l.code}">${l.name}</option>`).join('');
-      gLang.innerHTML = bankLang.innerHTML = langOpts;
+      for (const select of [gLang, bankLang])
+        select.replaceChildren(...voiceLangs.map(l => new Option(l.name, l.code)));
       gLang.value = bankLang.value = 'en-us';
     }
     if (classicVoices.length) { showStudioVoices(); showSpeakVoices(); }
   }
   gLang.addEventListener('change', showStudioVoices);
-  bankLang.addEventListener('change', () => { showSpeakVoices(); bankList.innerHTML = ''; });
+  bankLang.addEventListener('change', () => { showSpeakVoices(); bankList.replaceChildren(); });
   loadGeminiVoices();
 
   // Timer bound to a given element id.

@@ -145,7 +145,19 @@ def test_banked_row_whose_ogg_is_missing_is_regenerated(client):
 def test_gemini_failure_is_502_and_saves_nothing(client):
     client.gemini.error = RuntimeError("quota exhausted")
     r = _speak(client, text="hello there", voice="Puck")
-    assert r.status_code == 502 and "quota exhausted" in r.json()["detail"]
+    assert r.status_code == 502 and r.json()["detail"] == "Gemini TTS failed"   # cause only logged
+    assert _phrase_rows(client.paths) == []
+
+
+def test_a_clip_that_fails_to_save_is_still_served_and_leaves_no_row(client, monkeypatch):
+    """Gemini was paid for it: the save failure is only logged."""
+    import src.server as server
+
+    def disk_full(path, data):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(server, "_write", disk_full)
+    r = _speak(client, text="hello there", voice="Puck")
+    assert r.status_code == 200 and r.headers["x-source"] == "gemini" and r.content[:4] == b"OggS"
     assert _phrase_rows(client.paths) == []
 
 
@@ -217,8 +229,7 @@ def test_store_off_still_serves_an_existing_bank(client, monkeypatch):
 def test_store_off_gemini_failure_is_502(client, monkeypatch):
     monkeypatch.setenv("SPEAK_STORE", "0")
     client.gemini.error = RuntimeError("quota exhausted")
-    r = _speak(client, text="hello there", voice="Puck")
-    assert r.status_code == 502 and "quota exhausted" in r.json()["detail"]
+    assert _speak(client, text="hello there", voice="Puck").status_code == 502
     client.gemini.error = None
     assert _speak(client, text="hello there", voice="Puck").status_code == 200   # failure not cached
 

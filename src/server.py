@@ -15,23 +15,28 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from .auth import require_auth
 from .upstream import UpstreamError, fetch_speech
 from wordbank.constants import BANK_OGG_APPLICATION, BANK_OGG_BITRATE
-from wordbank.gemini_tts import (DEFAULT_MODEL as GEMINI_TTS_DEFAULT_MODEL,
-                                 GeminiStyleUnsupportedError, GeminiVoiceUnsupportedError,
-                                 canonical_voice, check_voice, is_classic_voice,
-                                 style_models, supports_style, voice_label)
+from wordbank.gemini_tts import (DEFAULT_MODEL as GEMINI_TTS_DEFAULT_MODEL, TTS_MODELS,
+                                 GeminiNoAudioError, GeminiStyleUnsupportedError,
+                                 GeminiVoiceUnsupportedError, canonical_voice, check_voice,
+                                 is_classic_voice, style_models, supports_style, voice_label)
 from wordbank.languages import normalize_lang
 from wordbank.lookup import BankLookup
-from wordbank.paths import check_segment, voice_from_path
+from wordbank.paths import voice_from_path
 
 # NOTE: src.audio (ffmpeg) and google-genai are imported LAZILY inside the
 # handlers, so the serving image needs neither at import time.
 
 MAX_TEXT_LEN = int(os.getenv("MAX_TEXT_LEN", "2000"))
+MAX_DIRECTION_LEN = 500           # instruct / style
+MAX_BODY_BYTES = 64 * 1024        # every POST is a small form
+MAX_RESULTS = 50                  # /v1/search, /v1/bank
 FRONTEND_DIR = os.getenv("FRONTEND_DIR", "frontend")
 DEFAULT_LANG = os.getenv("DEFAULT_LANG", "en-us")
 GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", GEMINI_TTS_DEFAULT_MODEL)
 GEMINI_TTS_VOICE = os.getenv("GEMINI_TTS_VOICE", "Kore")
 SPEAK_UPSTREAM_TIMEOUT = float(os.getenv("SPEAK_UPSTREAM_TIMEOUT", "60"))
+
+log = logging.getLogger("uvicorn.error")
 
 
 def _truthy(val: Optional[str]) -> bool:
@@ -150,6 +155,14 @@ def _lang(lang: str) -> str:
         raise HTTPException(400, str(exc)) from exc
 
 
+def _direction(value: Optional[str], name: str) -> str:
+    """A stripped instruct/style field, or 400 when it exceeds MAX_DIRECTION_LEN."""
+    value = (value or "").strip()
+    if len(value) > MAX_DIRECTION_LEN:
+        raise HTTPException(400, f"{name} exceeds {MAX_DIRECTION_LEN} characters")
+    return value
+
+
 def _cors_origins() -> list:
     """Comma-separated CORS_ORIGINS env var -> origin list; unset -> ["*"]."""
     raw = os.getenv("CORS_ORIGINS")
@@ -166,7 +179,6 @@ async def lifespan(app: FastAPI):
     app.state.ogg_root = os.getenv("OGG_ROOT", "output/words_ogg")
     # Auth is env-gated (JWT_SECRET) so dev setups and existing deploys keep
     # working unauthenticated unless a secret is explicitly configured.
-    log = logging.getLogger("uvicorn.error")
     if not os.getenv("JWT_SECRET"):
         log.warning("JWT_SECRET not set: /v1/speak, /v1/gemini/tts are unauthenticated")
     _warn_about_upstream_token(log)
@@ -176,6 +188,38 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="TTS Server", lifespan=lifespan)
+
+
+class _BodyLimit:
+    """413 for a request body over MAX_BODY_BYTES, before the app sees any of
+    it: FastAPI parses a form before require_auth runs. Pure ASGI."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        too_large = JSONResponse({"detail": f"request body exceeds {MAX_BODY_BYTES} bytes"}, 413)
+        length = dict(scope["headers"]).get(b"content-length", b"0")
+        if not length.isdigit() or int(length) > MAX_BODY_BYTES:
+            return await too_large(scope, receive, send)
+        body, more = b"", True
+        while more:                     # a chunked body has no length: count it
+            msg = await receive()
+            if msg["type"] != "http.request":
+                return                  # client gone
+            body, more = body + msg.get("body", b""), msg.get("more_body", False)
+            if len(body) > MAX_BODY_BYTES:
+                return await too_large(scope, receive, send)
+        first = [{"type": "http.request", "body": body, "more_body": False}]
+
+        async def replay():
+            return first.pop() if first else await receive()
+        await self.app(scope, replay, send)
+
+
+app.add_middleware(_BodyLimit)          # added first: CORS wraps it, so a 413 carries CORS headers
 
 # CORS_ORIGINS env var: comma-separated allowlist (e.g.
 # "https://app.example.com,https://admin.example.com"). Unset -> wildcard, so
@@ -208,7 +252,6 @@ def health():
         "upstream": upstream,
         "store": _speak_store(),
         "bank": bank.available,
-        "bank_path": bank.path,
         "bank_words": bank.count(),
     }
     return JSONResponse(content=info, status_code=200 if healthy else 503)
@@ -243,6 +286,10 @@ def languages():
             "generate": SUPPORTED_LANGUAGES}
 
 
+def _limit(limit: int) -> int:
+    return max(1, min(limit, MAX_RESULTS))      # SQLite reads LIMIT -1 as "no limit"
+
+
 @app.get("/v1/search")
 def search(prefix: str, lang: str = DEFAULT_LANG, limit: int = 10,
            kind: Optional[str] = None, voice: Optional[str] = None):
@@ -251,7 +298,7 @@ def search(prefix: str, lang: str = DEFAULT_LANG, limit: int = 10,
     result per voice a text is banked in. `kind=word|phrase` restricts to one
     bank; `voice` to that voice (words and phrases by the same label, as
     /v1/speak matches them)."""
-    return {"results": app.state.bank.search(prefix, _lang(lang), min(limit, 50), kind,
+    return {"results": app.state.bank.search(prefix, _lang(lang), _limit(limit), kind,
                                              _bank_voice(voice))}
 
 
@@ -260,7 +307,7 @@ def bank_suggest(prefix: str, lang: str = DEFAULT_LANG, limit: int = 10,
                  voice: Optional[str] = None):
     """Prefix autocomplete over the word bank only (index-backed range scan):
     distinct words, optionally only those banked in `voice`."""
-    return {"words": app.state.bank.suggest(prefix, _lang(lang), min(limit, 50),
+    return {"words": app.state.bank.suggest(prefix, _lang(lang), _limit(limit),
                                             _bank_voice(voice))}
 
 
@@ -392,33 +439,44 @@ async def _single_flight(key: tuple):
             del _miss_locks[key]
 
 
+def _in_executor(fn, *args):
+    return asyncio.get_running_loop().run_in_executor(None, fn, *args)
+
+
 async def _synthesize(text: str, voice: str, instruct: str, model: str,
                       style: Optional[str], server_style: bool = False) -> bytes:
-    """Gemini synthesis off the event loop -> PCM; failures as HTTP errors. A
-    style the model can't take is 400, or 500 when it is GEMINI_TTS_STYLE."""
+    """Gemini synthesis off the event loop -> PCM; failures as HTTP errors with
+    short details (the cause is logged). A style the model can't take is 400,
+    or 500 when it is GEMINI_TTS_STYLE."""
     from wordbank.gemini_tts import synthesize_pcm  # lazy: genai
     try:
-        return await asyncio.get_running_loop().run_in_executor(None, lambda: synthesize_pcm(
+        return await _in_executor(lambda: synthesize_pcm(
             text, voice=voice, instruct=instruct, model=model, style=style))
     except GeminiStyleUnsupportedError as exc:
         if server_style:
-            raise HTTPException(500, f"server misconfigured: GEMINI_TTS_STYLE is set but {exc}") from exc
+            log.error("GEMINI_TTS_STYLE: %s", exc)
+            raise HTTPException(500, "server misconfigured: GEMINI_TTS_STYLE") from exc
         raise HTTPException(400, str(exc)) from exc
     except ImportError as exc:
-        raise HTTPException(503, f"google-genai not installed: {exc}") from exc
-    except Exception as exc:
+        raise HTTPException(503, "google-genai not installed") from exc
+    except GeminiNoAudioError as exc:           # our own message: the finish reason
         raise HTTPException(502, f"Gemini TTS failed: {exc}") from exc
+    except Exception as exc:
+        log.warning("Gemini TTS failed: %r", exc)
+        raise HTTPException(502, "Gemini TTS failed") from exc
 
 
-def _encode_ogg(pcm: bytes) -> bytes:
+async def _encode_ogg(pcm: bytes) -> bytes:
     """PCM -> OGG in the bank profile, so saved clips match encode_wavs.py's."""
     from .audio import pcm16_to_ogg  # lazy: shells out to ffmpeg
     try:
-        return pcm16_to_ogg(pcm, bitrate=BANK_OGG_BITRATE, application=BANK_OGG_APPLICATION)
+        return await _in_executor(lambda: pcm16_to_ogg(
+            pcm, bitrate=BANK_OGG_BITRATE, application=BANK_OGG_APPLICATION))
     except FileNotFoundError as exc:
-        raise HTTPException(503, f"ffmpeg not installed: {exc}") from exc
-    except subprocess.CalledProcessError as exc:
-        raise HTTPException(500, f"OGG encoding failed: {exc.stderr.decode(errors='replace')}") from exc
+        raise HTTPException(503, "ffmpeg not installed") from exc
+    except subprocess.SubprocessError as exc:   # failed, or timed out
+        log.error("OGG encoding failed: %s", getattr(exc, "stderr", None) or exc)
+        raise HTTPException(500, "OGG encoding failed") from exc
 
 
 @dataclass
@@ -434,19 +492,23 @@ class _Clip:
 async def _upstream_clip(url: str, text: str, lang: str, voice: Optional[str],
                          instruct: str, fallback_voice: str) -> _Clip:
     """A miss fetched from the upstream server, filed under the voice it
-    reports (voice_label: an older upstream's "gemini-Kore" -> "Kore")."""
+    reports, which must be a known voice: it names the saved clip's directory
+    and is later shown by the frontend (an older upstream's "gemini-Kore" is
+    "Kore")."""
     token = os.getenv("SPEAK_UPSTREAM_TOKEN")
     try:
-        speech = await asyncio.get_running_loop().run_in_executor(
-            None, lambda: fetch_speech(url, token, text, lang, voice, instruct,
-                                       timeout=SPEAK_UPSTREAM_TIMEOUT))
+        speech = await _in_executor(lambda: fetch_speech(
+            url, token, text, lang, voice, instruct, timeout=SPEAK_UPSTREAM_TIMEOUT))
     except UpstreamError as exc:
+        if exc.status >= 500:
+            log.warning("upstream /v1/speak: %s (%r)", exc.detail, exc.__cause__)
         raise HTTPException(exc.status, exc.detail) from exc
-    label = voice_label(speech.voice) if speech.voice else fallback_voice
-    try:
-        check_segment(label)            # it names the saved clip's directory
-    except ValueError as exc:
-        raise HTTPException(502, f"upstream reported an unusable voice label: {exc}") from exc
+    if not speech.voice:
+        return _Clip(speech.ogg, fallback_voice, "upstream")
+    label = canonical_voice(speech.voice.strip().removeprefix("gemini-"))
+    if label is None:
+        log.warning("upstream X-Voice %r is not a known voice", speech.voice)
+        raise HTTPException(502, "upstream reported an unknown voice")
     return _Clip(speech.ogg, label, "upstream")
 
 
@@ -466,23 +528,29 @@ def _save_phrase(text: str, lang: str, clip: _Clip) -> None:
         for root in (app.state.ogg_root, app.state.wav_root):
             path_under(root, clip_dir)
     except ValueError as exc:
-        raise HTTPException(500, str(exc)) from exc
+        raise HTTPException(500, "clip path outside the bank") from exc
     db = os.getenv("BANK_DB", "wordbank.db")
     os.makedirs(os.path.dirname(db) or ".", exist_ok=True)   # bank-less deploy: first write creates it
     m = Manifest(db, table="phrases", text_col="text")
     try:
         m.add_words([text], lang, voice=clip.voice)
         row = m.get_entry(text, lang, clip.voice)
-        rel = os.path.join(clip_dir, str(row["id"] // 1000), f"{row['id']}_{safe_filename(text)}.wav")
-        _write(_ogg_abs(rel), clip.ogg)
-        if clip.pcm is not None and os.path.isdir(app.state.wav_root):   # dev-only WAV master
-            from wordbank.gemini_tts import pcm_to_wav_bytes
-            try:
-                _write(_wav_abs(rel), pcm_to_wav_bytes(clip.pcm))
-            except OSError:
-                pass
-        m.set_status(row["id"], DONE, file_path=rel, voice=clip.voice, model=clip.model,
-                     style=clip.style, billed_chars=len(text) if clip.source == "gemini" else None)
+        try:
+            rel = os.path.join(clip_dir, str(row["id"] // 1000),
+                               f"{row['id']}_{safe_filename(text)}.wav")
+            _write(_ogg_abs(rel), clip.ogg)
+            if clip.pcm is not None and os.path.isdir(app.state.wav_root):   # dev-only WAV master
+                from wordbank.gemini_tts import pcm_to_wav_bytes
+                try:
+                    _write(_wav_abs(rel), pcm_to_wav_bytes(clip.pcm))
+                except OSError:
+                    pass
+            m.set_status(row["id"], DONE, file_path=rel, voice=clip.voice, model=clip.model,
+                         style=clip.style,
+                         billed_chars=len(text) if clip.source == "gemini" else None)
+        except Exception:
+            m.discard_unfinished(row["id"])     # no pending row left behind
+            raise
     finally:
         m.close()
     app.state.bank.close()   # drop the memoized read conn so the new row is visible
@@ -513,7 +581,7 @@ async def speak(
         raise HTTPException(400, f"text exceeds {MAX_TEXT_LEN} characters")
     lang = _lang(lang)
     voice = _gemini_voice(voice)
-    instruct = (instruct or "").strip()
+    instruct = _direction(instruct, "instruct")
     eff_voice = voice or _default_voice()
     upstream = _upstream_url()
 
@@ -524,7 +592,7 @@ async def speak(
         style = None if instruct else _tts_style()   # a one-off's instruct replaces it
         pcm = await _synthesize(text, eff_voice, instruct, GEMINI_TTS_MODEL, style,
                                 server_style=True)
-        return _Clip(_encode_ogg(pcm), eff_voice, "gemini", pcm, GEMINI_TTS_MODEL, style)
+        return _Clip(await _encode_ogg(pcm), eff_voice, "gemini", pcm, GEMINI_TTS_MODEL, style)
 
     if instruct:
         return _clip_response(await generate())
@@ -537,7 +605,10 @@ async def speak(
         if (hit := _speak_bank_hit(text, lang, voice, eff_voice)) is not None:
             return hit                  # a queued twin saved it
         clip = await generate()
-        _save_phrase(text, lang, clip)
+        try:
+            await _in_executor(_save_phrase, text, lang, clip)
+        except Exception:                       # the clip is paid for: serve it anyway
+            log.exception("could not save the /v1/speak clip for %r", text[:80])
     return _clip_response(clip)
 
 
@@ -556,10 +627,13 @@ async def gemini_tts(
     GEMINI_TTS_STYLE does not apply."""
     if len(text) > MAX_TEXT_LEN:
         raise HTTPException(400, f"text exceeds {MAX_TEXT_LEN} characters")
+    if model not in TTS_MODELS and model != GEMINI_TTS_MODEL:
+        raise HTTPException(400, f"unknown model {model!r} (one of: {', '.join(TTS_MODELS)})")
     voice = _gemini_voice(voice) or GEMINI_TTS_VOICE
     _check_voice(voice, model)
     from wordbank.gemini_tts import pcm_to_wav_bytes
-    pcm = await _synthesize(text, voice, instruct or "", model, style)
+    pcm = await _synthesize(text, voice, _direction(instruct, "instruct"), model,
+                            _direction(style, "style") or None)
     return Response(content=pcm_to_wav_bytes(pcm), media_type="audio/wav")
 
 

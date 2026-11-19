@@ -38,6 +38,7 @@ DEFAULT_MODEL = "gemini-3.8-flash-tts"
 # defaults to v1, which rejects speechConfig with 400 INVALID_ARGUMENT, so every
 # client pins the version explicitly (via new_client) instead of trusting the SDK.
 GEMINI_API_VERSION = "v1beta"
+_HTTP_TIMEOUT_S = 120     # every Gemini request (a server thread waits on it)
 
 log = logging.getLogger(__name__)
 
@@ -243,7 +244,8 @@ def new_client():
     """A google-genai client pinned to GEMINI_API_VERSION. Every Gemini client
     in the project (TTS, batch, scripts) is built here."""
     from google import genai
-    return genai.Client(http_options={"api_version": GEMINI_API_VERSION})
+    return genai.Client(http_options={"api_version": GEMINI_API_VERSION,
+                                      "timeout": _HTTP_TIMEOUT_S * 1000})   # ms
 
 
 def _get_client():
@@ -355,7 +357,6 @@ def _empty_retries() -> int:
 # runs (2.31 in the dev venv, 3.x in the images). The URL carries
 # GEMINI_API_VERSION like every google-genai client from new_client().
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com"
-_INTERACTIONS_TIMEOUT_S = 120
 # A completed interaction with no audio is the Interactions analogue of an
 # empty generateContent candidate (finish_reason OTHER) and is retried; a
 # failed / cancelled / incomplete one, or one carrying errors, is not.
@@ -407,7 +408,7 @@ def _post_interaction(body: dict) -> dict:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=_INTERACTIONS_TIMEOUT_S) as resp:
+        with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT_S) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         raise GeminiAPIError(

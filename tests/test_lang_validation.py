@@ -109,13 +109,14 @@ def test_edge_speak_rejects_bad_lang_before_fetching_upstream(edge, tmp_path):
     assert edge.upstream.requests == [] and edge.gemini.calls == []
 
 
-def test_edge_refuses_an_upstream_voice_label_that_is_not_one_segment(edge, tmp_path):
-    """The upstream's X-Voice becomes a directory of the saved clip."""
-    for label in ("../../escaped", "a/b", "..", "x\\y"):
+def test_edge_refuses_an_upstream_voice_that_is_not_a_known_voice(edge, tmp_path):
+    """The upstream's X-Voice becomes a directory of the saved clip and is
+    shown by the frontend: only a known voice is taken."""
+    for label in ("../../escaped", "a/b", "..", "<img src=x onerror=alert(1)>", "k" * 300):
         edge.upstream.respond = lambda f, label=label: (200, {"X-Source": "gemini", "X-Voice": label}, b"OggS-x")
         with _nothing_written(tmp_path, edge.paths.db):
             r = edge.post("/v1/speak", data={"text": "hello there"})
-        assert r.status_code == 502 and "unusable voice label" in r.json()["detail"], label
+        assert r.status_code == 502 and r.json()["detail"] == "upstream reported an unknown voice", label
 
 
 def test_read_routes_reject_bad_lang(client):
