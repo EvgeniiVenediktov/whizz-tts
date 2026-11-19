@@ -61,7 +61,7 @@ class FakeUpstream:
 
     @staticmethod
     def _ok(fields):
-        voice = f"gemini-{fields.get('voice', 'Kore')}"
+        voice = fields.get("voice", "Kore")
         body = b"OggS" + f"|{fields['text']}|{voice}|{fields.get('instruct', '')}".encode()
         return 200, {"Content-Type": "audio/ogg", "X-Source": "gemini", "X-Voice": voice}, body
 
@@ -98,14 +98,14 @@ def _phrases(paths):
 def test_miss_is_fetched_from_upstream_saved_and_then_served_locally(edge):
     r = _speak(edge, text="hello there", voice="puck")
     assert r.status_code == 200, r.text
-    assert r.headers["x-source"] == "upstream" and r.headers["x-voice"] == "gemini-Puck"
-    assert r.content == b"OggS|hello there|gemini-Puck|"
+    assert r.headers["x-source"] == "upstream" and r.headers["x-voice"] == "Puck"
+    assert r.content == b"OggS|hello there|Puck|"
 
     [req] = edge.upstream.requests
     assert req == {"path": "/v1/speak", "auth": f"Bearer {TOKEN}",
                    "text": "hello there", "lang": "en-us", "voice": "Puck"}
     [row] = _phrases(edge.paths)
-    assert row["voice"] == "gemini-Puck" and row["status"] == DONE
+    assert row["voice"] == "Puck" and row["status"] == DONE
     assert (edge.paths.ogg / (row["file_path"][:-4] + ".ogg")).read_bytes() == r.content
 
     again = _speak(edge, text="Hello there", voice="Puck")
@@ -131,15 +131,30 @@ def test_packaged_bank_serves_without_asking_upstream(edge):
 
 def test_no_voice_is_forwarded_as_none_and_filed_under_the_voice_upstream_used(edge):
     """Upstream applies its own default/any-banked rule; a word-bank hit there
-    reports the bare name, filed here as the phrase voice gemini-<Name>."""
+    reports the voice's label, which the phrase is filed under here too."""
     edge.upstream.respond = lambda f: (200, {"X-Source": "bank", "X-Voice": "Kore"}, b"OggS-word")
     r = _speak(edge, text="cat")
     assert "voice" not in edge.upstream.requests[0]
-    assert r.headers["x-voice"] == "gemini-Kore"
-    assert [p["voice"] for p in _phrases(edge.paths)] == ["gemini-Kore"]
+    assert r.headers["x-voice"] == "Kore"
+    assert [p["voice"] for p in _phrases(edge.paths)] == ["Kore"]
 
     pinned = _speak(edge, text="cat", voice="Kore")   # now a local hit in that voice
     assert pinned.headers["x-source"] == "bank" and len(edge.upstream.requests) == 1
+
+
+def test_an_older_upstreams_phrase_label_is_filed_as_the_plain_label(edge):
+    """An upstream on code from before phrases took their word labels reports
+    "gemini-<Voice>": filed (and reported) as the plain label, in the usual
+    `gemini-<Voice>` directory, so a pinned request is a local hit next."""
+    edge.upstream.respond = lambda f: (200, {"X-Source": "gemini", "X-Voice": "gemini-puck"},
+                                       b"OggS-old")
+    r = _speak(edge, text="hello there", voice="Puck")
+    assert r.status_code == 200 and r.headers["x-voice"] == "Puck"
+    [row] = _phrases(edge.paths)
+    assert row["voice"] == "Puck" and row["file_path"].startswith("en-us/gemini-Puck/phrases/")
+
+    again = _speak(edge, text="hello there", voice="Puck")
+    assert again.headers["x-source"] == "bank" and len(edge.upstream.requests) == 1
 
 
 def test_instruct_is_forwarded_and_never_saved(edge):
@@ -261,7 +276,7 @@ def test_edge_against_a_real_upstream_server(bank_env, fake_gemini, tmp_path, mo
                 {"sub": "edge", "exp": int(time.time()) + 3600}, secret, algorithm="HS256"))
             miss = _speak(c, text="hello there", voice="Puck")
             assert miss.status_code == 200, miss.text
-            assert miss.headers["x-source"] == "upstream" and miss.headers["x-voice"] == "gemini-Puck"
+            assert miss.headers["x-source"] == "upstream" and miss.headers["x-voice"] == "Puck"
             assert miss.content[:4] == b"OggS"
             hit = _speak(c, text="hello there", voice="Puck")
             assert hit.headers["x-source"] == "bank" and hit.content == miss.content
@@ -269,10 +284,10 @@ def test_edge_against_a_real_upstream_server(bank_env, fake_gemini, tmp_path, mo
         found = urllib.request.urlopen(url + "/v1/search?prefix=hello").read()
         if store == "1":
             # upstream banked it too, so a second edge would get it without Gemini
-            assert b"gemini-Puck" in found
+            assert b'"voice":"Puck"' in found
         else:
             # stateless upstream: the clip lives only on the edge
-            assert b"gemini-Puck" not in found
+            assert b"hello there" not in found
             assert not up_dir.exists()
         assert fake_gemini.calls == []                  # the edge process never called Gemini
     finally:

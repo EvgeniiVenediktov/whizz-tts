@@ -10,16 +10,25 @@ A word may be banked in several voices (one row each). With a voice, lookups
 match that voice only; without one, get() serves the caller's preferred voice
 if banked, else the earliest banked clip (lowest id), and searches list one
 result per voice.
+
+Phrases carry the same voice labels as words ("Kore"). Phrases saved before
+that say "gemini-Kore" until a Manifest opens the bank and relabels them
+(Manifest._migrate_phrase_voices); this reader never migrates, so phrase
+lookups read either spelling as the label the migration gives it.
 """
 import os
 import sqlite3
 import threading
 from typing import List, Optional
 
+from .gemini_tts import plain_voice_label
 from .paths import voice_from_path
 
 _READY = ("done", "verified")
 _READY_SQL = "status IN ({})".format(", ".join(f"'{s}'" for s in _READY))
+# A phrase's voice as its label (see above); legacy rows only call into Python.
+_PHRASE_VOICE_SQL = ("CASE WHEN voice GLOB 'gemini-?*' THEN plain_voice_label(voice) "
+                     "ELSE voice END")
 
 
 def _prefix_upper(prefix: str) -> str:
@@ -50,6 +59,7 @@ class BankLookup:
             conn = sqlite3.connect(self._db_path, check_same_thread=False)
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA query_only = ON")
+            conn.create_function("plain_voice_label", 1, plain_voice_label, deterministic=True)
             self._conn = conn
             # Capabilities (a bank from older code may lack these).
             self._words_has_voice = any(
@@ -145,9 +155,10 @@ class BankLookup:
 
     def get_phrase(self, text: str, lang: str = "en",
                    voice: Optional[str] = None) -> Optional[sqlite3.Row]:
-        """Exact phrase match (case-insensitive). If voice is omitted, returns any
-        voice for that phrase (the earliest banked, so the choice is stable).
-        Returns the row or None (also None if no phrases)."""
+        """Exact phrase match (case-insensitive). `voice` (a bank label, "Kore")
+        pins it, matching a legacy "gemini-Kore" row too; omitted, any voice
+        (the earliest banked, so the choice is stable). Returns the row, its
+        voice as the label, or None (also None if no phrases)."""
         with self._lock:
             self._open()
             if self._conn is None or not self._has_phrases:
@@ -155,14 +166,15 @@ class BankLookup:
             if voice is not None and "voice" not in self._phrase_cols:
                 return None  # voice-pinned lookup can't match a voiceless bank
             cols = ", ".join(
-                c if c in self._phrase_cols else f"NULL AS {c}"
+                f"NULL AS {c}" if c not in self._phrase_cols
+                else f"{_PHRASE_VOICE_SQL} AS voice" if c == "voice" else c
                 for c in ("voice", "seed", "ref_audio", "ref_text")
             )
             sql = (f"SELECT text, lang, file_path, status, {cols} FROM phrases "
                    f"WHERE LOWER(text) = LOWER(?) AND lang = ? AND {_READY_SQL}")
             params = [text.strip(), lang]
             if voice is not None:
-                sql += " AND voice = ?"
+                sql += f" AND {_PHRASE_VOICE_SQL} = ?"
                 params.append(voice)
             return self._conn.execute(sql + " ORDER BY id LIMIT 1", params).fetchone()
 
@@ -170,9 +182,8 @@ class BankLookup:
                kind: Optional[str] = None, voice: Optional[str] = None) -> List[dict]:
         """Merged prefix search over words + phrases. Each result is tagged with
         its `type` ('word'|'phrase') and `voice`, one per voice a text is banked
-        in. `kind` optionally restricts to one; `voice` (a bare label, "Kore")
-        to words in that voice and phrases in `gemini-<voice>`, as /v1/speak
-        matches them."""
+        in. `kind` optionally restricts to one; `voice` (a bank label, "Kore")
+        to words and phrases in that voice, as /v1/speak matches them."""
         p = prefix.strip().lower()
         if not p:
             return []
@@ -193,13 +204,15 @@ class BankLookup:
                 parts.append(sql)
             if kind in (None, "phrase") and self._has_phrases and (
                     voice is None or "voice" in self._phrase_cols):
-                vp = "voice" if "voice" in self._phrase_cols else "NULL"
-                sql = (f"SELECT text, 'phrase' AS type, {vp} AS voice FROM phrases "
+                vp = _PHRASE_VOICE_SQL if "voice" in self._phrase_cols else "NULL"
+                # DISTINCT: a duplicate the migration kept under a legacy spelling
+                # is the same text in the same voice
+                sql = (f"SELECT DISTINCT text, 'phrase' AS type, {vp} AS voice FROM phrases "
                        f"WHERE lang = ? AND LOWER(text) LIKE ? AND {_READY_SQL}")
                 params += [lang, p + "%"]
                 if voice is not None:
-                    sql += " AND voice = ?"
-                    params.append(f"gemini-{voice}")
+                    sql += f" AND {_PHRASE_VOICE_SQL} = ?"
+                    params.append(voice)
                 parts.append(sql)
             if not parts:
                 return []

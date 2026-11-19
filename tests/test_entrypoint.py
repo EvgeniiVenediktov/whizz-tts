@@ -27,7 +27,7 @@ def _entrypoint(data, **env):
 def _add_phrase(db, ogg_root, text, voice, pid):
     m = Manifest(str(db), table="phrases", text_col="text")
     m.add_words([text], "en-us", voice=voice)
-    rel = f"en-us/{voice}/phrases/0/{pid}_{text.replace(' ', '-')}.wav"
+    rel = f"en-us/gemini-{voice}/phrases/0/{pid}_{text.replace(' ', '-')}.wav"
     m.set_status(m.get_entry(text, "en-us", voice)["id"], DONE, file_path=rel, voice=voice)
     m.close()
     ogg = ogg_root / (rel[:-4] + ".ogg")
@@ -85,7 +85,7 @@ def test_empty_edge_volume_starts_on_its_upstream(tmp_path):
 def test_restart_on_runtime_built_bank_says_so(tmp_path):
     """Gemini-only volume after /v1/speak saved phrases: no description, but the
     bank is real, so the log must not claim there is no bank."""
-    _add_phrase(tmp_path / "wordbank.db", tmp_path / "words_ogg", "good morning", "gemini-Puck", 1)
+    _add_phrase(tmp_path / "wordbank.db", tmp_path / "words_ogg", "good morning", "Puck", 1)
     code, out = _entrypoint(tmp_path, GEMINI_API_KEY="k")
     assert code == 0 and out.rstrip().endswith("STARTED")
     assert "serving the bank built at runtime" in out and "no bank" not in out
@@ -100,7 +100,7 @@ def test_archive_is_unpacked_once_and_a_grown_bank_still_verifies(tmp_path):
     assert (data / "words_ogg" / "en-us" / "gemini-Kore" / "0").is_dir()
 
     # /v1/speak adds a phrase on the live volume; the restart must not re-unpack.
-    _add_phrase(data / "wordbank.db", data / "words_ogg", "good morning", "gemini-Puck", 1)
+    _add_phrase(data / "wordbank.db", data / "words_ogg", "good morning", "Puck", 1)
     code, out = _entrypoint(data)
     assert code == 0 and "library verified — starting" in out and "unpacking" not in out
 
@@ -110,7 +110,7 @@ def test_unpack_over_an_existing_bank_keeps_it_as_a_backup(tmp_path):
     (with its phrases) is moved aside, not overwritten."""
     data = tmp_path / "data"
     data.mkdir()
-    _add_phrase(data / "wordbank.db", data / "words_ogg", "good morning", "gemini-Puck", 1)
+    _add_phrase(data / "wordbank.db", data / "words_ogg", "good morning", "Puck", 1)
     _provision(_package(tmp_path), data)
 
     code, out = _entrypoint(data, GEMINI_API_KEY="k")

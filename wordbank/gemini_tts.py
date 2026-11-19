@@ -210,7 +210,7 @@ LOCALE_VOICES = frozenset(v["id"] for lang in VOICE_LANGUAGES
 def canonical_voice(name: str) -> Optional[str]:
     """Case-insensitive match against the classic VOICES and LOCALE_VOICES ->
     the canonical label, or None if it is neither. Classic voices keep their
-    capitalized name ("puck" -> "Puck": banks key on it, `gemini-Kore`); a
+    capitalized name ("puck" -> "Puck": banks key on it, words and phrases); a
     locale voice is its lowercase id ("EN-GB-Tutor-11" -> "en-gb-tutor-11").
     Banked clips are keyed by this label, so "puck"/"Puck" stay one entry."""
     key = name.strip().lower()
@@ -222,6 +222,15 @@ def voice_label(name: str) -> str:
     else the lowercase id (voice-library ids are lowercase). Word rows key on
     it, so `--voice kore` and `Kore` stay one voice."""
     return canonical_voice(name) or name.strip().lower()
+
+
+def plain_voice_label(label: str) -> str:
+    """voice_label of a bank label, also in the spelling phrases had before
+    they took their voice's word label: "gemini-<voice>" ("gemini-Kore" ->
+    "Kore", "gemini-puck" -> "Puck"). Unmigrated banks and upstreams on older
+    code still use it."""
+    name = label.strip()
+    return voice_label(name[len("gemini-"):] if name.startswith("gemini-") else name)
 
 
 def is_classic_voice(name: str) -> bool:

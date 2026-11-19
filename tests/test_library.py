@@ -128,10 +128,10 @@ def test_verify_accepts_a_bank_grown_at_runtime(tmp_path):
     assert verify(str(tmp_path / "library.json"), str(tmp_path)) == []
 
     pm = Manifest(db, table="phrases", text_col="text")
-    pm.add_words(["good morning"], "en-us", voice="gemini-Puck")
+    pm.add_words(["good morning"], "en-us", voice="Puck")
     rel = "en-us/gemini-Puck/phrases/0/2_good-morning.wav"
-    pm.set_status(pm.get_entry("good morning", "en-us", "gemini-Puck")["id"], DONE,
-                  file_path=rel, voice="gemini-Puck")
+    pm.set_status(pm.get_entry("good morning", "en-us", "Puck")["id"], DONE,
+                  file_path=rel, voice="Puck")
     pm.close()
     ogg = tmp_path / "words_ogg" / (rel[:-4] + ".ogg")
     ogg.parent.mkdir(parents=True)

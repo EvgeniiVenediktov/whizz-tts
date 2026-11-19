@@ -58,7 +58,7 @@ def live_client(bank_env, monkeypatch):
 def test_speak_miss_generates_with_real_gemini_then_serves_from_bank(live_client):
     miss = live_client.post("/v1/speak", data={"text": TEXT, "voice": "Puck"})
     assert miss.status_code == 200, miss.text
-    assert miss.headers["x-source"] == "gemini" and miss.headers["x-voice"] == "gemini-Puck"
+    assert miss.headers["x-source"] == "gemini" and miss.headers["x-voice"] == "Puck"
     assert miss.content[:4] == b"OggS"
 
     # The raw payload was unwrapped to bare 16-bit PCM: no RIFF header, no C2PA
@@ -81,4 +81,4 @@ def test_speak_miss_generates_with_real_gemini_then_serves_from_bank(live_client
         [row] = [dict(r) for r in m.iter_rows()]
     finally:
         m.close()
-    assert row["status"] == DONE and row["voice"] == "gemini-Puck"
+    assert row["status"] == DONE and row["voice"] == "Puck"

@@ -52,13 +52,13 @@ def test_miss_generates_in_selected_voice_and_persists(client):
 
     assert r.status_code == 200, r.text
     assert r.headers["content-type"].startswith("audio/ogg")
-    assert r.headers["x-source"] == "gemini" and r.headers["x-voice"] == "gemini-Puck"
+    assert r.headers["x-source"] == "gemini" and r.headers["x-voice"] == "Puck"
     assert client.gemini.calls == [("hello there", "Puck", "")]
     pcm, sr = sf.read(io.BytesIO(r.content))
     assert abs(len(pcm) / sr - 0.5) < 0.05          # the whole 0.5 s clip decodes
 
     [row] = _phrase_rows(client.paths)
-    assert row["status"] == DONE and row["voice"] == "gemini-Puck"
+    assert row["status"] == DONE and row["voice"] == "Puck"
     assert row["file_path"].startswith("en-us/gemini-Puck/phrases/")
     saved = client.paths.ogg / (row["file_path"][:-4] + ".ogg")
     assert saved.read_bytes() == r.content          # what was served is what was banked
@@ -71,12 +71,12 @@ def test_repeat_is_a_bank_hit_and_each_voice_is_banked_separately(client):
     assert again.headers["x-source"] == "bank" and again.content == first.content
 
     other = _speak(client, text="hello there", voice="Charon")
-    assert other.headers["x-source"] == "gemini" and other.headers["x-voice"] == "gemini-Charon"
+    assert other.headers["x-source"] == "gemini" and other.headers["x-voice"] == "Charon"
 
     assert [voice for _, voice, _ in client.gemini.calls] == ["Puck", "Charon"]
-    assert sorted(r["voice"] for r in _phrase_rows(client.paths)) == ["gemini-Charon", "gemini-Puck"]
+    assert sorted(r["voice"] for r in _phrase_rows(client.paths)) == ["Charon", "Puck"]
     results = client.get("/v1/search", params={"prefix": "hello"}).json()["results"]
-    assert {r["voice"] for r in results} == {"gemini-Puck", "gemini-Charon"}
+    assert {r["voice"] for r in results} == {"Puck", "Charon"}
 
 
 def test_unknown_voice_is_rejected_before_calling_gemini(client):
@@ -95,7 +95,7 @@ def test_word_bank_hit_honours_the_selected_voice(client):
     assert client.gemini.calls == []
 
     r = _speak(client, text="cat", voice="Puck")                # banked word is Kore
-    assert r.headers["x-source"] == "gemini" and r.headers["x-voice"] == "gemini-Puck"
+    assert r.headers["x-source"] == "gemini" and r.headers["x-voice"] == "Puck"
     assert client.gemini.calls == [("cat", "Puck", "")]
 
 
@@ -107,10 +107,10 @@ def test_word_without_recorded_voice_matches_on_its_file_path(client):
 
 
 def test_no_voice_prefers_the_default_voice_then_any_banked(client):
-    _bank_phrase(client.paths, "hello there", "gemini-Puck")    # banked first
-    kore = _bank_phrase(client.paths, "hello there", "gemini-Kore")
+    _bank_phrase(client.paths, "hello there", "Puck")    # banked first
+    kore = _bank_phrase(client.paths, "hello there", "Kore")
     r = _speak(client, text="hello there")
-    assert r.content == kore and r.headers["x-voice"] == "gemini-Kore"
+    assert r.content == kore and r.headers["x-voice"] == "Kore"
 
     local = _bank_phrase(client.paths, "good morning", "local-en-gb")
     r = _speak(client, text="good morning")
@@ -118,17 +118,17 @@ def test_no_voice_prefers_the_default_voice_then_any_banked(client):
     assert client.gemini.calls == []
 
     r = _speak(client, text="good morning", voice="Kore")       # pinned: local clip doesn't count
-    assert r.headers["x-source"] == "gemini" and r.headers["x-voice"] == "gemini-Kore"
+    assert r.headers["x-source"] == "gemini" and r.headers["x-voice"] == "Kore"
 
 
 def test_instruct_is_a_one_off_render_never_banked(client):
-    _bank_phrase(client.paths, "hello there", "gemini-Puck")
+    _bank_phrase(client.paths, "hello there", "Puck")
 
     for _ in range(2):
         r = _speak(client, text="hello there", voice="Puck", instruct="whisper it")
         assert r.status_code == 200 and r.headers["x-source"] == "gemini"
     assert client.gemini.calls == [("hello there", "Puck", "whisper it")] * 2
-    assert [r["voice"] for r in _phrase_rows(client.paths)] == ["gemini-Puck"]  # unchanged
+    assert [r["voice"] for r in _phrase_rows(client.paths)] == ["Puck"]  # unchanged
 
 
 def test_banked_row_whose_ogg_is_missing_is_regenerated(client):
@@ -196,7 +196,7 @@ def test_store_off_serves_the_miss_and_writes_nothing(client, monkeypatch):
     monkeypatch.setenv("SPEAK_STORE", "0")
     r = _speak(client, text="hello there", voice="Puck")
     assert r.status_code == 200, r.text
-    assert r.headers["x-source"] == "gemini" and r.headers["x-voice"] == "gemini-Puck"
+    assert r.headers["x-source"] == "gemini" and r.headers["x-voice"] == "Puck"
     assert r.content[:4] == b"OggS"
     assert _phrase_rows(client.paths) == [] and _ogg_files(client.paths) == []
 
@@ -207,7 +207,7 @@ def test_store_off_serves_the_miss_and_writes_nothing(client, monkeypatch):
 
 
 def test_store_off_still_serves_an_existing_bank(client, monkeypatch):
-    banked = _bank_phrase(client.paths, "hello there", "gemini-Puck")
+    banked = _bank_phrase(client.paths, "hello there", "Puck")
     monkeypatch.setenv("SPEAK_STORE", "0")
     r = _speak(client, text="hello there", voice="Puck")
     assert r.headers["x-source"] == "bank" and r.content == banked

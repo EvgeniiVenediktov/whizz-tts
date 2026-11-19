@@ -3,10 +3,12 @@
 Two content tables with identical shape:
   - `words`   — the Gemini single-word bank   (UNIQUE(lang, word, voice))
   - `phrases` — the /v1/speak phrase bank      (UNIQUE(text, lang, voice))
-They are stored separately so words and phrases never overlap. One `Manifest`
-instance targets one table (pass `table=`/`text_col=`); both tables are always
-created. Banks made before clone references were removed may also hold an
-unused `voices` table.
+They are stored separately so words and phrases never overlap, but share
+their voice labels (gemini_tts.voice_label: "Kore", "en-gb-tutor-11"): a
+voice's bank is its words plus its phrases. One `Manifest` instance targets
+one table (pass `table=`/`text_col=`); both tables are always created. Banks
+made before clone references were removed may also hold an unused `voices`
+table.
 
 A word is banked once per voice (a woman's and a man's en-gb bank side by
 side). A NULL `voice` marks an unattributed row: a word ingested by code that
@@ -27,6 +29,7 @@ import threading
 import time
 from typing import Iterable, Optional
 
+from .gemini_tts import plain_voice_label
 from .paths import voice_from_path
 
 PENDING = "pending"
@@ -125,6 +128,9 @@ WHEN EXISTS (SELECT 1 FROM words WHERE lang = NEW.lang AND word = NEW.word
 BEGIN SELECT RAISE(IGNORE); END;
 """
 
+# A content row holding a clip (_migrate_phrase_voices).
+_CLIP_SQL = f"status IN ('{DONE}', '{VERIFIED}') AND file_path IS NOT NULL"
+
 # QC columns (see qc.Check); NULL measurements = never checked. qc_accepted = 1:
 # a person listened and kept the clip despite its flag, so `qc` skips it.
 _QC_COLUMNS = (("review", "TEXT"), ("qc_seconds", "REAL"), ("qc_end_db", "REAL"),
@@ -161,6 +167,7 @@ class Manifest:
         # a second voice's take of a banked word was dropped the same way.
         if ["lang", "word", "voice"] not in self._unique_keys("words"):
             self._rebuild("words", self._migrate_word_rows)
+        self._migrate_phrase_voices()
         self._conn.executescript(_POST_SCHEMA)
 
     def _unique_keys(self, table: str) -> list:
@@ -238,6 +245,65 @@ class Manifest:
         self._conn.execute(
             "UPDATE words SET review = substr(error, 9), error = NULL "
             "WHERE error LIKE 'review: %' AND status IN (?, ?)", (DONE, VERIFIED))
+
+    def _migrate_phrase_voices(self) -> None:
+        """Phrases were labelled "gemini-<label>" ("gemini-Kore") while words
+        were "Kore"; a phrase now takes its voice's word label. Rewritten once,
+        on open: the legacy spelling -> plain_voice_label ("gemini-puck" ->
+        "Puck"). Any other label (e.g. a removed local voice's "local-...") is
+        left as is. Clips don't move: phrases are still filed under
+        `<lang>/gemini-<label>/phrases/`, like words.
+
+        A rewrite may meet a row already keyed (text, lang, label): another
+        spelling of the same voice, or a row newer code wrote. Of the two, the
+        one with a clip (done/verified, with a file_path), then the lower id,
+        takes the label. The other is deleted if it has no clip (an unfinished
+        save: no audio is lost); one with a clip is kept under a legacy
+        spelling (its own, or the winner's old one if it held the label) and
+        stays so: BankLookup matches both spellings, oldest first, so it
+        serves the winner, and later opens leave the pair alone."""
+        select = (f"SELECT id, text, lang, voice, {_CLIP_SQL} AS clip FROM phrases "
+                  "WHERE voice GLOB 'gemini-?*' ORDER BY id")
+
+        def holder(row):        # the row keyed under row's plain label, if any
+            return self._conn.execute(
+                f"SELECT id, voice, {_CLIP_SQL} AS clip FROM phrases "
+                "WHERE text = ? AND lang = ? AND voice = ?",
+                (row["text"], row["lang"], plain_voice_label(row["voice"]))).fetchone()
+
+        def loser(row, held):   # no clip, else the higher id
+            return max((row, held), key=lambda r: (not r["clip"], r["id"]))
+
+        def kept(row):          # a duplicate with a clip, kept by an earlier open
+            held = holder(row)
+            return held is not None and row["clip"] and loser(row, held) is row
+
+        if all(kept(row) for row in self._conn.execute(select).fetchall()):
+            return              # nothing to rewrite: no write lock
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                for row in self._conn.execute(select).fetchall():
+                    held = holder(row)
+                    if held is not None:
+                        other = loser(row, held)
+                        if not other["clip"]:
+                            self._conn.execute("DELETE FROM phrases WHERE id = ?", (other["id"],))
+                            if other is row:
+                                continue
+                        elif other is row:
+                            continue                    # keeps its legacy spelling
+                        else:                           # the holder takes row's spelling
+                            self._conn.execute("UPDATE phrases SET voice = NULL WHERE id = ?",
+                                               (row["id"],))
+                            self._conn.execute("UPDATE phrases SET voice = ? WHERE id = ?",
+                                               (row["voice"], held["id"]))
+                    self._conn.execute("UPDATE phrases SET voice = ? WHERE id = ?",
+                                       (plain_voice_label(row["voice"]), row["id"]))
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
 
     def close(self) -> None:
         with self._lock:

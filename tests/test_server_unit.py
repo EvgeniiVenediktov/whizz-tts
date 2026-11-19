@@ -37,7 +37,7 @@ def test_cors_exposes_speak_metadata_headers(client):
     """Cross-origin JS can only read X-Source/X-Voice if they're exposed."""
     r = client.post("/v1/speak", data={"text": "hello there", "voice": "Puck"},
                     headers={"Origin": "https://app.example.com"})
-    assert r.status_code == 200 and r.headers["x-voice"] == "gemini-Puck"
+    assert r.status_code == 200 and r.headers["x-voice"] == "Puck"
     exposed = {h.strip().lower() for h in r.headers["access-control-expose-headers"].split(",")}
     assert {"x-source", "x-voice"} <= exposed
 

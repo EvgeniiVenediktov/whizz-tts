@@ -211,14 +211,14 @@ def test_tts_style_applies_to_misses_and_is_saved_as_provenance(server, monkeypa
     assert _sent(server.api) == [("style", "haha", STYLE), ("style", "haha", "whisper it")]
     [row] = _phrase_rows(server.paths)
     assert (row["status"], row["voice"], row["model"], row["style"]) == \
-        (DONE, "gemini-Kore", FLASH, STYLE)
+        (DONE, "Kore", FLASH, STYLE)
 
 
 def test_tts_style_with_a_model_that_cannot_take_it(server, monkeypatch, caplog):
     """Startup warns; a miss is a 500 naming the setting, with nothing sent or
     saved; bank hits and instruct one-offs (which don't use it) still work."""
     from tests.test_speak import _bank_phrase
-    banked = _bank_phrase(server.paths, "hello there", "gemini-Kore")
+    banked = _bank_phrase(server.paths, "hello there", "Kore")
     monkeypatch.setenv("GEMINI_TTS_STYLE", STYLE)
     with caplog.at_level(logging.WARNING, logger="uvicorn.error"), server.client(PREVIEW) as c:
         miss = c.post("/v1/speak", data={"text": "haha"})

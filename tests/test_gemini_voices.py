@@ -3,7 +3,7 @@ their labels, the 3.8-only rule for locale voices, the routes that expose and
 accept them, and scripts/fetch_gemini_voices.py. Gemini is faked throughout.
 
 Why the labels matter: banks already key on the classic capitalized names
-(`words.voice = "Kore"`, phrases `gemini-Kore`, paths `en/gemini-Kore/…`), while
+(`words.voice` and `phrases.voice` = "Kore", paths `en/gemini-Kore/…`), while
 the batch path files a locale voice under its lowercase id
 (`en-gb/gemini-en-gb-tutor-11/…`); /v1/speak must use the same labels.
 """
@@ -75,13 +75,13 @@ def test_speak_files_a_locale_voice_under_its_id(client):
                                           "voice": "EN-GB-Tutor-11"})
     hit = client.post("/v1/speak", data={"text": "hello there", "lang": "en-gb", "voice": LOCALE})
     assert miss.status_code == 200, miss.text
-    assert (miss.headers["x-source"], miss.headers["x-voice"]) == ("gemini", f"gemini-{LOCALE}")
+    assert (miss.headers["x-source"], miss.headers["x-voice"]) == ("gemini", LOCALE)
     assert hit.headers["x-source"] == "bank" and hit.content == miss.content
     assert client.gemini.calls == [("hello there", LOCALE, "")]
     m = Manifest(str(client.paths.db), table="phrases", text_col="text")
     [row] = m.iter_rows()
     m.close()
-    assert row["voice"] == f"gemini-{LOCALE}"
+    assert row["voice"] == LOCALE
     assert row["file_path"].startswith(f"en-gb/gemini-{LOCALE}/phrases/")
 
 

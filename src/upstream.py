@@ -28,7 +28,7 @@ class UpstreamError(Exception):
 @dataclass
 class UpstreamSpeech:
     ogg: bytes
-    voice: Optional[str]    # upstream's X-Voice label (e.g. "gemini-Puck", or "Kore" for a word)
+    voice: Optional[str]    # upstream's X-Voice ("Puck"; from older code "gemini-Puck" for a phrase)
     source: Optional[str]   # upstream's X-Source ("bank" | "gemini")
 
 

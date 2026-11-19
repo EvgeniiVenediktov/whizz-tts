@@ -42,7 +42,13 @@ Two content tables are the source of truth (and the text→file index), stored
   NULL `voice` left after that marks a word never generated: the first voice
   to generate it claims the row.
 - **`phrases`** — the phrase bank, `UNIQUE(text, lang, voice)` (a phrase can
-  exist in several voices). Written by `POST /v1/speak` on a miss.
+  exist in several voices). Written by `POST /v1/speak` on a miss. Its `voice`
+  is the same label as a word's (`Kore`), so a voice's bank is its words plus
+  its phrases. Phrases saved before that say `gemini-Kore`: relabelled once
+  when the `wordbank` tools (or the server's first `/v1/speak` save) open the
+  bank, and read as `Kore` by lookups until then. A clash with a row already
+  labelled `Kore` for the same text keeps the one with a clip, then the older;
+  the other is deleted if it has no clip, else kept under the old spelling.
 
 Both share the same columns:
 
@@ -50,7 +56,7 @@ Both share the same columns:
 |--------|-------|
 | `id` | PK; also the filename prefix and shard key (`id // 1000`) |
 | `word` / `text`, `lang` | leading `(lang, …)` index → exact lookup is an O(log n) hit |
-| `voice` | the voice label the clip was generated with (`Kore`, `en-gb-tutor-11`; surfaced in lookups) |
+| `voice` | the voice label the clip was generated with (`Kore`, `en-gb-tutor-11`; the same for words and phrases; surfaced in lookups) |
 | `status` | `pending → submitted → done` (or `verified` / `failed` / `quarantined`; `retake`: a batch take QC flagged, queued for a re-take, not served) |
 | `file_path` | **relative to the bank root**, e.g. `en/gemini-Kore/1/1914_hello.wav` |
 | `seed`, `ref_audio`, `ref_text` | provenance of phrases made by the removed local OmniVoice pipeline; null for Gemini clips |
@@ -83,7 +89,7 @@ the `UNIQUE` index; prefix autocomplete uses an index range scan.
 | `GET /v1/bank?prefix=he` | word-only autocomplete (index range scan; optional `voice`) |
 | `GET /v1/bank/{word}` · `/info` | serve a word (OGG default; `wav` dev-only; optional `voice`) · sizes+type+voice |
 | `GET /v1/phrase?text=…` · `/info` | serve a phrase (by text, optional `voice`) · sizes+type+voice+provenance |
-| `POST /v1/speak` | get-or-generate — `text` (required), `lang` (default `en-us`), `voice` (optional: a classic Gemini voice or a curated locale voice, case-insensitive; unknown → `400`), `instruct` (optional, one-off: not looked up or saved). Bank hit in that voice → stored OGG, `X-Source: bank`. Miss → Gemini synth in that voice, saved into the phrase bank (`voice=gemini-<Voice>`, e.g. `gemini-Kore`, `gemini-en-gb-tutor-11`), served with `X-Source: gemini`; `X-Voice` names the voice served. Needs `GEMINI_API_KEY` only on a miss |
+| `POST /v1/speak` | get-or-generate — `text` (required), `lang` (default `en-us`), `voice` (optional: a classic Gemini voice or a curated locale voice, case-insensitive; unknown → `400`), `instruct` (optional, one-off: not looked up or saved). Bank hit in that voice → stored OGG, `X-Source: bank`. Miss → Gemini synth in that voice, saved into the phrase bank under the voice's label, as words are (`Kore`, `en-gb-tutor-11`; filed in `<lang>/gemini-<label>/phrases/`), served with `X-Source: gemini`; `X-Voice` names the voice served (that label, for a word or a phrase). Needs `GEMINI_API_KEY` only on a miss |
 | voice studio | `GET /v1/gemini/voices` (the 30 classic voices), `GET /v1/gemini/languages` (the curated female + male voice per language), `POST /v1/gemini/tts` (preview a voice, nothing saved) |
 
 ### Endpoint reference
@@ -111,7 +117,7 @@ is the curated, listen-verified list generation supports.
 
 **`GET /v1/search`** — `prefix` (required) · `lang` (default `en-us`) ·
 `limit` (default 10, capped 50) · `kind` (`word`|`phrase`, optional filter) ·
-`voice` (optional: words in that voice, phrases in `gemini-<voice>`).
+`voice` (optional: words and phrases in that voice).
 Merged prefix search; each result is `{text, type: word|phrase, voice}`, one
 per voice a text is banked in.
 
@@ -127,7 +133,8 @@ the earliest banked one. 404 `not in bank` otherwise.
 bytes}, ogg: {...}}` for the compare UI.
 
 **`GET /v1/phrase`** — `text` (required) · `lang` · `voice` (optional — pin a
-specific voice; omitted = any) · `format`. The phrase's audio, or 404.
+specific voice by its label, `Kore`; the old `gemini-Kore` is accepted too;
+omitted = any) · `format`. The phrase's audio, or 404.
 **`GET /v1/phrase/info`** — same params, plus provenance in the response:
 `seed`, `ref_audio`, `ref_text` (set only on phrases from the removed local
 pipeline).
@@ -166,8 +173,8 @@ implied). Refresh their metadata, or list candidates for a new pick, with
 **`POST /v1/speak`** — get-or-generate. `text` (required, ≤ `MAX_TEXT_LEN`) ·
 `lang` (default `en-us`) · `voice` (a classic voice from `/v1/gemini/voices`
 or a curated locale voice from `/v1/gemini/languages`, case-insensitive; default
-`GEMINI_TTS_VOICE` = Kore; also pins the bank lookup: words by the bare label,
-phrases by `gemini-<label>`, where a classic label keeps its capitals (`Kore`)
+`GEMINI_TTS_VOICE` = Kore; also pins the bank lookup: words and phrases by the
+same label, where a classic label keeps its capitals (`Kore`)
 and a locale voice is its lowercase id (`en-gb-tutor-11`); any language may use
 any of them) · `instruct` (delivery direction). Bank hit (words table for single tokens, phrases otherwise) → stored
 OGG with `X-Source: bank`; miss → Gemini synth, persisted into the phrase bank,
@@ -230,7 +237,8 @@ site backend --JWT(edge secret)--> edge (bank on /data) --miss, JWT(upstream sec
 
 - Same request/voice semantics as the upstream; `X-Source: upstream` marks a
   clip just fetched. The voice is forwarded as requested, and the clip is filed
-  under the voice upstream reports (`X-Voice`).
+  under the voice upstream reports (`X-Voice`), as its label: an upstream on
+  older code reports a phrase as `gemini-Kore`, filed here as `Kore`.
 - `instruct` requests are forwarded and never saved.
 - **Stateless upstream:** run the upstream with `SPEAK_STORE=0` and it never
   writes the bank — misses are generated with Gemini and returned only, so the

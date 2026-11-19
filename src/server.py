@@ -17,7 +17,7 @@ from wordbank.constants import BANK_OGG_APPLICATION, BANK_OGG_BITRATE
 from wordbank.gemini_tts import (DEFAULT_MODEL as GEMINI_TTS_DEFAULT_MODEL,
                                  GeminiStyleUnsupportedError, GeminiVoiceUnsupportedError,
                                  canonical_voice, check_voice, is_classic_voice,
-                                 style_models, supports_style, voice_label)
+                                 plain_voice_label, style_models, supports_style)
 from wordbank.languages import normalize_lang
 from wordbank.lookup import BankLookup
 from wordbank.paths import voice_from_path
@@ -115,10 +115,12 @@ def _gemini_voice(voice: Optional[str]) -> Optional[str]:
 
 
 def _bank_voice(voice: Optional[str]) -> Optional[str]:
-    """A lookup's `voice` as the word bank labels it (gemini_tts.voice_label:
-    "kore" -> "Kore"), None when omitted. Lenient, unlike _gemini_voice: a
-    read can't waste a Gemini call, and a bank may hold any library voice."""
-    return voice_label(voice) if voice and voice.strip() else None
+    """A lookup's `voice` as the bank labels words and phrases
+    (gemini_tts.plain_voice_label: "kore" -> "Kore"; the legacy phrase
+    spelling "gemini-Kore" too), None when omitted. Lenient, unlike
+    _gemini_voice: a read can't waste a Gemini call, and a bank may hold any
+    library voice."""
+    return plain_voice_label(voice) if voice and voice.strip() else None
 
 
 def _default_voice() -> str:
@@ -248,8 +250,8 @@ def search(prefix: str, lang: str = DEFAULT_LANG, limit: int = 10,
     """Merged prefix search over the word + phrase banks. Each result carries a
     `type` flag ('word'|'phrase') and the `voice` it was generated with — one
     result per voice a text is banked in. `kind=word|phrase` restricts to one
-    bank; `voice` to that voice (words by the bare label, phrases by
-    `gemini-<label>`, as /v1/speak matches them)."""
+    bank; `voice` to that voice (words and phrases by the same label, as
+    /v1/speak matches them)."""
     return {"results": app.state.bank.search(prefix, _lang(lang), min(limit, 50), kind,
                                              _bank_voice(voice))}
 
@@ -309,8 +311,9 @@ def bank_get(word: str, lang: str = DEFAULT_LANG, format: str = "ogg",
 
 @app.get("/v1/phrase/info")
 def phrase_info(text: str, lang: str = DEFAULT_LANG, voice: Optional[str] = None):
-    """Sizes/availability for a phrase (optionally pin a voice)."""
-    row = app.state.bank.get_phrase(text, _lang(lang), voice)
+    """Sizes/availability for a phrase (optionally pin a voice: its label,
+    "Kore"; the legacy "gemini-Kore" is accepted too)."""
+    row = app.state.bank.get_phrase(text, _lang(lang), _bank_voice(voice))
     if row is None:
         raise HTTPException(404, "not in phrase bank")
     rel = row["file_path"]
@@ -323,8 +326,9 @@ def phrase_info(text: str, lang: str = DEFAULT_LANG, voice: Optional[str] = None
 @app.get("/v1/phrase")
 def phrase_get(text: str, lang: str = DEFAULT_LANG, voice: Optional[str] = None,
                format: str = "ogg"):
-    """Serve a phrase's audio (OGG by default, WAV master in dev)."""
-    row = app.state.bank.get_phrase(text, _lang(lang), voice)
+    """Serve a phrase's audio (OGG by default, WAV master in dev); `voice` as
+    for /v1/phrase/info."""
+    row = app.state.bank.get_phrase(text, _lang(lang), _bank_voice(voice))
     if row is None:
         raise HTTPException(404, "not in phrase bank")
     return _serve_audio(row["file_path"], format)
@@ -342,14 +346,13 @@ def _speak_bank_hit(text: str, lang: str, voice: Optional[str], eff_voice: str):
     in the word bank; anything may be in the phrase bank. Without a `voice`,
     the default voice (`eff_voice`) is preferred in both. A manifest row whose
     OGG is missing on disk is a MISS."""
-    bank_voice = f"gemini-{eff_voice}"
     if not any(c.isspace() for c in text):
         row = app.state.bank.get(text, lang, voice=voice, prefer=eff_voice)
         if row is not None and os.path.exists(_ogg_abs(row["file_path"])):
             row_voice = row["voice"] or voice_from_path(row["file_path"] or "")
             return _serve_audio(row["file_path"], "ogg",
                                 headers=_bank_voice_headers("bank", row_voice))
-    for pinned in ([bank_voice] if voice else [bank_voice, None]):
+    for pinned in ([eff_voice] if voice else [eff_voice, None]):
         row = app.state.bank.get_phrase(text, lang, voice=pinned)
         if row is not None and os.path.exists(_ogg_abs(row["file_path"])):
             return _serve_audio(row["file_path"], "ogg",
@@ -357,7 +360,7 @@ def _speak_bank_hit(text: str, lang: str, voice: Optional[str], eff_voice: str):
     return None
 
 
-# Single-flight for /v1/speak misses: (text, lang, bank voice) -> [lock, users].
+# Single-flight for /v1/speak misses: (text, lang, voice) -> [lock, users].
 # Concurrent requests for the same new clip queue behind the first, then find it
 # banked, instead of each paying for its own generation. In-process, which is
 # enough: the bank is one SQLite file, so a deployment is one server process.
@@ -425,11 +428,11 @@ async def _gemini_clip(text: str, voice: str, instruct: str,
 
 async def _upstream_clip(url: str, text: str, lang: str, voice: Optional[str],
                          instruct: str, fallback_voice: str) -> tuple:
-    """Fetch a miss from the upstream server -> (OGG, bank voice label). The
-    voice is forwarded as requested (None stays None), so upstream applies its
-    own default/any-banked rules; the clip is filed under the voice upstream
-    reports. A word-bank hit there reports a bare Gemini name ("Kore"), which
-    is filed as the phrase voice "gemini-Kore" here."""
+    """Fetch a miss from the upstream server -> (OGG, voice label). The voice
+    is forwarded as requested (None stays None), so upstream applies its own
+    default/any-banked rules; the clip is filed under the voice upstream
+    reports, as its plain label: "Kore" (an upstream on older code reports
+    its phrases as "gemini-Kore": filed as "Kore" too)."""
     token = os.getenv("SPEAK_UPSTREAM_TOKEN")
     try:
         speech = await asyncio.get_running_loop().run_in_executor(
@@ -437,25 +440,25 @@ async def _upstream_clip(url: str, text: str, lang: str, voice: Optional[str],
                                        timeout=SPEAK_UPSTREAM_TIMEOUT))
     except UpstreamError as exc:
         raise HTTPException(exc.status, exc.detail) from exc
-    label = speech.voice
-    if label and canonical_voice(label):
-        label = f"gemini-{canonical_voice(label)}"
+    label = plain_voice_label(speech.voice) if speech.voice else None
     if label and (label in (".", "..") or any(c in label for c in "/\\\0")):
         # the label becomes a directory of the saved clip: one plain segment only
         raise HTTPException(502, f"upstream reported an unusable voice label {label!r}")
     return speech.ogg, label or fallback_voice
 
 
-def _save_phrase(text: str, lang: str, bank_voice: str, ogg: bytes,
+def _save_phrase(text: str, lang: str, voice: str, ogg: bytes,
                  pcm: Optional[bytes] = None, billed_chars: Optional[int] = None,
                  model: Optional[str] = None, style: Optional[str] = None) -> None:
-    """Persist a /v1/speak clip into the phrase bank. Phrases get their own `phrases/` subtree: phrase and word ids
-    are separate sequences, so `<lang>/<voice>/<n>/<id>_<slug>` alone could
-    collide with a word clip of the same id, voice, and slug."""
+    """Persist a /v1/speak clip into the phrase bank under its voice label
+    ("Kore", as words are), filed in the voice's directory like a word,
+    `<lang>/gemini-<voice>/`, in its own `phrases/` subtree: phrase and word
+    ids are separate sequences, so `<lang>/gemini-<voice>/<n>/<id>_<slug>`
+    alone could collide with a word clip of the same id, voice, and slug."""
     from wordbank.manifest import DONE, Manifest
     from wordbank.paths import safe_filename
     from wordbank.paths import path_under
-    clip_dir = os.path.join(lang, bank_voice, "phrases")
+    clip_dir = os.path.join(lang, f"gemini-{voice}", "phrases")
     try:
         # lang and the voice label are checked on the way in; this is the last
         # line of defence, run before the row exists so a refusal leaves nothing.
@@ -467,8 +470,8 @@ def _save_phrase(text: str, lang: str, bank_voice: str, ogg: bytes,
     os.makedirs(os.path.dirname(db) or ".", exist_ok=True)   # bank-less deploy: first write creates it
     m = Manifest(db, table="phrases", text_col="text")
     try:
-        m.add_words([text], lang, voice=bank_voice)
-        row = m.get_entry(text, lang, bank_voice)
+        m.add_words([text], lang, voice=voice)
+        row = m.get_entry(text, lang, voice)
         rel = os.path.join(clip_dir, str(row["id"] // 1000),
                            f"{row['id']}_{safe_filename(text)}.wav")
         ogg_path = _ogg_abs(rel)
@@ -484,7 +487,7 @@ def _save_phrase(text: str, lang: str, bank_voice: str, ogg: bytes,
                     f.write(pcm_to_wav_bytes(pcm))
             except OSError:
                 pass
-        m.set_status(row["id"], DONE, file_path=rel, billed_chars=billed_chars, voice=bank_voice,
+        m.set_status(row["id"], DONE, file_path=rel, billed_chars=billed_chars, voice=voice,
                      model=model, style=style)
     finally:
         m.close()
@@ -511,12 +514,11 @@ async def speak(
 
     `voice` is a classic Gemini voice name or a curated locale voice id
     (/v1/gemini/languages), case-insensitive. When given, only a recording in
-    that voice is served — words match the bare label ("Kore",
-    "en-gb-tutor-11"), phrases the bank voice `gemini-<label>` — and a miss is
-    generated in it. When omitted, any banked recording serves (the default
-    GEMINI_TTS_VOICE first) and a miss is generated in the default voice. A
-    locale voice needs a 3.8 GEMINI_TTS_MODEL: on another model a miss is a
-    400 (bank hits still serve).
+    that voice is served — words and phrases match the same label ("Kore",
+    "en-gb-tutor-11") — and a miss is generated in it. When omitted, any
+    banked recording serves (the default GEMINI_TTS_VOICE first) and a miss is
+    generated in the default voice. A locale voice needs a 3.8
+    GEMINI_TTS_MODEL: on another model a miss is a 400 (bank hits still serve).
 
     `instruct` (style direction) makes the request a one-off: the bank has no
     key for style, so it is neither looked up nor saved. How it reaches Gemini
@@ -528,7 +530,8 @@ async def speak(
     `lang` is a language code like `en-us` (case-insensitive, filed lowercase);
     anything else is a 400 before the bank, Gemini, or upstream is touched.
 
-    Response headers: `X-Source: bank|gemini|upstream`, `X-Voice: <voice label>`.
+    Response headers: `X-Source: bank|gemini|upstream`, `X-Voice: <voice label>`
+    (the plain label, the same for a word or a phrase).
     """
     text = text.strip()
     if not text:
@@ -539,19 +542,18 @@ async def speak(
     voice = _gemini_voice(voice)
     instruct = (instruct or "").strip()
     eff_voice = voice or _default_voice()
-    bank_voice = f"gemini-{eff_voice}"
     upstream = _upstream_url()
 
     async def _generate():
         """-> (ogg, voice label, source, pcm, billed chars, provenance kwargs)."""
         if upstream:
-            ogg, label = await _upstream_clip(upstream, text, lang, voice, instruct, bank_voice)
+            ogg, label = await _upstream_clip(upstream, text, lang, voice, instruct, eff_voice)
             return ogg, label, "upstream", None, None, {}
         _check_voice(eff_voice, GEMINI_TTS_MODEL, server_default=not voice)
         style = None if instruct else _tts_style()   # a one-off's instruct replaces it
         ogg, pcm = await _gemini_clip(text, eff_voice, instruct, style)
-        return ogg, bank_voice, "gemini", pcm, len(text), {"model": GEMINI_TTS_MODEL,
-                                                           "style": style}
+        return ogg, eff_voice, "gemini", pcm, len(text), {"model": GEMINI_TTS_MODEL,
+                                                          "style": style}
 
     if instruct:
         ogg, label, source, *_ = await _generate()
@@ -562,10 +564,10 @@ async def speak(
     if hit is not None:
         return hit
     if not _speak_store():
-        ogg, label, source, *_ = await _coalesced((text.lower(), lang, bank_voice), _generate)
+        ogg, label, source, *_ = await _coalesced((text.lower(), lang, eff_voice), _generate)
         return Response(content=ogg, media_type="audio/ogg",
                         headers=_bank_voice_headers(source, label))
-    async with _single_flight((text.lower(), lang, bank_voice)):
+    async with _single_flight((text.lower(), lang, eff_voice)):
         hit = _speak_bank_hit(text, lang, voice, eff_voice)   # a queued twin may have saved it
         if hit is not None:
             return hit
@@ -629,7 +631,8 @@ def gemini_languages():
     """The curated Gemini voices per language (wordbank/gemini_voices.json):
     each bank `lang` code with one female and one male voice and their voice
     library metadata. A voice's `name` is what /v1/speak and /v1/gemini/tts
-    take as `voice`, and the label clips are filed under (`gemini-<name>`).
+    take as `voice`, and the label its words and phrases are banked under
+    (filed in `<lang>/gemini-<name>/`).
     `classic` marks the language-agnostic classic voices (en-us uses two);
     the others are locale voices, which need a 3.8 model (`locale_voice_models`)."""
     from wordbank.gemini_tts import locale_voice_models
