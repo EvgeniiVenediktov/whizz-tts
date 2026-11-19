@@ -16,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 
 from .auth import require_auth
-from .upstream import UpstreamError, fetch_speech
+from .upstream import UpstreamError, fetch_preview, fetch_speech
 from wordbank.constants import BANK_OGG_APPLICATION, BANK_OGG_BITRATE
 from wordbank.gemini_tts import (DEFAULT_MODEL as GEMINI_TTS_DEFAULT_MODEL, TTS_MODELS, VOICES,
                                  GeminiNoAudioError, GeminiStyleUnsupportedError,
@@ -509,20 +509,25 @@ async def _encode_ogg(pcm: bytes) -> bytes:
         raise HTTPException(500, "OGG encoding failed") from exc
 
 
+async def _from_upstream(path: str, fetch):
+    """fetch(SPEAK_UPSTREAM_TOKEN) off the event loop; UpstreamError as HTTP."""
+    token = os.getenv("SPEAK_UPSTREAM_TOKEN")
+    try:
+        return await _in_executor(lambda: fetch(token))
+    except UpstreamError as exc:
+        if exc.status >= 500:
+            log.warning("upstream %s: %s (%r)", path, exc.detail, exc.__cause__)
+        raise HTTPException(exc.status, exc.detail) from exc
+
+
 async def _upstream_clip(url: str, text: str, lang: str, voice: Optional[str],
                          instruct: str, fallback_voice: str) -> _Clip:
     """A miss fetched from the upstream server in audio mode, filed under the
     voice it reports, which must be a known voice: it names the saved clip's
     directory and is shown by the frontend (an older upstream's "gemini-Kore"
     is "Kore"); and under its clip id, when it sends one."""
-    token = os.getenv("SPEAK_UPSTREAM_TOKEN")
-    try:
-        speech = await _in_executor(lambda: fetch_speech(
-            url, token, text, lang, voice, instruct, timeout=SPEAK_UPSTREAM_TIMEOUT))
-    except UpstreamError as exc:
-        if exc.status >= 500:
-            log.warning("upstream /v1/speak: %s (%r)", exc.detail, exc.__cause__)
-        raise HTTPException(exc.status, exc.detail) from exc
+    speech = await _from_upstream("/v1/speak", lambda token: fetch_speech(
+        url, token, text, lang, voice, instruct, timeout=SPEAK_UPSTREAM_TIMEOUT))
     label = canonical_voice(speech.voice.strip().removeprefix("gemini-")) \
         if speech.voice else fallback_voice
     if label is None:
@@ -663,22 +668,29 @@ def clip_get(clip_id: str):
 @app.post("/v1/gemini/tts", dependencies=[Depends(require_auth)])
 async def gemini_tts(
     text: str = Form(...),
-    voice: Annotated[str, Form()] = GEMINI_TTS_VOICE,
+    voice: Annotated[Optional[str], Form()] = None,
     instruct: Annotated[Optional[str], Form()] = None,
-    model: Annotated[str, Form()] = GEMINI_TTS_MODEL,
+    model: Annotated[Optional[str], Form()] = None,
     style: Annotated[Optional[str], Form()] = None,
 ):
     """Preview a phrase in a Gemini voice -> WAV; nothing saved. `voice`,
     `instruct` as for /v1/speak; `style` (3.8 models only) as speech metadata.
-    GEMINI_TTS_STYLE does not apply."""
+    GEMINI_TTS_STYLE does not apply. An edge (no Gemini key) passes it to the
+    upstream, with only the fields given (its own defaults apply there)."""
     if len(text) > MAX_TEXT_LEN:
         raise HTTPException(400, f"text exceeds {MAX_TEXT_LEN} characters")
-    if model not in TTS_MODELS and model != GEMINI_TTS_MODEL:
+    if model and model not in TTS_MODELS and model != GEMINI_TTS_MODEL:
         raise HTTPException(400, f"unknown model {model!r} (one of: {', '.join(TTS_MODELS)})")
-    voice = _gemini_voice(voice) or GEMINI_TTS_VOICE
+    voice, instruct = _gemini_voice(voice), _direction(instruct, "instruct")
+    style = _direction(style, "style") or None
+    if upstream := _upstream_url():
+        fields = {"text": text, "voice": voice, "instruct": instruct, "model": model, "style": style}
+        wav = await _from_upstream("/v1/gemini/tts", lambda token: fetch_preview(
+            upstream, token, fields, timeout=SPEAK_UPSTREAM_TIMEOUT))
+        return Response(content=wav, media_type="audio/wav")
+    model, voice = model or GEMINI_TTS_MODEL, voice or GEMINI_TTS_VOICE
     _check_voice(voice, model)
-    pcm = await _synthesize(text, voice, _direction(instruct, "instruct"), model,
-                            _direction(style, "style") or None)
+    pcm = await _synthesize(text, voice, instruct, model, style)
     return Response(content=pcm_to_wav_bytes(pcm), media_type="audio/wav")
 
 

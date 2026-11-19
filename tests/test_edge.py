@@ -195,6 +195,18 @@ def test_upstream_failures_map_to_clear_errors_and_save_nothing(edge, status, bo
     assert _phrases(edge.paths) == []
 
 
+def test_voice_preview_is_made_by_the_upstream(edge):
+    """An edge has no Gemini key: /v1/gemini/tts goes upstream with the
+    fields given (defaults are upstream's), and its WAV comes back as is."""
+    edge.upstream.respond = lambda f: (200, {"Content-Type": "audio/wav"}, b"RIFF" + f["text"].encode())
+    r = edge.post("/v1/gemini/tts", data={"text": "hello", "voice": "puck", "style": "calm"})
+    assert (r.status_code, r.content, r.headers["content-type"]) == (200, b"RIFFhello", "audio/wav")
+    [q] = edge.upstream.requests
+    assert q == {"path": "/v1/gemini/tts", "accept": "audio/wav", "auth": f"Bearer {TOKEN}",
+                 "text": "hello", "voice": "Puck", "style": "calm"}
+    assert edge.gemini.calls == []
+
+
 def test_upstream_redirects_are_not_followed(edge):
     """urllib would follow a 302 to any host, bearer token included."""
     elsewhere = FakeUpstream()

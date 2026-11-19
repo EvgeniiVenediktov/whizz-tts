@@ -1,8 +1,10 @@
-"""Edge mode: fetch a /v1/speak miss from an upstream whizz-tts server.
+"""Edge mode: fetch a /v1/speak miss (or a voice preview) from an upstream
+whizz-tts server.
 
 An edge (a cache deployed next to its client) keeps its own copy of the bank
 and, instead of calling Gemini itself, forwards misses to the upstream
-server's /v1/speak, then saves what comes back. Stdlib only (urllib +
+server's /v1/speak, then saves what comes back; /v1/gemini/tts previews are
+passed through (nothing saved). Stdlib only (urllib +
 urlencoded form, which FastAPI's Form() accepts), so it adds nothing to the
 bank-only image.
 """
@@ -45,22 +47,36 @@ class UpstreamSpeech:
 def fetch_speech(base_url: str, token: Optional[str], text: str, lang: str,
                  voice: Optional[str] = None, instruct: str = "",
                  timeout: float = 60.0) -> UpstreamSpeech:
-    """POST text to `<base_url>/v1/speak` in audio mode and return the OGG.
+    """POST text to `<base_url>/v1/speak` in audio mode and return the OGG."""
+    fields = {"text": text, "lang": lang, "voice": voice, "instruct": instruct}
+    body, headers = _post(base_url, "/v1/speak", token, fields, "audio/ogg", timeout)
+    if body[:4] != b"OggS":
+        raise UpstreamError(502, f"upstream returned {headers.get('Content-Type')!r}, not OGG audio")
+    return UpstreamSpeech(ogg=body, voice=headers.get("X-Voice"), clip_id=headers.get("X-Clip-Id"))
+
+
+def fetch_preview(base_url: str, token: Optional[str], fields: dict,
+                  timeout: float = 60.0) -> bytes:
+    """POST a voice preview (/v1/gemini/tts form fields) upstream -> the WAV."""
+    body, headers = _post(base_url, "/v1/gemini/tts", token, fields, "audio/wav", timeout)
+    if body[:4] != b"RIFF":
+        raise UpstreamError(502, f"upstream returned {headers.get('Content-Type')!r}, not WAV audio")
+    return body
+
+
+def _post(base_url: str, path: str, token: Optional[str], fields: dict, accept: str,
+          timeout: float) -> tuple:
+    """POST the non-empty `fields` urlencoded -> (body, headers).
 
     Upstream 400s are passed through (the request itself is bad); every other
     failure is the edge's upstream problem, not the caller's: 502 (504 on a
     timeout), with upstream's detail in the message. Redirects are not
     followed, and a reply over MAX_REPLY_BYTES is refused.
     """
-    fields = {"text": text, "lang": lang}
-    if voice:
-        fields["voice"] = voice
-    if instruct:
-        fields["instruct"] = instruct
     req = urllib.request.Request(
-        base_url.rstrip("/") + "/v1/speak",
-        data=urllib.parse.urlencode(fields).encode(),
-        headers={"Accept": "audio/ogg", **({"Authorization": f"Bearer {token}"} if token else {})},
+        base_url.rstrip("/") + path,
+        data=urllib.parse.urlencode({k: v for k, v in fields.items() if v}).encode(),
+        headers={"Accept": accept, **({"Authorization": f"Bearer {token}"} if token else {})},
         method="POST",
     )
     try:
@@ -83,9 +99,7 @@ def fetch_speech(base_url: str, token: Optional[str], text: str, lang: str,
 
     if len(body) > MAX_REPLY_BYTES:
         raise UpstreamError(502, f"upstream reply exceeds {MAX_REPLY_BYTES} bytes")
-    if body[:4] != b"OggS":
-        raise UpstreamError(502, f"upstream returned {headers.get('Content-Type')!r}, not OGG audio")
-    return UpstreamSpeech(ogg=body, voice=headers.get("X-Voice"), clip_id=headers.get("X-Clip-Id"))
+    return body, headers
 
 
 def _detail(raw: bytes) -> str:
