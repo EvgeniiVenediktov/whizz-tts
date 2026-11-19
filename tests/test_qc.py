@@ -6,9 +6,10 @@ import csv
 import pytest
 
 from tests.conftest import clip_pcm16, interaction_resp
+from tests.test_wordbank_batch import ScriptedBatch
 from wordbank import qc
 from wordbank.gemini_batch import write_wav_from_pcm_bytes
-from wordbank.gemini_tts import pcm_to_wav_bytes
+from wordbank.gemini_tts import pcm_to_wav_bytes, route_direction
 from wordbank.manifest import DONE, RETAKE, Manifest
 
 LITE = "gemini-3.8-flash-lite-tts"
@@ -37,7 +38,7 @@ def test_best_take_prefers_a_plausible_length_then_the_quieter_end():
     assert qc.best_take(("long", long_but_silent), ("loud", loud))[0] == "loud"
 
 
-def _bank(tmp_path, clips):
+def _bank(tmp_path, clips, model="gemini-3.1-flash-tts-preview", style="old"):
     """Done en-gb rows with real WAV masters and OGG copies: {word: pcm}."""
     m = Manifest(str(tmp_path / "wb.db"))
     m.add_words(list(clips), "en-gb", voice=VOICE)
@@ -45,8 +46,7 @@ def _bank(tmp_path, clips):
         rel = f"en-gb/gemini-{VOICE}/0/{r['id']}_{r['word']}.wav"
         write_wav_from_pcm_bytes(_mkdir(tmp_path / "words" / rel), clips[r["word"]])
         _mkdir(tmp_path / "words_ogg" / (rel[:-4] + ".ogg")).write_bytes(b"OggS-old")
-        m.set_status(r["id"], DONE, file_path=rel, voice=VOICE,
-                     model="gemini-3.1-flash-tts-preview", style="old")
+        m.set_status(r["id"], DONE, file_path=rel, voice=VOICE, model=model, style=style)
     m.close()
 
 
@@ -85,7 +85,7 @@ def test_qc_records_flags_and_retry_keeps_the_best_take(tmp_path, gemini_api, ca
     # haha's re-take passes; russian's ends louder (-20 dB) than its original
     gemini_api.interactions = [interaction_resp(pcm_to_wav_bytes(clip_pcm16(seed=1))),
                                interaction_resp(pcm_to_wav_bytes(clip_pcm16(end_db=-20)))]
-    _cli(tmp_path, "qc", "--retry", "--model", LITE, "--style", "plain", "--qc-retries", "1",
+    _cli(tmp_path, "qc", "--retry", "--sync", "--model", LITE, "--style", "plain", "--qc-retries", "1",
          "--rpm", "6000", "--ogg-root", str(tmp_path / "words_ogg"), "--csv", str(review))
     out = capsys.readouterr().out
     assert "2 flagged, 1 resolved by a re-take, 1 still flagged" in out
@@ -109,6 +109,43 @@ def test_qc_records_flags_and_retry_keeps_the_best_take(tmp_path, gemini_api, ca
     assert "QC: 1 flagged for review, 0 never checked" in capsys.readouterr().out
 
 
+def test_qc_retry_batches_the_retakes_with_each_clips_own_provenance(tmp_path, monkeypatch, capsys):
+    """haha passes on its first batch re-take; russian's two are both louder at
+    the end than its original, which is filed back with its flag."""
+    original = {"cat": clip_pcm16(), "haha": clip_pcm16(end_db=-25),
+                "russian": clip_pcm16(end_db=-30)}
+    _bank(tmp_path, original, model=LITE, style="plain")
+    batch = ScriptedBatch({"haha": [clip_pcm16(seed=1)],
+                           "russian": [clip_pcm16(end_db=-20), clip_pcm16(end_db=-22)]})
+    made = []
+
+    def gemini_batch(model, voice, instruction, style):
+        batch.model, batch.voice = model, voice
+        batch.style, batch.instruction = route_direction(model, instruction, style)
+        made.append((model, voice, batch.direction))
+        return batch
+    monkeypatch.setattr("wordbank.__main__.GeminiBatch", gemini_batch)
+
+    _cli(tmp_path, "qc", "--retry", "--ogg-root", str(tmp_path / "words_ogg"))
+    assert "2 flagged, 1 resolved by a re-take, 1 still flagged" in capsys.readouterr().out
+    assert made == [(LITE, VOICE, "plain")]
+    assert batch.sent == [["haha", "russian"], ["russian"]]
+    rows = _rows(tmp_path)
+    assert [(rows[w]["status"], rows[w]["review"], rows[w]["qc_takes"], rows[w]["attempts"],
+             rows[w]["model"], rows[w]["style"]) for w in ("haha", "russian")] == [
+        (DONE, None, 1, 0, LITE, "plain"), (DONE, "ends on sound (-30 dB)", 2, 0, LITE, "plain")]
+    words = tmp_path / "words"
+    assert qc.read_pcm(words / rows["haha"]["file_path"]) == clip_pcm16(seed=1)
+    assert qc.read_pcm(words / rows["russian"]["file_path"]) == original["russian"]
+    assert not list((tmp_path / "takes" / "qc").rglob("*.wav"))      # held takes filed
+    assert sorted(p.name for p in (tmp_path / "takes").rglob("*_*.*")) == [
+        f"{rows['haha']['id']}_haha.ogg", f"{rows['haha']['id']}_haha.wav",
+        f"{rows['russian']['id']}_russian.ogg", f"{rows['russian']['id']}_russian.wav"]
+
+    with pytest.raises(SystemExit, match="add --sync"):
+        _cli(tmp_path, "qc", "--retry", "--model", LITE)
+
+
 def test_accepted_clips_are_neither_reflagged_nor_retaken(tmp_path, gemini_api, capsys):
     """A person listened and kept a flagged clip: qc leaves it alone until a
     regenerate gives the word a new take."""
@@ -116,7 +153,7 @@ def test_accepted_clips_are_neither_reflagged_nor_retaken(tmp_path, gemini_api, 
     keep = tmp_path / "keep.txt"
     keep.write_text("tom\n")
     gemini_api.interactions = [interaction_resp(pcm_to_wav_bytes(clip_pcm16(seed=1)))]
-    _cli(tmp_path, "qc", "--accept-file", str(keep), "--retry", "--model", LITE,
+    _cli(tmp_path, "qc", "--accept-file", str(keep), "--retry", "--sync", "--model", LITE,
          "--style", "plain", "--rpm", "6000")
     out = capsys.readouterr().out
     assert "accepted 1 clip(s)" in out and "checked 1 clip(s)" in out

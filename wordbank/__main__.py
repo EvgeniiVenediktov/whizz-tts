@@ -317,10 +317,14 @@ def _write_qc_csv(path: str, m: Manifest, still: list, final: dict) -> None:
 
 def cmd_qc(args, cfg: Config) -> None:
     """Check the bank's clips (wordbank/qc.py) and record the result. With
-    --retry, re-take each flagged word synchronously in the row's own voice
-    until a take passes or --qc-retries run out; a replaced take is moved to
-    <db dir>/takes/."""
+    --retry, re-take each flagged word in the row's own voice until a take
+    passes or --qc-retries run out: in batches with the row's own model and
+    direction, or with --sync one request at a time with --model/--style. A
+    replaced take is moved to <db dir>/takes/."""
 
+    if args.retry and not args.sync and (args.model or args.style or args.instruction is not None):
+        sys.exit("--model/--style/--instruction re-take with another model or direction: add "
+                 "--sync (a batch re-take keeps each clip's own)")
     _require_db(cfg)
     voice = args.voice
     lang = None if args.all_langs else cfg.lang
@@ -351,7 +355,8 @@ def cmd_qc(args, cfg: Config) -> None:
         final = {r["id"]: checks[r["id"]] for r in flagged}
         take_dir, replaced = None, 0
         if args.retry and flagged:
-            take_dir, replaced = _qc_retakes(args, cfg, m, flagged, checks, final, clip)
+            take_dir, replaced = (_qc_retakes(args, cfg, m, flagged, checks, final, clip)
+                                  if args.sync else _qc_batch_retakes(args, cfg, m, flagged, final))
         still = [r for r in flagged if final[r["id"]].flagged]
         if args.csv:
             _write_qc_csv(args.csv, m, still, final)
@@ -372,13 +377,15 @@ def cmd_qc(args, cfg: Config) -> None:
         print(f"replaced {replaced} clip(s); previous takes in {take_dir}")
         print(f"  python scripts/encode_wavs.py {cfg.out_dir} {args.ogg_root or '<ogg root>'}")
     elif flagged and not args.retry:
-        print("re-take them: add --retry --model <model> [--style \"...\"]")
+        print("re-take them: add --retry (batches, each clip's own model and direction), "
+              "or --retry --sync --model <model> [--style \"...\"]")
 
 
 def _qc_retakes(args, cfg: Config, m: Manifest, flagged, checks, final, clip) -> tuple:
-    """`qc --retry`: re-take each flagged row in its own voice; updates `final`
-    (row id -> Check). -> (take dir, number of bank clips it replaced)."""
+    """`qc --retry --sync`: re-take each flagged row in its own voice; updates
+    `final` (row id -> Check). -> (take dir, number of bank clips it replaced)."""
 
+    args.model = args.model or GEMINI_TTS_DEFAULT_MODEL
     instruction, style = _direction_args(args)
     voice_of = {r["id"]: r["voice"] or voice_from_path(r["file_path"]) for r in flagged}
     for v in sorted({v for v in voice_of.values() if v}):
@@ -415,6 +422,61 @@ def _qc_retakes(args, cfg: Config, m: Manifest, flagged, checks, final, clip) ->
             if row["status"] == RETAKE:
                 held.unlink()               # only once the new take is filed
         final[row["id"]] = check
+    return take_dir, len(listing)
+
+
+def _qc_batch_retakes(args, cfg: Config, m: Manifest, flagged, final) -> tuple:
+    """`qc --retry`: queue each flagged row for a re-take as a batch collect
+    does (status RETAKE, its take held at qc.retake_path, the bank copies moved
+    to a takes dir) and re-take it in batches with its own voice, model and
+    direction, up to --qc-retries more takes. A row without a recorded model
+    (generated before provenance was kept) needs --sync --model. Updates
+    `final`. -> (take dir, number of clips queued)."""
+
+    queue = []
+    for row in flagged:
+        voice = row["voice"] or voice_from_path(row["file_path"])
+        if not (voice and row["model"]):
+            print(f"  {row['word']!r}: no {'model' if voice else 'voice'} recorded, skipped "
+                  "(re-take it with --sync --model ...)")
+            continue
+        _check_voice(voice, row["model"], "--retry")
+        queue.append((row, voice))
+    take_dir, roots, listing, before = None, _take_roots(cfg, args.ogg_root), [], {}
+    groups = {}
+    for row, voice in queue:
+        if row["status"] == RETAKE:         # already queued: its next take is a re-take
+            before[row["id"]] = row["qc_takes"] - 1
+        else:
+            held = qc.retake_path(cfg.db, row["id"])
+            held.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(pathlib.Path(cfg.out_dir) / row["file_path"], held)
+            m.set_status(row["id"], RETAKE, file_path=row["file_path"],
+                         billed_chars=row["billed_chars"], voice=voice, check=final[row["id"]],
+                         qc_takes=row["qc_takes"] + 1)
+            take_dir = take_dir or _take_dir(cfg)
+            _archive_take(cfg, row, take_dir, roots, listing)
+            before[row["id"]] = row["qc_takes"]
+        key = (row["lang"], voice, row["model"], row["style"])
+        groups[key] = groups.get(key, 0) + 1
+
+    def budget(row):                        # other in-flight jobs keep the usual budget
+        return before.get(row["id"], 0) + args.qc_retries
+
+    print(f"re-taking {len(queue)} flagged clip(s) in batches, each with its own voice, "
+          f"model and direction, up to {args.qc_retries} take(s) each")
+    for (lang, voice, model, direction), n in groups.items():
+        print(f"{n} clip(s): {lang}, voice {voice}, {model}, direction {direction!r}")
+        caps = model_caps(model)
+        batch = GeminiBatch(model=model, voice=voice,
+                            instruction="" if caps.style else (direction or ""),
+                            style=direction if caps.style else None)
+        run_in_waves(m, batch, cfg.out_dir, lang=lang, poll_interval=args.poll_interval,
+                     qc_retries=budget, fresh=False)
+    now = {r["id"]: r for r in m.iter_rows()}
+    for row, _ in queue:
+        r = now[row["id"]]
+        final[r["id"]] = qc.Check(r["qc_seconds"], r["qc_end_db"])
     return take_dir, len(listing)
 
 
@@ -537,12 +599,16 @@ def main(argv=None) -> None:
                    help="words (one per line) a person listened to and kept despite a flag: "
                         "their flag is cleared and qc skips them from now on (regenerate undoes it)")
     q.add_argument("--retry", action="store_true",
-                   help="re-take flagged words with Gemini (sync, rate-limited), each in its "
-                        "own voice, with --model and --style/--instruction")
-    q.add_argument("--model", default=GEMINI_TTS_DEFAULT_MODEL,
-                   help=f"Gemini TTS model for --retry (default {GEMINI_TTS_DEFAULT_MODEL})")
+                   help="re-take flagged words with Gemini in batches, each in its own voice, "
+                        "model and direction")
+    q.add_argument("--sync", action="store_true",
+                   help="--retry one request at a time (rate-limited), with --model and "
+                        "--style/--instruction")
+    q.add_argument("--model", default=None,
+                   help=f"Gemini TTS model for --retry --sync (default {GEMINI_TTS_DEFAULT_MODEL})")
     _add_direction_args(q)
     _add_rpm_arg(q)
+    q.add_argument("--poll-interval", type=int, default=60, dest="poll_interval")
     _add_qc_arg(q)
     q.add_argument("--ogg-root", default=None, dest="ogg_root",
                    help="OGG tree of the bank: a replaced clip's OGG copy is moved aside too, "

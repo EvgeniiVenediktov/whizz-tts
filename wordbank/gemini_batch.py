@@ -223,12 +223,14 @@ def _write_and_mark(manifest: Manifest, out_dir: pathlib.Path, lang: str,
 
 
 def _settle_take(manifest: Manifest, out_dir: pathlib.Path, row, pcm: Optional[bytes],
-                 *, qc_retries: int) -> Optional[str]:
+                 *, qc_retries) -> Optional[str]:
     """QC a collected take (`pcm`; None when the request produced none) against
     the row's best take so far, if it is a re-take, and file the outcome:
     "passed" / "resolved" (passed on a re-take) / "flagged" (re-takes used up,
     the best take filed with its flag) / "requeued" (status RETAKE). None when
-    there is no take at all: the caller fails the row as before QC."""
+    there is no take at all: the caller fails the row as before QC.
+    `qc_retries`: the row's re-take budget, or a function of the row giving it
+    (`wordbank qc --retry`: the re-takes it had before + N)."""
     lang, voice = row["lang"], row["voice"]
     held = qc.retake_path(manifest.path, row["id"])
     takes = []
@@ -239,7 +241,8 @@ def _settle_take(manifest: Manifest, out_dir: pathlib.Path, row, pcm: Optional[b
     if not takes:
         return None
     best, check = qc.best_take(*takes)
-    if check.flagged and row["qc_takes"] < qc_retries:
+    limit = qc_retries(row) if callable(qc_retries) else qc_retries
+    if check.flagged and row["qc_takes"] < limit:
         held.parent.mkdir(parents=True, exist_ok=True)
         write_wav_from_pcm_bytes(held, best)
         manifest.set_status(row["id"], RETAKE, file_path=clip_rel(lang, voice, row),
@@ -261,7 +264,7 @@ _GONE = (403, 404)
 
 def _collect(manifest: Manifest, batch: GeminiBatch, job_name: str,
              out_dir: pathlib.Path, poll_interval: float, sleep: Callable, log: Callable,
-             qc_retries: int = qc.DEFAULT_RETRIES) -> None:
+             qc_retries=qc.DEFAULT_RETRIES) -> None:
     try:
         while True:
             job = batch.poll(job_name)
@@ -323,11 +326,12 @@ def _collect(manifest: Manifest, batch: GeminiBatch, job_name: str,
     log(f"{job_name}: {_tally(outcomes)}")
 
 
-def _pending(manifest: Manifest, batch: GeminiBatch, lang: str, limit: int):
+def _pending(manifest: Manifest, batch: GeminiBatch, lang: str, limit: int, fresh: bool = True):
     """This batch's work: `lang` rows in its voice (or unattributed) still to
-    generate, and RETAKE rows recorded with its model and direction."""
+    generate (unless not `fresh`), and RETAKE rows recorded with its model and
+    direction."""
     return manifest.pending(limit=limit, lang=lang, voice=batch.voice,
-                            retake=(batch.model, batch.direction))
+                            retake=(batch.model, batch.direction), fresh=fresh)
 
 
 def _tally(outcomes: dict) -> str:
@@ -339,17 +343,17 @@ def _tally(outcomes: dict) -> str:
 
 
 def submit_pending(manifest: Manifest, batch: GeminiBatch, *, lang: str = "en",
-                   chunk: int = 2000, log: Callable = print) -> List[str]:
+                   chunk: int = 2000, log: Callable = print, fresh: bool = True) -> List[str]:
     """Submit all pending `lang` words in the batch's voice as async job(s),
-    QC re-takes queued for its model and direction included, and return
-    immediately.
+    QC re-takes queued for its model and direction included (only those when
+    not `fresh`), and return immediately.
 
     Job ids persist in the manifest (status -> submitted), so the machine can be
     powered off; collect later with `collect_active`. Does NOT poll.
     """
     jobs: List[str] = []
     while True:
-        rows = _pending(manifest, batch, lang, chunk)
+        rows = _pending(manifest, batch, lang, chunk, fresh)
         if not rows:
             break
         jsonl = build_jsonl(rows, batch.voice, batch.instruction, batch.style)
@@ -371,7 +375,7 @@ def submit_pending(manifest: Manifest, batch: GeminiBatch, *, lang: str = "en",
 
 def collect_active(manifest: Manifest, batch: GeminiBatch, out_dir: str, *,
                    poll_interval: float = 60, sleep: Callable = time.sleep,
-                   log: Callable = print, qc_retries: int = qc.DEFAULT_RETRIES) -> dict:
+                   log: Callable = print, qc_retries=qc.DEFAULT_RETRIES) -> dict:
     """Poll every in-flight batch (from the manifest) and write completed clips.
 
     Safe to run in a fresh process after a reboot — reconnects by job id.
@@ -394,10 +398,11 @@ def run_in_waves(manifest: Manifest, batch: GeminiBatch, out_dir: str, *,
                  lang: str = "en", chunk: int = 2000,
                  poll_interval: float = 60, sleep: Callable = time.sleep,
                  log: Callable = print, max_waves: int = 10_000,
-                 qc_retries: int = qc.DEFAULT_RETRIES) -> dict:
+                 qc_retries=qc.DEFAULT_RETRIES, fresh: bool = True) -> dict:
     """Quota-aware loop: collect in-flight (frees enqueued-token budget), submit
     as many words as the budget allows, repeat until nothing is pending — QC
-    re-takes included, so it ends with every clip passed or out of re-takes.
+    re-takes included, so it ends with every clip passed or out of re-takes
+    (`fresh=False`: only the re-takes, for `wordbank qc --retry`).
 
     Needs the process to stay alive (collection waits for jobs to finish), so run
     it with the laptop on. Fully resumable — picks up whatever the manifest holds.
@@ -405,10 +410,10 @@ def run_in_waves(manifest: Manifest, batch: GeminiBatch, out_dir: str, *,
     for wave_num in range(1, max_waves + 1):
         collect_active(manifest, batch, out_dir, poll_interval=poll_interval, sleep=sleep, log=log,
                        qc_retries=qc_retries)
-        if not _pending(manifest, batch, lang, 1):
+        if not _pending(manifest, batch, lang, 1, fresh):
             log("all words processed")
             break
-        jobs = submit_pending(manifest, batch, lang=lang, chunk=chunk, log=log)
+        jobs = submit_pending(manifest, batch, lang=lang, chunk=chunk, log=log, fresh=fresh)
         if not jobs:
             log("could not submit any job this wave — a single chunk likely exceeds "
                 "the enqueued-token quota; retry with a smaller --chunk")

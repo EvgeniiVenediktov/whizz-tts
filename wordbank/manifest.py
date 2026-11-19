@@ -232,20 +232,23 @@ class Manifest:
 
     def pending(self, limit: Optional[int] = None, max_attempts: int = 3,
                 lang: Optional[str] = None, voice: Optional[str] = None,
-                retake: Optional[tuple] = None):
+                retake: Optional[tuple] = None, fresh: bool = True):
         """Rows still to generate (pending, or failed under max_attempts), in id
         order. `lang` restricts them to one language. `voice` to one voice's
         rows, plus the unattributed ones (voice NULL) that voice has no row
         for: the first voice to generate such a row claims it. `retake=(model,
         style)` adds the RETAKE rows recorded with exactly that provenance, so
-        a QC re-take uses the take's own model and direction."""
+        a QC re-take uses the take's own model and direction; `fresh=False`
+        leaves the rows still to generate out (re-takes only)."""
         t, col = self.table, self.text_col
-        sql = f"SELECT * FROM {t} WHERE ((status IN (?, ?) AND attempts < ?)"
-        params = [PENDING, FAILED, max_attempts]
+        conds, params = [], []
+        if fresh:
+            conds.append("(status IN (?, ?) AND attempts < ?)")
+            params += [PENDING, FAILED, max_attempts]
         if retake is not None:
-            sql += " OR (status = ? AND model IS ? AND style IS ?)"
+            conds.append("(status = ? AND model IS ? AND style IS ?)")
             params += [RETAKE, *retake]
-        sql += ") "
+        sql = f"SELECT * FROM {t} WHERE ({' OR '.join(conds) or '0'}) "
         if lang is not None:
             sql += "AND lang = ? "
             params.append(lang)

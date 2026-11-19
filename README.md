@@ -443,11 +443,11 @@ GEMINI_API_KEY=… python -m wordbank --lang en-gb gemini-run --model gemini-3.8
 python scripts/encode_wavs.py output/words output/words_ogg
 
 # QC an existing bank (reads the WAV masters): record flags, list them for a listen,
-# then re-take the flagged words until they pass (2 extra takes each, the best kept):
+# then re-take the flagged words until they pass (2 extra takes each, the best kept),
+# in batches with each clip's own model and style (--sync --model … --style … for another):
 python -m wordbank --lang en-gb qc --voice en-gb-tutor-11 --csv review.csv
 GEMINI_API_KEY=… python -m wordbank --lang en-gb qc --voice en-gb-tutor-11 --retry \
-    --model gemini-3.8-flash-lite-tts --style "plain and neutral" --ogg-root output/words_ogg \
-    --csv review.csv
+    --ogg-root output/words_ogg --csv review.csv
 python scripts/encode_wavs.py output/words output/words_ogg
 python -m wordbank status                                     # flag / never-checked counts
 ```
@@ -484,9 +484,12 @@ re-queues the row (status `retake`, its best take held in
 `batch-submit`/`batch-run`. Re-takes don't count toward `--max-attempts`.
 `batch-collect` takes no `--voice`: each row's voice is recorded at submit.
 `wordbank qc` checks an existing bank (`--voice`, `--all-langs`, `--csv`) and
-with `--retry` re-takes flagged words synchronously (`--model`, `--style`,
-`--rpm`, `--qc-retries`; `--ogg-root` moves a replaced clip's OGG aside so it
-gets re-encoded). `--accept-file keep.txt` records words a person listened to and
+with `--retry` re-takes flagged words in batches, each with its own voice,
+model and style (the rows become `retake` and go through the batch waves, so an
+interrupted run resumes with `batch-run`/`batch-collect`; `--qc-retries` more
+takes each); `--retry --sync` re-takes them one request at a time with another
+`--model`/`--style` (`--rpm`). `--ogg-root` moves a re-taken clip's OGG aside so
+it gets re-encoded. A clip with no recorded model needs `--sync`. `--accept-file keep.txt` records words a person listened to and
 kept despite a flag (`qc_accepted`): their flag is cleared and later `qc` runs skip
 them, until a `regenerate` gives the word a new take (a `retake` row can't be
 accepted). Phrases made by `/v1/speak` are not checked.
