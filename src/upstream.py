@@ -4,12 +4,16 @@ whizz-tts server.
 An edge (a cache deployed next to its client) keeps its own copy of the bank
 and, instead of calling Gemini itself, forwards misses to the upstream
 server's /v1/speak, then saves what comes back; /v1/gemini/tts previews are
-passed through (nothing saved). Stdlib only (urllib +
+passed through (nothing saved). With `cafile` (SPEAK_UPSTREAM_CA) the edge
+trusts only that certificate, e.g. the upstream's own self-signed one, not the
+system CAs. Stdlib only (urllib +
 urlencoded form, which FastAPI's Form() accepts), so it adds nothing to the
 bank-only image.
 """
+import functools
 import json
 import socket
+import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -24,7 +28,12 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None             # a 3xx is an error: the bearer token never goes elsewhere
 
 
-_OPENER = urllib.request.build_opener(_NoRedirect)
+@functools.lru_cache(maxsize=None)
+def _opener(cafile: Optional[str]) -> urllib.request.OpenerDirector:
+    handlers = [_NoRedirect()]
+    if cafile:
+        handlers.append(urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile=cafile)))
+    return urllib.request.build_opener(*handlers)
 
 
 class UpstreamError(Exception):
@@ -46,26 +55,26 @@ class UpstreamSpeech:
 
 def fetch_speech(base_url: str, token: Optional[str], text: str, lang: str,
                  voice: Optional[str] = None, instruct: str = "",
-                 timeout: float = 60.0) -> UpstreamSpeech:
+                 timeout: float = 60.0, cafile: Optional[str] = None) -> UpstreamSpeech:
     """POST text to `<base_url>/v1/speak` in audio mode and return the OGG."""
     fields = {"text": text, "lang": lang, "voice": voice, "instruct": instruct}
-    body, headers = _post(base_url, "/v1/speak", token, fields, "audio/ogg", timeout)
+    body, headers = _post(base_url, "/v1/speak", token, fields, "audio/ogg", timeout, cafile)
     if body[:4] != b"OggS":
         raise UpstreamError(502, f"upstream returned {headers.get('Content-Type')!r}, not OGG audio")
     return UpstreamSpeech(ogg=body, voice=headers.get("X-Voice"), clip_id=headers.get("X-Clip-Id"))
 
 
 def fetch_preview(base_url: str, token: Optional[str], fields: dict,
-                  timeout: float = 60.0) -> bytes:
+                  timeout: float = 60.0, cafile: Optional[str] = None) -> bytes:
     """POST a voice preview (/v1/gemini/tts form fields) upstream -> the WAV."""
-    body, headers = _post(base_url, "/v1/gemini/tts", token, fields, "audio/wav", timeout)
+    body, headers = _post(base_url, "/v1/gemini/tts", token, fields, "audio/wav", timeout, cafile)
     if body[:4] != b"RIFF":
         raise UpstreamError(502, f"upstream returned {headers.get('Content-Type')!r}, not WAV audio")
     return body
 
 
 def _post(base_url: str, path: str, token: Optional[str], fields: dict, accept: str,
-          timeout: float) -> tuple:
+          timeout: float, cafile: Optional[str]) -> tuple:
     """POST the non-empty `fields` urlencoded -> (body, headers).
 
     Upstream 400s are passed through (the request itself is bad); every other
@@ -80,7 +89,7 @@ def _post(base_url: str, path: str, token: Optional[str], fields: dict, accept: 
         method="POST",
     )
     try:
-        with _OPENER.open(req, timeout=timeout) as resp:
+        with _opener(cafile).open(req, timeout=timeout) as resp:
             body = resp.read(MAX_REPLY_BYTES + 1)
             headers = resp.headers
     except urllib.error.HTTPError as exc:
@@ -95,6 +104,9 @@ def _post(base_url: str, path: str, token: Optional[str], fields: dict, accept: 
     except urllib.error.URLError as exc:
         if isinstance(exc.reason, (socket.timeout, TimeoutError)):
             raise UpstreamError(504, f"upstream timed out after {timeout:g}s") from exc
+        if isinstance(exc.reason, ssl.SSLCertVerificationError):
+            raise UpstreamError(502, f"upstream TLS certificate not trusted "
+                                     f"({exc.reason.verify_message})") from exc
         raise UpstreamError(502, "upstream unreachable") from exc
 
     if len(body) > MAX_REPLY_BYTES:

@@ -16,7 +16,6 @@ services:
     profiles: [bank]
     ports: ["8000:8000"]
     environment:
-      SERVE_FRONTEND: "1"
       BANK_DB: /data/wordbank.db
       OGG_ROOT: /data/words_ogg
       # LIBRARY_DESC: /data/library.json          # defaults; override if placed elsewhere

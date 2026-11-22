@@ -53,7 +53,6 @@ RUN pip install -r requirements-base.txt && \
 
 COPY src/ ./src/
 COPY wordbank/ ./wordbank/
-COPY frontend/ ./frontend/
 COPY docker-entrypoint.sh ./
 # Code stays root-owned (read-only to the server); only /data belongs to the
 # unprivileged `app` user (uid 1000) the server runs as. Bytecode is compiled
@@ -64,8 +63,8 @@ RUN chmod +x docker-entrypoint.sh && \
     mkdir -p /data && chown app:app /data
 USER app
 
-ENV SERVE_FRONTEND=1 \
-    BANK_DB=/data/wordbank.db \
+# No UI in the image: frontend/ is for local development (SERVE_FRONTEND=1).
+ENV BANK_DB=/data/wordbank.db \
     OGG_ROOT=/data/words_ogg
 
 EXPOSE 8000

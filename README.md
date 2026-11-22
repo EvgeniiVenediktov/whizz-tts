@@ -345,7 +345,8 @@ SERVE_FRONTEND=1 .venv/bin/uvicorn src.server:app --port 8000
 | `BANK_DB` | `wordbank.db` | manifest path |
 | `OGG_ROOT` | `output/words_ogg` | served OGG tree |
 | `WAV_ROOT` | `output/words` | WAV masters (dev compare only) |
-| `SERVE_FRONTEND` | off | serve the static UI from the API |
+| `SERVE_FRONTEND` | off | serve the static UI from the API (local development; the images don't ship it) |
+| `SPEAK_UPSTREAM_CA` | — | edge: the only certificate trusted for the upstream (PEM path, e.g. its self-signed certificate) |
 | `CORS_ORIGINS` | `*` (any) | comma-separated allowed origins. **Browser-enforced only — not authentication**; it does nothing against `curl` or any non-browser client |
 | `JWT_SECRET` | unset | bearer-token auth on the phrase and synthesis routes (see [Auth](#auth)); required when the server can generate |
 | `AUTH_DISABLED` | unset | `1` lets a server with a Gemini key or an upstream run without `JWT_SECRET` (local dev only) |

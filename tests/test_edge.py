@@ -8,6 +8,7 @@ in a subprocess (Gemini faked there) to pin the edge <-> upstream contract.
 import logging
 import os
 import socket
+import ssl
 import subprocess
 import sys
 import threading
@@ -31,9 +32,10 @@ TOKEN = "edge-token"
 
 class FakeUpstream:
     """Answers POST /v1/speak like the real server would; `respond(fields)`
-    -> (status, headers, body) can be swapped per test. Records every request."""
+    -> (status, headers, body) can be swapped per test. Records every request.
+    `tls=(cert, key)` serves HTTPS with that certificate."""
 
-    def __init__(self):
+    def __init__(self, tls=None):
         self.requests = []
         self.delay = 0.0
         self.respond = self._ok
@@ -60,7 +62,11 @@ class FakeUpstream:
                 pass
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.url = f"http://127.0.0.1:{self.server.server_port}"
+        if tls:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(*tls)
+            self.server.socket = ctx.wrap_socket(self.server.socket, server_side=True)
+        self.url = f"{'https' if tls else 'http'}://127.0.0.1:{self.server.server_port}"
         threading.Thread(target=self.server.serve_forever, args=(0.05,), daemon=True).start()
 
     def close(self):
@@ -205,6 +211,43 @@ def test_voice_preview_is_made_by_the_upstream(edge):
     assert q == {"path": "/v1/gemini/tts", "accept": "audio/wav", "auth": f"Bearer {TOKEN}",
                  "text": "hello", "voice": "Puck", "style": "calm"}
     assert edge.gemini.calls == []
+
+
+def _self_signed(tmp_path, name):
+    """A self-signed certificate for 127.0.0.1, made as for an upstream -> (cert, key)."""
+    cert, key = tmp_path / f"{name}.pem", tmp_path / f"{name}.key"
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
+                    "-nodes", "-days", "1", "-subj", f"/CN={name}",
+                    "-addext", "subjectAltName=IP:127.0.0.1", "-keyout", str(key), "-out", str(cert)],
+                   check=True, capture_output=True)
+    return str(cert), str(key)
+
+
+def test_a_pinned_upstream_certificate_is_the_only_one_trusted(edge, tmp_path, monkeypatch):
+    """SPEAK_UPSTREAM_CA: the upstream's own self-signed certificate is
+    trusted; an upstream presenting any other is refused before the token is sent."""
+    import src.server as server_mod
+    pinned, other = _self_signed(tmp_path, "pinned"), _self_signed(tmp_path, "other")
+    up = FakeUpstream(tls=pinned)
+    try:
+        monkeypatch.setenv("SPEAK_UPSTREAM_URL", up.url)
+        monkeypatch.setattr(server_mod, "SPEAK_UPSTREAM_CA", pinned[0])
+        assert _speak(edge, text="hello there").headers["x-source"] == "upstream"
+        monkeypatch.setattr(server_mod, "SPEAK_UPSTREAM_CA", other[0])
+        r = _speak(edge, text="hello again")
+        assert r.status_code == 502 and "not trusted" in r.json()["detail"]
+        assert [q["text"] for q in up.requests] == ["hello there"]
+    finally:
+        up.close()
+
+
+def test_an_edge_whose_pinned_certificate_cant_be_loaded_does_not_start(bank_env, monkeypatch, tmp_path):
+    import src.server as server_mod
+    monkeypatch.setenv("SPEAK_UPSTREAM_URL", "https://upstream.example")
+    monkeypatch.setattr(server_mod, "SPEAK_UPSTREAM_CA", str(tmp_path / "missing.pem"))
+    with pytest.raises(RuntimeError, match="SPEAK_UPSTREAM_CA"):
+        with TestClient(server_mod.app):
+            pass
 
 
 def test_upstream_redirects_are_not_followed(edge):
