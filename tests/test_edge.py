@@ -23,6 +23,7 @@ import jwt
 import pytest
 from fastapi.testclient import TestClient
 
+from src.upstream import UpstreamTLS
 from tests.conftest import AUDIO
 from wordbank.manifest import DONE, Manifest
 
@@ -33,9 +34,10 @@ TOKEN = "edge-token"
 class FakeUpstream:
     """Answers POST /v1/speak like the real server would; `respond(fields)`
     -> (status, headers, body) can be swapped per test. Records every request.
-    `tls=(cert, key)` serves HTTPS with that certificate."""
+    `tls=(cert, key)` serves HTTPS with that certificate; `clients` (a PEM
+    file) then requires a client certificate from it (mutual TLS)."""
 
-    def __init__(self, tls=None):
+    def __init__(self, tls=None, clients=None):
         self.requests = []
         self.delay = 0.0
         self.respond = self._ok
@@ -65,6 +67,9 @@ class FakeUpstream:
         if tls:
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             ctx.load_cert_chain(*tls)
+            if clients:
+                ctx.verify_mode = ssl.CERT_REQUIRED
+                ctx.load_verify_locations(clients)
             self.server.socket = ctx.wrap_socket(self.server.socket, server_side=True)
         self.url = f"{'https' if tls else 'http'}://127.0.0.1:{self.server.server_port}"
         threading.Thread(target=self.server.serve_forever, args=(0.05,), daemon=True).start()
@@ -231,9 +236,9 @@ def test_a_pinned_upstream_certificate_is_the_only_one_trusted(edge, tmp_path, m
     up = FakeUpstream(tls=pinned)
     try:
         monkeypatch.setenv("SPEAK_UPSTREAM_URL", up.url)
-        monkeypatch.setattr(server_mod, "SPEAK_UPSTREAM_CA", pinned[0])
+        monkeypatch.setattr(server_mod, "SPEAK_UPSTREAM_TLS", UpstreamTLS(pinned[0]))
         assert _speak(edge, text="hello there").headers["x-source"] == "upstream"
-        monkeypatch.setattr(server_mod, "SPEAK_UPSTREAM_CA", other[0])
+        monkeypatch.setattr(server_mod, "SPEAK_UPSTREAM_TLS", UpstreamTLS(other[0]))
         r = _speak(edge, text="hello again")
         assert r.status_code == 502 and "not trusted" in r.json()["detail"]
         assert [q["text"] for q in up.requests] == ["hello there"]
@@ -241,10 +246,35 @@ def test_a_pinned_upstream_certificate_is_the_only_one_trusted(edge, tmp_path, m
         up.close()
 
 
+def test_mutual_tls_the_upstream_serves_only_the_edges_certificate(edge, tmp_path, monkeypatch):
+    """The edge makes its key and certificate on its first start (key 0600,
+    kept on later starts); an upstream that trusts that certificate serves it,
+    one that trusts another refuses it."""
+    import src.server as server_mod
+    from src.client_cert import ensure
+    server = _self_signed(tmp_path, "upstream")
+    mine = UpstreamTLS(server[0], str(tmp_path / "edge" / "cert.pem"), str(tmp_path / "edge" / "key.pem"))
+    server_mod._prepare_upstream_tls(mine)
+    assert os.stat(mine.keyfile).st_mode & 0o777 == 0o600
+    assert ensure(mine.certfile, mine.keyfile) is False
+    monkeypatch.setattr(server_mod, "SPEAK_UPSTREAM_TLS", mine)
+    for clients, want in ((mine.certfile, 200), (_self_signed(tmp_path, "someone")[0], 502)):
+        up = FakeUpstream(tls=server, clients=clients)
+        try:
+            monkeypatch.setenv("SPEAK_UPSTREAM_URL", up.url)
+            r = _speak(edge, text=f"hello {want}")
+            assert r.status_code == want
+            if want == 502:
+                assert "rejected the edge's TLS client certificate" in r.json()["detail"]
+                assert up.requests == []
+        finally:
+            up.close()
+
+
 def test_an_edge_whose_pinned_certificate_cant_be_loaded_does_not_start(bank_env, monkeypatch, tmp_path):
     import src.server as server_mod
     monkeypatch.setenv("SPEAK_UPSTREAM_URL", "https://upstream.example")
-    monkeypatch.setattr(server_mod, "SPEAK_UPSTREAM_CA", str(tmp_path / "missing.pem"))
+    monkeypatch.setattr(server_mod, "SPEAK_UPSTREAM_TLS", UpstreamTLS(str(tmp_path / "missing.pem")))
     with pytest.raises(RuntimeError, match="SPEAK_UPSTREAM_CA"):
         with TestClient(server_mod.app):
             pass

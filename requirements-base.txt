@@ -7,3 +7,4 @@ PyJWT>=2.8.0  # JWT bearer auth for write/synthesis routes; pure Python, no ML d
 # /v1/speak get-or-generate: Gemini synthesis of bank misses (needs GEMINI_API_KEY
 # at runtime). OGG encoding uses the static ffmpeg the Dockerfile builds.
 google-genai>=1.0.0
+cryptography>=42  # the edge's TLS client certificate (src/client_cert.py); google-genai pulls it in anyway

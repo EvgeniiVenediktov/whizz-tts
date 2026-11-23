@@ -4,11 +4,12 @@ whizz-tts server.
 An edge (a cache deployed next to its client) keeps its own copy of the bank
 and, instead of calling Gemini itself, forwards misses to the upstream
 server's /v1/speak, then saves what comes back; /v1/gemini/tts previews are
-passed through (nothing saved). With `cafile` (SPEAK_UPSTREAM_CA) the edge
-trusts only that certificate, e.g. the upstream's own self-signed one, not the
-system CAs. Stdlib only (urllib +
-urlencoded form, which FastAPI's Form() accepts), so it adds nothing to the
-bank-only image.
+passed through (nothing saved). `UpstreamTLS`: with a `cafile`
+(SPEAK_UPSTREAM_CA) the edge trusts only that certificate, e.g. the upstream's
+own self-signed one, not the system CAs; with a `certfile`/`keyfile`
+(SPEAK_UPSTREAM_CERT/KEY, src/client_cert.py) it presents its own certificate
+(mutual TLS). Stdlib only (urllib + urlencoded form, which FastAPI's Form()
+accepts), so it adds nothing to the bank-only image.
 """
 import functools
 import json
@@ -18,7 +19,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Optional
+from typing import NamedTuple, Optional
 
 MAX_REPLY_BYTES = 5 * 1024 * 1024       # a clip is ~3 KB/s of speech
 
@@ -28,11 +29,22 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None             # a 3xx is an error: the bearer token never goes elsewhere
 
 
+class UpstreamTLS(NamedTuple):
+    cafile: Optional[str] = None        # the only certificate trusted for the upstream
+    certfile: Optional[str] = None      # the edge's own certificate, presented to it
+    keyfile: Optional[str] = None
+
+
 @functools.lru_cache(maxsize=None)
-def _opener(cafile: Optional[str]) -> urllib.request.OpenerDirector:
+def opener(tls: UpstreamTLS = UpstreamTLS()) -> urllib.request.OpenerDirector:
+    """urllib opener for the upstream (cached per `tls`); raises OSError when a
+    certificate or key can't be loaded."""
     handlers = [_NoRedirect()]
-    if cafile:
-        handlers.append(urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile=cafile)))
+    if tls.cafile or tls.certfile:
+        ctx = ssl.create_default_context(cafile=tls.cafile)
+        if tls.certfile:
+            ctx.load_cert_chain(tls.certfile, tls.keyfile)
+        handlers.append(urllib.request.HTTPSHandler(context=ctx))
     return urllib.request.build_opener(*handlers)
 
 
@@ -55,26 +67,26 @@ class UpstreamSpeech:
 
 def fetch_speech(base_url: str, token: Optional[str], text: str, lang: str,
                  voice: Optional[str] = None, instruct: str = "",
-                 timeout: float = 60.0, cafile: Optional[str] = None) -> UpstreamSpeech:
+                 timeout: float = 60.0, tls: UpstreamTLS = UpstreamTLS()) -> UpstreamSpeech:
     """POST text to `<base_url>/v1/speak` in audio mode and return the OGG."""
     fields = {"text": text, "lang": lang, "voice": voice, "instruct": instruct}
-    body, headers = _post(base_url, "/v1/speak", token, fields, "audio/ogg", timeout, cafile)
+    body, headers = _post(base_url, "/v1/speak", token, fields, "audio/ogg", timeout, tls)
     if body[:4] != b"OggS":
         raise UpstreamError(502, f"upstream returned {headers.get('Content-Type')!r}, not OGG audio")
     return UpstreamSpeech(ogg=body, voice=headers.get("X-Voice"), clip_id=headers.get("X-Clip-Id"))
 
 
 def fetch_preview(base_url: str, token: Optional[str], fields: dict,
-                  timeout: float = 60.0, cafile: Optional[str] = None) -> bytes:
+                  timeout: float = 60.0, tls: UpstreamTLS = UpstreamTLS()) -> bytes:
     """POST a voice preview (/v1/gemini/tts form fields) upstream -> the WAV."""
-    body, headers = _post(base_url, "/v1/gemini/tts", token, fields, "audio/wav", timeout, cafile)
+    body, headers = _post(base_url, "/v1/gemini/tts", token, fields, "audio/wav", timeout, tls)
     if body[:4] != b"RIFF":
         raise UpstreamError(502, f"upstream returned {headers.get('Content-Type')!r}, not WAV audio")
     return body
 
 
 def _post(base_url: str, path: str, token: Optional[str], fields: dict, accept: str,
-          timeout: float, cafile: Optional[str]) -> tuple:
+          timeout: float, tls: UpstreamTLS) -> tuple:
     """POST the non-empty `fields` urlencoded -> (body, headers).
 
     Upstream 400s are passed through (the request itself is bad); every other
@@ -89,7 +101,7 @@ def _post(base_url: str, path: str, token: Optional[str], fields: dict, accept: 
         method="POST",
     )
     try:
-        with _opener(cafile).open(req, timeout=timeout) as resp:
+        with opener(tls).open(req, timeout=timeout) as resp:
             body = resp.read(MAX_REPLY_BYTES + 1)
             headers = resp.headers
     except urllib.error.HTTPError as exc:
@@ -108,6 +120,9 @@ def _post(base_url: str, path: str, token: Optional[str], fields: dict, accept: 
             raise UpstreamError(502, f"upstream TLS certificate not trusted "
                                      f"({exc.reason.verify_message})") from exc
         raise UpstreamError(502, "upstream unreachable") from exc
+    except ssl.SSLError as exc:     # TLS 1.3: the upstream's verdict on our certificate comes with the reply
+        raise UpstreamError(502, f"upstream rejected the edge's TLS client certificate "
+                                 f"({exc.reason or exc})") from exc
 
     if len(body) > MAX_REPLY_BYTES:
         raise UpstreamError(502, f"upstream reply exceeds {MAX_REPLY_BYTES} bytes")

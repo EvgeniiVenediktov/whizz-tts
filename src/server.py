@@ -2,7 +2,6 @@ import asyncio
 import base64
 import logging
 import os
-import ssl
 import subprocess
 import time
 import uuid
@@ -17,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 
 from .auth import require_auth
-from .upstream import UpstreamError, fetch_preview, fetch_speech
+from .upstream import UpstreamError, UpstreamTLS, fetch_preview, fetch_speech, opener
 from wordbank.constants import BANK_OGG_APPLICATION, BANK_OGG_BITRATE
 from wordbank.gemini_tts import (DEFAULT_MODEL as GEMINI_TTS_DEFAULT_MODEL, TTS_MODELS, VOICES,
                                  GeminiNoAudioError, GeminiStyleUnsupportedError,
@@ -42,8 +41,10 @@ DEFAULT_LANG = os.getenv("DEFAULT_LANG", "en-us")
 GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", GEMINI_TTS_DEFAULT_MODEL)
 GEMINI_TTS_VOICE = os.getenv("GEMINI_TTS_VOICE", "Kore")
 SPEAK_UPSTREAM_TIMEOUT = float(os.getenv("SPEAK_UPSTREAM_TIMEOUT", "60"))
-# The only certificate an edge trusts for its upstream (e.g. its self-signed one).
-SPEAK_UPSTREAM_CA = os.getenv("SPEAK_UPSTREAM_CA") or None
+# Edge: the only certificate trusted for the upstream (e.g. its self-signed one), and
+# the edge's own certificate + key presented to it (mutual TLS; made on first start).
+SPEAK_UPSTREAM_TLS = UpstreamTLS(*(os.getenv(f"SPEAK_UPSTREAM_{k}") or None
+                                   for k in ("CA", "CERT", "KEY")))
 
 log = logging.getLogger("uvicorn.error")
 
@@ -88,6 +89,23 @@ def _speak_store() -> bool:
     front for edges, which hold the clips. Hits from an existing bank are still
     served (reads aren't storage). Default on. Read per call."""
     return os.getenv("SPEAK_STORE", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _prepare_upstream_tls(tls: UpstreamTLS) -> None:
+    """Make the edge's client certificate on first start (its key never leaves
+    the edge), then load everything once: a certificate or key that can't be
+    loaded would fail every miss, so the edge refuses to start instead."""
+    if tls.certfile and tls.keyfile:
+        from .client_cert import ensure         # lazy: cryptography
+        if ensure(tls.certfile, tls.keyfile):
+            log.warning("made the edge's TLS client certificate %s: the upstream must trust it "
+                        "(`python -m src.client_cert` prints it)", tls.certfile)
+    elif tls.certfile or tls.keyfile:
+        raise RuntimeError("set both SPEAK_UPSTREAM_CERT and SPEAK_UPSTREAM_KEY, or neither")
+    try:
+        opener(tls)
+    except OSError as exc:
+        raise RuntimeError(f"SPEAK_UPSTREAM_CA/CERT/KEY can't be loaded: {exc}") from exc
 
 
 def _warn_about_upstream_token(log: logging.Logger) -> None:
@@ -189,11 +207,7 @@ async def lifespan(app: FastAPI):
             raise RuntimeError("JWT_SECRET is not set but this server can generate (Gemini key or "
                                "SPEAK_UPSTREAM_URL): set JWT_SECRET, or AUTH_DISABLED=1 for local development")
         log.warning("JWT_SECRET not set: speak, clip, phrase and search routes are unauthenticated")
-    if SPEAK_UPSTREAM_CA:           # trusting nothing would fail every miss: refuse instead
-        try:
-            ssl.create_default_context(cafile=SPEAK_UPSTREAM_CA)
-        except OSError as exc:
-            raise RuntimeError(f"SPEAK_UPSTREAM_CA {SPEAK_UPSTREAM_CA!r} can't be loaded: {exc}") from exc
+    _prepare_upstream_tls(SPEAK_UPSTREAM_TLS)
     _warn_about_upstream_token(log)
     _warn_about_tts_style(log)
     yield
@@ -536,7 +550,7 @@ async def _upstream_clip(url: str, text: str, lang: str, voice: Optional[str],
     is "Kore"); and under its clip id, when it sends one."""
     speech = await _from_upstream("/v1/speak", lambda token: fetch_speech(
         url, token, text, lang, voice, instruct, timeout=SPEAK_UPSTREAM_TIMEOUT,
-        cafile=SPEAK_UPSTREAM_CA))
+        tls=SPEAK_UPSTREAM_TLS))
     label = canonical_voice(speech.voice.strip().removeprefix("gemini-")) \
         if speech.voice else fallback_voice
     if label is None:
@@ -695,7 +709,7 @@ async def gemini_tts(
     if upstream := _upstream_url():
         fields = {"text": text, "voice": voice, "instruct": instruct, "model": model, "style": style}
         wav = await _from_upstream("/v1/gemini/tts", lambda token: fetch_preview(
-            upstream, token, fields, timeout=SPEAK_UPSTREAM_TIMEOUT, cafile=SPEAK_UPSTREAM_CA))
+            upstream, token, fields, timeout=SPEAK_UPSTREAM_TIMEOUT, tls=SPEAK_UPSTREAM_TLS))
         return Response(content=wav, media_type="audio/wav")
     model, voice = model or GEMINI_TTS_MODEL, voice or GEMINI_TTS_VOICE
     _check_voice(voice, model)
